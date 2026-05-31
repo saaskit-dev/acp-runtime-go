@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "id": "scenario.permission-mode-denied",
+  "kind": "scenario",
+  "agents": {
+    "include": [
+      "claude-acp"
+    ]
+  },
+  "probes": {
+    "claude-acp": {
+      "modeId": "dontAsk",
+      "prompt": "Write the exact text 'hello world' into $cwd/.acp-harness-mode-denied.txt and then tell me whether the write succeeded."
+    }
+  },
+  "title": "Permission Denied Outcome (Mode Denied)",
+  "level": "P1",
+  "protocolDependencies": [
+    "session/new",
+    "session/set_mode",
+    "session/prompt"
+  ],
+  "steps": [
+    {
+      "type": "initialize"
+    },
+    {
+      "type": "session-new"
+    },
+    {
+      "type": "set-mode",
+      "modeId": "$probe-mode"
+    },
+    {
+      "type": "session-prompt",
+      "prompt": "$probe-prompt",
+      "turnRef": "turn-mode-denied"
+    },
+    {
+      "type": "wait-for-event",
+      "eventType": "completed",
+      "timeoutMs": 45000
+    }
+  ],
+  "assertions": [
+    {
+      "type": "transcript-event-count",
+      "eventType": "permission-request",
+      "max": 0
+    },
+    {
+      "type": "transcript-method-response-has",
+      "method": "session/prompt",
+      "path": "stopReason",
+      "equals": "end_turn"
+    },
+    {
+      "type": "transcript-event-count",
+      "eventType": "tool_call_update",
+      "min": 1
+    },
+    {
+      "type": "transcript-event-field",
+      "eventType": "tool_call_update",
+      "path": "update.status",
+      "equals": "failed"
+    }
+  ]
+}

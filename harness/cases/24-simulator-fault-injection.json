@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "id": "simulator.fault-injection",
+  "kind": "scenario",
+  "agents": {
+    "include": [
+      "simulator-agent-acp-local"
+    ]
+  },
+  "title": "Simulator Fault Injection",
+  "level": "P1",
+  "protocolDependencies": [
+    "initialize",
+    "session/new",
+    "session/prompt",
+    "session/update"
+  ],
+  "steps": [
+    {
+      "type": "initialize"
+    },
+    {
+      "type": "session-new"
+    },
+    {
+      "type": "session-prompt",
+      "prompt": "/simulate duplicate-next-tool-update",
+      "turnRef": "turn-fault-setup"
+    },
+    {
+      "type": "wait-for-event",
+      "eventType": "completed",
+      "timeoutMs": 45000
+    },
+    {
+      "type": "permission-decision",
+      "decision": "allow"
+    },
+    {
+      "type": "session-prompt",
+      "prompt": "/bash git status",
+      "turnRef": "turn-fault-run"
+    },
+    {
+      "type": "wait-for-event",
+      "eventType": "completed",
+      "timeoutMs": 45000
+    }
+  ],
+  "assertions": [
+    {
+      "type": "transcript-event-count",
+      "eventType": "tool_call_update",
+      "min": 3
+    },
+    {
+      "type": "transcript-has-method",
+      "method": "terminal/create"
+    }
+  ]
+}

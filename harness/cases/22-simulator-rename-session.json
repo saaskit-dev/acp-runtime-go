@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "id": "simulator.rename-session",
+  "kind": "interaction",
+  "agents": {
+    "include": [
+      "simulator-agent-acp-local"
+    ]
+  },
+  "title": "Simulator Rename Session",
+  "protocolDependencies": [
+    "initialize",
+    "session/new",
+    "session/prompt",
+    "session/update"
+  ],
+  "steps": [
+    {
+      "type": "initialize"
+    },
+    {
+      "type": "session-new"
+    },
+    {
+      "type": "session-prompt",
+      "prompt": "/rename Harness Runtime Investigation",
+      "turnRef": "turn-rename"
+    },
+    {
+      "type": "wait-for-event",
+      "eventType": "completed",
+      "timeoutMs": 45000
+    }
+  ],
+  "assertions": [
+    {
+      "type": "transcript-has-event",
+      "eventType": "session_info_update"
+    },
+    {
+      "type": "transcript-event-field",
+      "eventType": "session_info_update",
+      "path": "update.title",
+      "equals": "Harness Runtime Investigation"
+    }
+  ]
+}

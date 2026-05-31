@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "id": "scenario.permission-denied-cancelled",
+  "kind": "scenario",
+  "agents": {
+    "include": [
+      "codex-acp"
+    ]
+  },
+  "probes": {
+    "codex-acp": {
+      "modeId": "read-only",
+      "prompt": "Write the exact text 'hello world' into $cwd/.acp-harness-permission-denied.txt and then tell me whether the write succeeded."
+    }
+  },
+  "title": "Permission Denied Outcome (Cancelled)",
+  "level": "P1",
+  "protocolDependencies": [
+    "session/new",
+    "session/set_mode",
+    "session/prompt",
+    "session/request_permission"
+  ],
+  "steps": [
+    {
+      "type": "initialize"
+    },
+    {
+      "type": "session-new"
+    },
+    {
+      "type": "set-mode",
+      "modeId": "$probe-mode"
+    },
+    {
+      "type": "permission-decision",
+      "decision": "deny"
+    },
+    {
+      "type": "session-prompt",
+      "prompt": "$probe-prompt",
+      "turnRef": "turn-deny-cancelled"
+    },
+    {
+      "type": "wait-for-event",
+      "eventType": "completed",
+      "timeoutMs": 45000
+    }
+  ],
+  "assertions": [
+    {
+      "type": "transcript-has-method",
+      "method": "session/request_permission"
+    },
+    {
+      "type": "transcript-method-response-has",
+      "method": "session/prompt",
+      "path": "stopReason",
+      "equals": "cancelled"
+    },
+    {
+      "type": "transcript-event-count",
+      "eventType": "tool_call_update",
+      "max": 0
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "id": "protocol.session-resume",
+  "kind": "protocol",
+  "title": "Session Resume",
+  "protocolDependencies": [
+    "initialize",
+    "session/new",
+    "session/resume"
+  ],
+  "steps": [
+    {
+      "type": "initialize"
+    },
+    {
+      "type": "session-new"
+    },
+    {
+      "type": "session-resume",
+      "sessionRef": "current",
+      "skipIf": "!capabilities.sessionCapabilities.resume"
+    }
+  ],
+  "assertions": [
+    {
+      "type": "transcript-has-method",
+      "method": "session/resume"
+    }
+  ]
+}

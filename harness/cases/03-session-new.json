@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "id": "protocol.session-new",
+  "kind": "protocol",
+  "title": "Session New",
+  "protocolDependencies": [
+    "initialize",
+    "session/new"
+  ],
+  "steps": [
+    {
+      "type": "initialize"
+    },
+    {
+      "type": "session-new"
+    }
+  ],
+  "assertions": [
+    {
+      "type": "transcript-has-method",
+      "method": "initialize"
+    },
+    {
+      "type": "transcript-has-method",
+      "method": "session/new"
+    },
+    {
+      "type": "transcript-method-response-has",
+      "method": "session/new",
+      "path": "sessionId",
+      "notEmpty": true
+    },
+    {
+      "type": "transcript-order",
+      "first": "initialize",
+      "then": "session/new"
+    }
+  ]
+}

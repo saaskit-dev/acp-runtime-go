@@ -1,0 +1,81 @@
+{
+  "version": 1,
+  "id": "scenario.permission-denied",
+  "kind": "scenario",
+  "classification": {
+    "simulator-agent-acp-local": {
+      "assertionFailureStatus": "not-observed",
+      "timeoutStatus": "not-observed"
+    },
+    "opencode": {
+      "assertionFailureStatus": "not-observed",
+      "timeoutStatus": "not-observed"
+    }
+  },
+  "probes": {
+    "simulator-agent-acp-local": {
+      "prompt": "/write /tmp/acp-harness-test.txt hello world"
+    },
+    "codex-acp": {
+      "modeId": "read-only",
+      "prompt": "Write the exact text 'hello world' into $cwd/.acp-harness-permission-denied.txt and then tell me whether the write succeeded."
+    }
+  },
+  "title": "Permission Denied Path",
+  "level": "P1",
+  "protocolDependencies": [
+    "session/new",
+    "session/prompt",
+    "session/update",
+    "session/request_permission"
+  ],
+  "steps": [
+    {
+      "type": "initialize"
+    },
+    {
+      "type": "session-new"
+    },
+    {
+      "type": "set-mode",
+      "modeId": "$probe-mode",
+      "skipIf": "!probe.modeId"
+    },
+    {
+      "type": "permission-decision",
+      "decision": "deny"
+    },
+    {
+      "type": "session-prompt",
+      "prompt": "$probe-prompt",
+      "defaultPrompt": "Write the exact text 'hello world' into $cwd/.acp-harness-permission-denied.txt and then tell me whether the write succeeded.",
+      "turnRef": "turn-deny"
+    },
+    {
+      "type": "wait-for-event",
+      "eventType": "completed",
+      "timeoutMs": 45000
+    }
+  ],
+  "assertions": [
+    {
+      "type": "transcript-has-method",
+      "method": "session/request_permission"
+    },
+    {
+      "type": "transcript-has-method",
+      "method": "session/prompt"
+    },
+    {
+      "type": "transcript-order",
+      "first": "session/prompt",
+      "then": "session/request_permission"
+    },
+    {
+      "type": "transcript-event-field",
+      "eventType": "permission-request",
+      "path": "options.0.kind",
+      "notEmpty": true
+    }
+  ]
+}

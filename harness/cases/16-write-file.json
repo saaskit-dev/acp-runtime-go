@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "id": "scenario.write-file",
+  "kind": "scenario",
+  "scenarioCategory": "main-flow",
+  "probes": {
+    "simulator-agent-acp-local": {
+      "prompt": "/write /tmp/acp-harness-test.txt READY"
+    },
+    "opencode": {
+      "prompt": "Use your file editing or command execution tool to create ./.tmp/tmp-output.txt containing exactly READY. Wait for the tool call to complete, then answer done."
+    },
+    "cursor": {
+      "prompt": "Use your file editing or command execution tool to create ./.tmp/tmp-output.txt containing exactly READY. Wait for the tool call to complete, then answer done."
+    },
+    "pi-acp": {
+      "prompt": "Use your file editing or command execution tool to create ./.tmp/tmp-output.txt containing exactly READY. Wait for the tool call to complete, then answer done."
+    }
+  },
+  "title": "Write File",
+  "level": "P0",
+  "protocolDependencies": [
+    "session/new",
+    "session/prompt",
+    "session/update",
+    "session/request_permission",
+    "fs/write_text_file"
+  ],
+  "steps": [
+    {
+      "type": "initialize"
+    },
+    {
+      "type": "session-new"
+    },
+    {
+      "type": "permission-decision",
+      "decision": "allow"
+    },
+    {
+      "type": "session-prompt",
+      "prompt": "$probe-prompt",
+      "defaultPrompt": "Create ./.tmp/tmp-output.txt containing the word READY.",
+      "turnRef": "turn-1"
+    },
+    {
+      "type": "wait-for-event",
+      "eventType": "completed"
+    }
+  ],
+  "assertions": [
+    {
+      "type": "transcript-has-method",
+      "method": "session/prompt"
+    },
+    {
+      "type": "any-of",
+      "assertions": [
+        {
+          "type": "transcript-has-method",
+          "method": "fs/write_text_file"
+        },
+        {
+          "type": "transcript-has-tool-update",
+          "kind": "edit",
+          "status": "completed"
+        },
+        {
+          "type": "transcript-has-tool-update",
+          "kind": "execute",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "type": "transcript-has-event",
+      "eventType": "tool_call_update"
+    }
+  ]
+}

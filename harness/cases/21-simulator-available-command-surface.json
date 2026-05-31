@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "id": "simulator.available-command-surface",
+  "kind": "protocol",
+  "agents": {
+    "include": [
+      "simulator-agent-acp-local"
+    ]
+  },
+  "title": "Simulator Available Command Surface",
+  "protocolDependencies": [
+    "initialize",
+    "session/new",
+    "session/update"
+  ],
+  "steps": [
+    {
+      "type": "initialize"
+    },
+    {
+      "type": "session-new"
+    }
+  ],
+  "assertions": [
+    {
+      "type": "transcript-has-event",
+      "eventType": "available_commands_update"
+    },
+    {
+      "type": "transcript-event-field",
+      "eventType": "available_commands_update",
+      "path": "update.availableCommands.0.name",
+      "equals": "help"
+    },
+    {
+      "type": "transcript-event-field",
+      "eventType": "available_commands_update",
+      "path": "update.availableCommands.3.name",
+      "equals": "bash"
+    },
+    {
+      "type": "transcript-event-field",
+      "eventType": "available_commands_update",
+      "path": "update.availableCommands.5.name",
+      "equals": "rename"
+    }
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "id": "protocol.set-config-option",
+  "kind": "protocol",
+  "title": "Set Config Option",
+  "protocolDependencies": [
+    "initialize",
+    "session/new",
+    "session/set_config_option"
+  ],
+  "steps": [
+    {
+      "type": "initialize"
+    },
+    {
+      "type": "session-new"
+    },
+    {
+      "type": "set-config-option",
+      "key": "$first",
+      "value": "$first-value",
+      "skipIf": "!configOptions"
+    }
+  ],
+  "assertions": [
+    {
+      "type": "transcript-has-method",
+      "method": "session/set_config_option"
+    }
+  ]
+}

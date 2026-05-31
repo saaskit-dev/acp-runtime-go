@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "id": "host.write-file",
+  "kind": "scenario",
+  "scenarioCategory": "host-authority",
+  "title": "Host Write File",
+  "agents": {
+    "include": ["simulator-agent-acp-local"]
+  },
+  "level": "P1",
+  "protocolDependencies": [
+    "session/new",
+    "session/prompt",
+    "session/update",
+    "session/request_permission",
+    "fs/write_text_file"
+  ],
+  "steps": [
+    {
+      "type": "initialize"
+    },
+    {
+      "type": "session-new"
+    },
+    {
+      "type": "permission-decision",
+      "decision": "allow"
+    },
+    {
+      "type": "session-prompt",
+      "defaultPrompt": "Create ./.tmp/tmp-output.txt containing the word READY.",
+      "turnRef": "turn-1",
+      "prompt": "Create ./.tmp/tmp-output.txt containing the word READY."
+    },
+    {
+      "type": "wait-for-event",
+      "eventType": "tool_call_update"
+    }
+  ],
+  "assertions": [
+    {
+      "type": "transcript-has-method",
+      "method": "session/prompt"
+    },
+    {
+      "type": "transcript-has-method",
+      "method": "session/request_permission"
+    },
+    {
+      "type": "transcript-has-method",
+      "method": "fs/write_text_file"
+    },
+    {
+      "type": "transcript-has-event",
+      "eventType": "tool_call_update"
+    }
+  ]
+}

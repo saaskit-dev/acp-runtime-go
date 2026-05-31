@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "id": "protocol.session-list",
+  "kind": "protocol",
+  "title": "Session List",
+  "protocolDependencies": [
+    "initialize",
+    "session/new",
+    "session/list"
+  ],
+  "steps": [
+    {
+      "type": "initialize"
+    },
+    {
+      "type": "session-new"
+    },
+    {
+      "type": "session-list"
+    }
+  ],
+  "assertions": [
+    {
+      "type": "transcript-has-method",
+      "method": "session/list"
+    }
+  ]
+}

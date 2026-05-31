@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "id": "protocol.session-cancel",
+  "kind": "protocol",
+  "classification": {
+    "simulator-agent-acp-local": {
+      "executionErrorStatus": "not-observed",
+      "timeoutStatus": "not-observed",
+      "assertionFailureStatus": "not-observed"
+    },
+    "opencode": {
+      "timeoutStatus": "mismatch"
+    }
+  },
+  "title": "Session Cancel",
+  "protocolDependencies": [
+    "initialize",
+    "session/new",
+    "session/prompt",
+    "session/cancel",
+    "session/update"
+  ],
+  "steps": [
+    {
+      "type": "initialize"
+    },
+    {
+      "type": "session-new"
+    },
+    {
+      "type": "session-prompt",
+      "prompt": "Run `sleep 30` in a terminal and wait for it to finish.",
+      "turnRef": "turn-1"
+    },
+    {
+      "type": "wait-for-event",
+      "eventType": "tool_call_update",
+      "timeoutMs": 45000
+    },
+    {
+      "type": "session-cancel",
+      "turnRef": "turn-1"
+    },
+    {
+      "type": "wait-for-event",
+      "eventType": "available_commands_update",
+      "timeoutMs": 15000
+    }
+  ],
+  "assertions": [
+    {
+      "type": "transcript-has-method",
+      "method": "session/cancel"
+    },
+    {
+      "type": "transcript-has-event",
+      "eventType": "tool_call_update"
+    },
+    {
+      "type": "transcript-order",
+      "first": "session/prompt",
+      "then": "session/cancel"
+    }
+  ]
+}

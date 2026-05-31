@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "id": "protocol.available-commands-update",
+  "kind": "protocol",
+  "title": "Available Commands Update",
+  "protocolDependencies": [
+    "initialize",
+    "session/new",
+    "session/update"
+  ],
+  "steps": [
+    {
+      "type": "initialize"
+    },
+    {
+      "type": "session-new"
+    }
+  ],
+  "assertions": [
+    {
+      "type": "transcript-has-event",
+      "eventType": "available_commands_update"
+    }
+  ]
+}

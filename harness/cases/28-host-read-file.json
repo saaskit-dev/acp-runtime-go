@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "id": "host.read-file",
+  "kind": "scenario",
+  "scenarioCategory": "host-authority",
+  "title": "Host Read File",
+  "agents": {
+    "include": ["simulator-agent-acp-local"]
+  },
+  "level": "P1",
+  "protocolDependencies": [
+    "session/new",
+    "session/prompt",
+    "session/update",
+    "fs/read_text_file"
+  ],
+  "steps": [
+    {
+      "type": "initialize"
+    },
+    {
+      "type": "session-new"
+    },
+    {
+      "type": "permission-decision",
+      "decision": "allow"
+    },
+    {
+      "type": "session-prompt",
+      "defaultPrompt": "Read ./README.md and tell me the first heading.",
+      "turnRef": "turn-1",
+      "prompt": "Read ./README.md and tell me the first heading."
+    },
+    {
+      "type": "wait-for-event",
+      "eventType": "tool_call_update",
+      "timeoutMs": 45000
+    }
+  ],
+  "assertions": [
+    {
+      "type": "transcript-has-method",
+      "method": "session/prompt"
+    },
+    {
+      "type": "transcript-has-method",
+      "method": "fs/read_text_file"
+    },
+    {
+      "type": "transcript-has-event",
+      "eventType": "tool_call_update"
+    }
+  ]
+}

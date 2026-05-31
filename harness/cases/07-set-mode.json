@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "id": "protocol.set-mode",
+  "kind": "protocol",
+  "title": "Set Mode",
+  "protocolDependencies": [
+    "initialize",
+    "session/new",
+    "session/set_mode"
+  ],
+  "steps": [
+    {
+      "type": "initialize"
+    },
+    {
+      "type": "session-new"
+    },
+    {
+      "type": "set-mode",
+      "modeId": "$alternate",
+      "skipIf": "!modes"
+    }
+  ],
+  "assertions": [
+    {
+      "type": "transcript-has-method",
+      "method": "session/set_mode"
+    }
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "id": "scenario.multi-turn",
+  "kind": "scenario",
+  "title": "Multi-Turn Conversation",
+  "level": "P2",
+  "protocolDependencies": [
+    "session/new",
+    "session/prompt",
+    "session/update"
+  ],
+  "steps": [
+    {
+      "type": "initialize"
+    },
+    {
+      "type": "session-new"
+    },
+    {
+      "type": "session-prompt",
+      "prompt": "Remember the number 42. Reply with just OK.",
+      "turnRef": "turn-1"
+    },
+    {
+      "type": "wait-for-event",
+      "eventType": "completed"
+    },
+    {
+      "type": "session-prompt",
+      "prompt": "What number did I ask you to remember? Reply with just the number.",
+      "turnRef": "turn-2"
+    },
+    {
+      "type": "wait-for-event",
+      "eventType": "completed"
+    }
+  ],
+  "assertions": [
+    {
+      "type": "transcript-has-method",
+      "method": "session/prompt"
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "id": "protocol.initialize",
+  "kind": "protocol",
+  "title": "Initialize",
+  "protocolDependencies": [
+    "initialize"
+  ],
+  "steps": [
+    {
+      "type": "initialize"
+    }
+  ],
+  "assertions": [
+    {
+      "type": "transcript-has-method",
+      "method": "initialize"
+    }
+  ]
+}

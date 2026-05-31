@@ -1,0 +1,27 @@
+#!/bin/zsh
+set -euo pipefail
+
+if [[ $# -eq 0 ]]; then
+  exec make help
+fi
+
+target="$1"
+shift
+
+case "$target" in
+  agents)
+    go run ./cmd/acp-runtime --list-agents
+    ;;
+  runtime)
+    exec go run ./cmd/acp-runtime "$@"
+    ;;
+  simulator)
+    exec go run ./cmd/acp-simulator-agent "$@"
+    ;;
+  harness)
+    exec go run ./cmd/acp-harness "$@"
+    ;;
+  *)
+    exec make "$target" "$@"
+    ;;
+esac

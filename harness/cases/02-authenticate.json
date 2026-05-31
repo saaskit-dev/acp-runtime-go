@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "id": "protocol.authenticate",
+  "kind": "protocol",
+  "classification": {
+    "simulator-agent-acp-local": {
+      "assertionFailureStatus": "not-applicable"
+    },
+    "opencode": {
+      "executionErrorStatus": "mismatch"
+    },
+    "claude-acp": {
+      "assertionFailureStatus": "not-applicable"
+    }
+  },
+  "title": "Authenticate",
+  "protocolDependencies": [
+    "initialize",
+    "authenticate"
+  ],
+  "steps": [
+    {
+      "type": "initialize"
+    },
+    {
+      "type": "authenticate",
+      "skipIf": "!authMethods"
+    }
+  ],
+  "assertions": [
+    {
+      "type": "transcript-has-method",
+      "method": "initialize"
+    },
+    {
+      "type": "transcript-has-method",
+      "method": "authenticate"
+    }
+  ]
+}

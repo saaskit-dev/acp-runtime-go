@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "id": "scenario.error-recovery",
+  "kind": "scenario",
+  "title": "Error Recovery",
+  "level": "P2",
+  "protocolDependencies": [
+    "session/new",
+    "session/prompt",
+    "session/update"
+  ],
+  "steps": [
+    {
+      "type": "initialize"
+    },
+    {
+      "type": "session-new"
+    },
+    {
+      "type": "session-prompt",
+      "prompt": "Divide the color blue by the texture of sandpaper. If you cannot do this, reply with just the word ERROR.",
+      "turnRef": "turn-error"
+    },
+    {
+      "type": "wait-for-event",
+      "eventType": "completed",
+      "timeoutMs": 45000
+    }
+  ],
+  "assertions": [
+    {
+      "type": "transcript-has-method",
+      "method": "session/prompt"
+    }
+  ]
+}

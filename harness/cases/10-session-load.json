@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "id": "protocol.session-load",
+  "kind": "protocol",
+  "title": "Session Load",
+  "protocolDependencies": [
+    "initialize",
+    "session/new",
+    "session/load"
+  ],
+  "steps": [
+    {
+      "type": "initialize"
+    },
+    {
+      "type": "session-new"
+    },
+    {
+      "type": "session-load",
+      "sessionRef": "current",
+      "skipIf": "!capabilities.sessionLoad"
+    }
+  ],
+  "assertions": [
+    {
+      "type": "transcript-has-method",
+      "method": "session/load"
+    }
+  ]
+}

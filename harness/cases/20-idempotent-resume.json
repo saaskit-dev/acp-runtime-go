@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "id": "scenario.idempotent-resume",
+  "kind": "scenario",
+  "title": "Idempotent Session Resume",
+  "level": "P2",
+  "protocolDependencies": [
+    "session/new",
+    "session/resume"
+  ],
+  "steps": [
+    {
+      "type": "initialize"
+    },
+    {
+      "type": "session-new"
+    },
+    {
+      "type": "session-resume",
+      "sessionRef": "current",
+      "skipIf": "!capabilities.sessionCapabilities.resume"
+    },
+    {
+      "type": "session-resume",
+      "sessionRef": "current",
+      "skipIf": "!capabilities.sessionCapabilities.resume"
+    }
+  ],
+  "assertions": [
+    {
+      "type": "transcript-has-method",
+      "method": "session/resume"
+    }
+  ]
+}

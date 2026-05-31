@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "id": "scenario.read-file",
+  "kind": "scenario",
+  "scenarioCategory": "main-flow",
+  "probes": {
+    "simulator-agent-acp-local": {
+      "prompt": "/read $cwd/README.md"
+    },
+    "opencode": {
+      "prompt": "Use the read tool to inspect ./README.md. Do not rely on prior context. After you have read the file, answer with only its first markdown heading."
+    },
+    "cursor": {
+      "prompt": "Use your file reading tool to inspect ./README.md. Do not rely on prior context. After the tool call completes, answer with only the first markdown heading."
+    },
+    "pi-acp": {
+      "prompt": "Use your file reading tool to inspect ./README.md. Do not rely on prior context. After the tool call completes, answer with only the first markdown heading."
+    }
+  },
+  "title": "Read File",
+  "level": "P0",
+  "protocolDependencies": [
+    "session/new",
+    "session/prompt",
+    "session/update"
+  ],
+  "steps": [
+    {
+      "type": "initialize"
+    },
+    {
+      "type": "session-new"
+    },
+    {
+      "type": "permission-decision",
+      "decision": "allow"
+    },
+    {
+      "type": "session-prompt",
+      "prompt": "$probe-prompt",
+      "defaultPrompt": "Read ./README.md and tell me the first heading.",
+      "turnRef": "turn-1"
+    },
+    {
+      "type": "wait-for-event",
+      "eventType": "tool_call_update",
+      "timeoutMs": 45000
+    }
+  ],
+  "assertions": [
+    {
+      "type": "transcript-has-method",
+      "method": "session/prompt"
+    },
+    {
+      "type": "any-of",
+      "assertions": [
+        {
+          "type": "transcript-has-method",
+          "method": "fs/read_text_file"
+        },
+        {
+          "type": "transcript-has-tool-update",
+          "kind": "read",
+          "status": "completed"
+        },
+        {
+          "type": "transcript-has-tool-update",
+          "kind": "search",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "type": "transcript-has-event",
+      "eventType": "tool_call_update"
+    }
+  ]
+}

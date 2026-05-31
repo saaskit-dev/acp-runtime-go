@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "id": "protocol.session-prompt",
+  "kind": "protocol",
+  "title": "Session Prompt",
+  "protocolDependencies": [
+    "initialize",
+    "session/new",
+    "session/prompt",
+    "session/update"
+  ],
+  "steps": [
+    {
+      "type": "initialize"
+    },
+    {
+      "type": "session-new"
+    },
+    {
+      "type": "session-prompt",
+      "prompt": "Reply with the single word OK.",
+      "turnRef": "turn-1"
+    },
+    {
+      "type": "wait-for-event",
+      "eventType": "completed"
+    }
+  ],
+  "assertions": [
+    {
+      "type": "transcript-has-method",
+      "method": "session/prompt"
+    }
+  ]
+}
