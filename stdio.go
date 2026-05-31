@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"sync"
 	"syscall"
@@ -37,7 +38,7 @@ func NewStdioConnectionFactory(options StdioFactoryOptions) ConnectionFactory {
 		var stderr bytes.Buffer
 		switch options.Stderr {
 		case "inherit":
-			cmd.Stderr = io.Discard
+			cmd.Stderr = os.Stderr
 		case "ignore":
 			cmd.Stderr = io.Discard
 		default:
@@ -54,7 +55,7 @@ func NewStdioConnectionFactory(options StdioFactoryOptions) ConnectionFactory {
 		}
 		peer := NewPeer(stdout, stdin, peerOptions)
 		conn := NewConnection(peer, input.Client)
-		startCtx, cancelStart := context.WithCancel(context.Background())
+		startCtx, cancelStart := context.WithCancel(context.WithoutCancel(ctx))
 		done := make(chan error, 1)
 		go func() {
 			done <- peer.Start(startCtx)

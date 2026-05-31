@@ -1,4 +1,4 @@
-.PHONY: help clean build lint test runtime simulator harness-admission harness-full install
+.PHONY: help clean build lint test test-race runtime simulator harness-admission harness-full install
 
 BIN_DIR ?= bin
 RUNTIME_AGENT := $(word 2,$(MAKECMDGOALS))
@@ -9,6 +9,7 @@ help:
 		'  make build' \
 		'  make lint' \
 		'  make test' \
+		'  make test-race' \
 		'  make runtime simulator' \
 		'  make runtime <registry-agent-id>' \
 		'  make harness-admission' \
@@ -28,6 +29,9 @@ lint:
 
 test:
 	go test ./...
+
+test-race:
+	go test -race ./...
 
 runtime: build
 	@if [ -z "$(RUNTIME_AGENT)" ]; then \

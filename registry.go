@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -15,7 +16,20 @@ import (
 	"time"
 )
 
-const registryURL = "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json"
+const (
+	registryCacheMaxAge      = 24 * time.Hour
+	registryHTTPTimeout      = 30 * time.Second
+	maxRegistryJSONBytes     = 8 * 1024 * 1024
+	maxArchiveDownloadBytes  = 256 * 1024 * 1024
+	maxArchiveExtractBytes   = 512 * 1024 * 1024
+	maxArchiveFileBytes      = 128 * 1024 * 1024
+	maxArchiveExtractedFiles = 4096
+)
+
+var (
+	registryURL        = "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json"
+	registryHTTPClient = &http.Client{Timeout: registryHTTPTimeout}
+)
 
 var RegistryAgentAliases = map[string]string{
 	"claude":         "claude-acp",
@@ -118,7 +132,7 @@ func ListRuntimeRegistryAgents(ctx context.Context) ([]RegistryAgent, error) {
 
 func fetchRegistry(ctx context.Context) (Registry, error) {
 	cachePath := ResolveRuntimeCachePath("registry.json")
-	if info, err := os.Stat(cachePath); err == nil && time.Since(info.ModTime()) < 24*time.Hour {
+	if info, err := os.Stat(cachePath); err == nil && time.Since(info.ModTime()) < registryCacheMaxAge {
 		bytes, err := os.ReadFile(cachePath)
 		if err == nil {
 			var reg Registry
@@ -131,7 +145,7 @@ func fetchRegistry(ctx context.Context) (Registry, error) {
 	if err != nil {
 		return Registry{}, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := registryHTTPClient.Do(req)
 	if err != nil {
 		return Registry{}, err
 	}
@@ -139,7 +153,7 @@ func fetchRegistry(ctx context.Context) (Registry, error) {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return Registry{}, fmt.Errorf("failed to fetch ACP registry: %s", resp.Status)
 	}
-	bytes, err := io.ReadAll(resp.Body)
+	bytes, err := readLimited(resp.Body, maxRegistryJSONBytes, "ACP registry")
 	if err != nil {
 		return Registry{}, err
 	}
@@ -189,20 +203,35 @@ func platformKey() string {
 }
 
 func ensureBinary(ctx context.Context, agentID string, target BinaryTarget) (string, error) {
-	filename := filepath.Base(target.Archive)
-	cacheDir := ResolveRuntimeCachePath("agents", agentID, strings.TrimSuffix(strings.TrimSuffix(filename, ".tar.gz"), ".tgz"))
-	commandPath := filepath.Join(cacheDir, strings.TrimPrefix(target.Cmd, "./"))
+	filename := archiveFilename(target.Archive)
+	if !isSupportedArchive(filename) {
+		return "", fmt.Errorf("unsupported archive format %s", filename)
+	}
+	cacheDir, err := filepath.Abs(ResolveRuntimeCachePath("agents", agentID, archiveCacheName(filename)))
+	if err != nil {
+		return "", err
+	}
+	commandPath, err := safeCachePath(cacheDir, target.Cmd)
+	if err != nil {
+		return "", fmt.Errorf("invalid binary command path %q: %w", target.Cmd, err)
+	}
 	if info, err := os.Stat(commandPath); err == nil && !info.IsDir() {
 		return commandPath, nil
 	}
-	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+	parentDir := filepath.Dir(cacheDir)
+	if err := os.MkdirAll(parentDir, 0o755); err != nil {
 		return "", err
 	}
+	tmpDir, err := os.MkdirTemp(parentDir, "."+filepath.Base(cacheDir)+"-*")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(tmpDir)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.Archive, nil)
 	if err != nil {
 		return "", err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := registryHTTPClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -210,46 +239,155 @@ func ensureBinary(ctx context.Context, agentID string, target BinaryTarget) (str
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", fmt.Errorf("failed to download %s: %s", target.Archive, resp.Status)
 	}
-	if strings.HasSuffix(filename, ".tar.gz") || strings.HasSuffix(filename, ".tgz") {
-		gz, err := gzip.NewReader(resp.Body)
+	if err := extractTarGzip(resp.Body, tmpDir); err != nil {
+		return "", err
+	}
+	tmpCommandPath, err := safeCachePath(tmpDir, target.Cmd)
+	if err != nil {
+		return "", fmt.Errorf("invalid binary command path %q: %w", target.Cmd, err)
+	}
+	if info, err := os.Stat(tmpCommandPath); err != nil || info.IsDir() {
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("binary command %q not found in archive: %w", target.Cmd, err)
 		}
-		defer gz.Close()
-		tr := tar.NewReader(gz)
-		for {
-			hdr, err := tr.Next()
-			if err == io.EOF {
-				break
+		return "", fmt.Errorf("binary command %q is a directory", target.Cmd)
+	}
+	if err := os.RemoveAll(cacheDir); err != nil {
+		return "", err
+	}
+	if err := os.Rename(tmpDir, cacheDir); err != nil {
+		return "", err
+	}
+	return commandPath, nil
+}
+
+func readLimited(r io.Reader, max int64, label string) ([]byte, error) {
+	bytes, err := io.ReadAll(io.LimitReader(r, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(bytes)) > max {
+		return nil, fmt.Errorf("%s exceeds maximum size of %d bytes", label, max)
+	}
+	return bytes, nil
+}
+
+func archiveFilename(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err == nil && parsed.Path != "" {
+		return filepath.Base(parsed.Path)
+	}
+	return filepath.Base(rawURL)
+}
+
+func archiveCacheName(filename string) string {
+	return strings.TrimSuffix(strings.TrimSuffix(filename, ".tar.gz"), ".tgz")
+}
+
+func isSupportedArchive(filename string) bool {
+	return strings.HasSuffix(filename, ".tar.gz") || strings.HasSuffix(filename, ".tgz")
+}
+
+func isArchiveRootPath(name string) bool {
+	return filepath.Clean(filepath.FromSlash(name)) == "."
+}
+
+func extractTarGzip(r io.Reader, destDir string) error {
+	limited := &io.LimitedReader{R: r, N: maxArchiveDownloadBytes + 1}
+	gz, err := gzip.NewReader(limited)
+	if err != nil {
+		return err
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	var totalBytes int64
+	var files int
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if hdr.Name == "" {
+			continue
+		}
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if isArchiveRootPath(hdr.Name) {
+				continue
 			}
+			dest, err := safeCachePath(destDir, hdr.Name)
 			if err != nil {
-				return "", err
+				return fmt.Errorf("unsafe archive directory %q: %w", hdr.Name, err)
 			}
-			dest := filepath.Join(cacheDir, filepath.Clean(hdr.Name))
-			if !strings.HasPrefix(dest, cacheDir) {
-				continue
+			if err := os.MkdirAll(dest, 0o755); err != nil {
+				return err
 			}
-			if hdr.FileInfo().IsDir() {
-				_ = os.MkdirAll(dest, 0o755)
-				continue
+		case tar.TypeReg, tar.TypeRegA:
+			if hdr.Size < 0 {
+				return fmt.Errorf("archive entry %q has negative size", hdr.Name)
+			}
+			if hdr.Size > maxArchiveFileBytes {
+				return fmt.Errorf("archive entry %q exceeds maximum file size", hdr.Name)
+			}
+			totalBytes += hdr.Size
+			if totalBytes > maxArchiveExtractBytes {
+				return fmt.Errorf("archive exceeds maximum extracted size of %d bytes", maxArchiveExtractBytes)
+			}
+			files++
+			if files > maxArchiveExtractedFiles {
+				return fmt.Errorf("archive exceeds maximum file count of %d", maxArchiveExtractedFiles)
+			}
+			dest, err := safeCachePath(destDir, hdr.Name)
+			if err != nil {
+				return fmt.Errorf("unsafe archive file %q: %w", hdr.Name, err)
 			}
 			if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-				return "", err
+				return err
 			}
-			out, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, hdr.FileInfo().Mode())
+			out, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, hdr.FileInfo().Mode().Perm())
 			if err != nil {
-				return "", err
+				return err
 			}
 			_, copyErr := io.Copy(out, tr)
 			closeErr := out.Close()
 			if copyErr != nil {
-				return "", copyErr
+				return copyErr
 			}
 			if closeErr != nil {
-				return "", closeErr
+				return closeErr
 			}
+		default:
+			return fmt.Errorf("unsupported archive entry %q with type %d", hdr.Name, hdr.Typeflag)
 		}
-		return commandPath, nil
 	}
-	return "", fmt.Errorf("unsupported archive format %s", filename)
+	if limited.N == 0 {
+		return fmt.Errorf("archive exceeds maximum download size of %d bytes", maxArchiveDownloadBytes)
+	}
+	return nil
+}
+
+func safeCachePath(root, name string) (string, error) {
+	clean := filepath.Clean(filepath.FromSlash(name))
+	if clean == "." || filepath.IsAbs(clean) {
+		return "", fmt.Errorf("path must be relative")
+	}
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("path escapes cache directory")
+	}
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	dest := filepath.Join(rootAbs, clean)
+	rel, err := filepath.Rel(rootAbs, dest)
+	if err != nil {
+		return "", err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("path escapes cache directory")
+	}
+	return dest, nil
 }

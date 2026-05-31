@@ -15,6 +15,7 @@ const (
 	ErrorProcess        ErrorKind = "process"
 	ErrorProtocol       ErrorKind = "protocol"
 	ErrorResume         ErrorKind = "resume"
+	ErrorSessionClosed  ErrorKind = "session_closed"
 	ErrorSystemPrompt   ErrorKind = "system_prompt"
 	ErrorTurnCancelled  ErrorKind = "turn_cancelled"
 	ErrorTurnCoalesced  ErrorKind = "turn_coalesced"
