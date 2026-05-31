@@ -108,12 +108,13 @@ func (p *Peer) Start(ctx context.Context) error {
 			if p.opts.OnRawMessage != nil {
 				p.opts.OnRawMessage("inbound", append(json.RawMessage(nil), line...))
 			}
-			var msg rpcMessage
-			if unmarshalErr := json.Unmarshal(line, &msg); unmarshalErr == nil {
+			if msg, ok := parseRPCMessage(line); ok {
 				if len(msg.ID) > 0 && msg.Method == "" {
 					p.resolvePending(msg)
 				} else if msg.Method != "" {
 					if len(msg.ID) > 0 {
+						msg.ID = copyRawMessage(msg.ID)
+						msg.Params = copyRawMessage(msg.Params)
 						go p.handleRequest(ctx, msg)
 					} else {
 						p.handleNotification(ctx, msg)
@@ -225,6 +226,7 @@ func (p *Peer) resolvePending(msg rpcMessage) {
 	if !ok {
 		return
 	}
+	msg.Result = copyRawMessage(msg.Result)
 	p.pendingMu.Lock()
 	ch := p.pending[id]
 	delete(p.pending, id)
@@ -265,7 +267,7 @@ func (p *Peer) handleNotification(ctx context.Context, msg rpcMessage) {
 	handler := p.notificationHandlers[msg.Method]
 	p.handlersMu.RUnlock()
 	if handler != nil {
-		handler(ctx, msg.Params)
+		handler(ctx, copyRawMessage(msg.Params))
 	}
 }
 
@@ -294,6 +296,34 @@ func recycleRPCWriteBuffer(bufferPtr *[]byte, buffer []byte) {
 }
 
 func appendRPCMessage(dst []byte, msg rpcMessage) []byte {
+	if msg.JSONRPC == "2.0" && msg.Error == nil {
+		if len(msg.ID) == 0 && msg.Method != "" && len(msg.Params) > 0 && len(msg.Result) == 0 {
+			dst = append(dst, `{"jsonrpc":"2.0","method":`...)
+			dst = appendMethodValue(dst, msg.Method)
+			dst = append(dst, `,"params":`...)
+			dst = append(dst, msg.Params...)
+			dst = append(dst, '}')
+			return dst
+		}
+		if len(msg.ID) > 0 && msg.Method != "" && len(msg.Params) > 0 && len(msg.Result) == 0 {
+			dst = append(dst, `{"jsonrpc":"2.0","id":`...)
+			dst = append(dst, msg.ID...)
+			dst = append(dst, `,"method":`...)
+			dst = appendMethodValue(dst, msg.Method)
+			dst = append(dst, `,"params":`...)
+			dst = append(dst, msg.Params...)
+			dst = append(dst, '}')
+			return dst
+		}
+		if len(msg.ID) > 0 && msg.Method == "" && len(msg.Result) > 0 {
+			dst = append(dst, `{"jsonrpc":"2.0","id":`...)
+			dst = append(dst, msg.ID...)
+			dst = append(dst, `,"result":`...)
+			dst = append(dst, msg.Result...)
+			dst = append(dst, '}')
+			return dst
+		}
+	}
 	dst = append(dst, '{')
 	first := true
 	if msg.JSONRPC != "" {
@@ -303,7 +333,7 @@ func appendRPCMessage(dst []byte, msg rpcMessage) []byte {
 		dst = appendRawField(dst, &first, "id", msg.ID)
 	}
 	if msg.Method != "" {
-		dst = appendStringField(dst, &first, "method", msg.Method)
+		dst = appendMethodField(dst, &first, msg.Method)
 	}
 	if len(msg.Params) > 0 {
 		dst = appendRawField(dst, &first, "params", msg.Params)
@@ -335,6 +365,50 @@ func appendRPCError(dst []byte, rpcErr *RPCError) []byte {
 func appendStringField(dst []byte, first *bool, name string, value string) []byte {
 	dst = appendFieldPrefix(dst, first, name)
 	return strconv.AppendQuote(dst, value)
+}
+
+func appendMethodField(dst []byte, first *bool, method string) []byte {
+	dst = appendFieldPrefix(dst, first, "method")
+	return appendMethodValue(dst, method)
+}
+
+func appendMethodValue(dst []byte, method string) []byte {
+	switch method {
+	case "authenticate":
+		return append(dst, `"authenticate"`...)
+	case "fs/read_text_file":
+		return append(dst, `"fs/read_text_file"`...)
+	case "fs/write_text_file":
+		return append(dst, `"fs/write_text_file"`...)
+	case "initialize":
+		return append(dst, `"initialize"`...)
+	case "session/cancel":
+		return append(dst, `"session/cancel"`...)
+	case "session/close":
+		return append(dst, `"session/close"`...)
+	case "session/fork":
+		return append(dst, `"session/fork"`...)
+	case "session/list":
+		return append(dst, `"session/list"`...)
+	case "session/load":
+		return append(dst, `"session/load"`...)
+	case "session/new":
+		return append(dst, `"session/new"`...)
+	case "session/prompt":
+		return append(dst, `"session/prompt"`...)
+	case "session/request_permission":
+		return append(dst, `"session/request_permission"`...)
+	case "session/resume":
+		return append(dst, `"session/resume"`...)
+	case "session/set_config_option":
+		return append(dst, `"session/set_config_option"`...)
+	case "session/set_mode":
+		return append(dst, `"session/set_mode"`...)
+	case "session/update":
+		return append(dst, `"session/update"`...)
+	default:
+		return strconv.AppendQuote(dst, method)
+	}
 }
 
 func appendRawField(dst []byte, first *bool, name string, value json.RawMessage) []byte {
@@ -375,6 +449,13 @@ func normalizeRaw(raw json.RawMessage) json.RawMessage {
 	return raw
 }
 
+func copyRawMessage(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return nil
+	}
+	return append(json.RawMessage(nil), raw...)
+}
+
 func (p *Peer) readMessageLine() ([]byte, error) {
 	var line []byte
 	for {
@@ -410,6 +491,406 @@ func trimLineEnding(line []byte) []byte {
 		line = line[:len(line)-1]
 	}
 	return line
+}
+
+func parseRPCMessage(line []byte) (rpcMessage, bool) {
+	var msg rpcMessage
+	line = trimJSONSpace(line)
+	if len(line) < 2 || line[0] != '{' {
+		return msg, false
+	}
+	i := 1
+	for {
+		i = skipJSONSpace(line, i)
+		if i >= len(line) {
+			return msg, false
+		}
+		if line[i] == '}' {
+			return msg, true
+		}
+		key, keyEscaped, next, ok := scanJSONString(line, i)
+		if !ok {
+			return msg, false
+		}
+		i = skipJSONSpace(line, next)
+		if i >= len(line) || line[i] != ':' {
+			return msg, false
+		}
+		i = skipJSONSpace(line, i+1)
+		valueStart := i
+		valueEnd, ok := scanJSONValue(line, i)
+		if !ok {
+			return msg, false
+		}
+		value := trimJSONSpace(line[valueStart:valueEnd])
+		field := rpcFieldUnknown
+		if !keyEscaped {
+			field = matchRPCField(key)
+		} else {
+			keyString, ok := unquoteJSONString(key, true)
+			if !ok {
+				return msg, false
+			}
+			field = matchRPCFieldString(keyString)
+		}
+		switch field {
+		case rpcFieldID:
+			msg.ID = value
+		case rpcFieldMethod:
+			method, ok := parseRPCMethodValue(value)
+			if !ok {
+				return msg, false
+			}
+			msg.Method = method
+		case rpcFieldParams:
+			msg.Params = value
+		case rpcFieldResult:
+			msg.Result = value
+		case rpcFieldError:
+			var rpcErr RPCError
+			if err := json.Unmarshal(value, &rpcErr); err != nil {
+				return msg, false
+			}
+			msg.Error = &rpcErr
+		case rpcFieldUnknown:
+		}
+		i = skipJSONSpace(line, valueEnd)
+		if i >= len(line) {
+			return msg, false
+		}
+		switch line[i] {
+		case ',':
+			i++
+		case '}':
+			return msg, true
+		default:
+			return msg, false
+		}
+	}
+}
+
+type rpcField uint8
+
+const (
+	rpcFieldUnknown rpcField = iota
+	rpcFieldID
+	rpcFieldMethod
+	rpcFieldParams
+	rpcFieldResult
+	rpcFieldError
+)
+
+func matchRPCField(key []byte) rpcField {
+	switch len(key) {
+	case 2:
+		if equalASCII(key, "id") {
+			return rpcFieldID
+		}
+	case 5:
+		if equalASCII(key, "error") {
+			return rpcFieldError
+		}
+	case 6:
+		if equalASCII(key, "method") {
+			return rpcFieldMethod
+		}
+		if equalASCII(key, "params") {
+			return rpcFieldParams
+		}
+		if equalASCII(key, "result") {
+			return rpcFieldResult
+		}
+	}
+	return rpcFieldUnknown
+}
+
+func matchRPCFieldString(key string) rpcField {
+	switch key {
+	case "id":
+		return rpcFieldID
+	case "method":
+		return rpcFieldMethod
+	case "params":
+		return rpcFieldParams
+	case "result":
+		return rpcFieldResult
+	case "error":
+		return rpcFieldError
+	default:
+		return rpcFieldUnknown
+	}
+}
+
+func equalASCII(bytes []byte, value string) bool {
+	if len(bytes) != len(value) {
+		return false
+	}
+	for i := range bytes {
+		if bytes[i] != value[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func parseRPCMethodValue(value []byte) (string, bool) {
+	raw, escaped, end, ok := scanJSONString(value, 0)
+	if !ok || skipJSONSpace(value, end) != len(value) {
+		return "", false
+	}
+	if !escaped {
+		return canonicalRPCMethod(raw), true
+	}
+	return unquoteJSONString(raw, true)
+}
+
+func canonicalRPCMethod(raw []byte) string {
+	if equalASCII(raw, "session/update") {
+		return "session/update"
+	}
+	if equalASCII(raw, "session/prompt") {
+		return "session/prompt"
+	}
+	if equalASCII(raw, "session/cancel") {
+		return "session/cancel"
+	}
+	if equalASCII(raw, "initialize") {
+		return "initialize"
+	}
+	if equalASCII(raw, "authenticate") {
+		return "authenticate"
+	}
+	if equalASCII(raw, "session/new") {
+		return "session/new"
+	}
+	if equalASCII(raw, "session/load") {
+		return "session/load"
+	}
+	if equalASCII(raw, "session/resume") {
+		return "session/resume"
+	}
+	if equalASCII(raw, "session/fork") {
+		return "session/fork"
+	}
+	if equalASCII(raw, "session/list") {
+		return "session/list"
+	}
+	if equalASCII(raw, "session/set_mode") {
+		return "session/set_mode"
+	}
+	if equalASCII(raw, "session/set_config_option") {
+		return "session/set_config_option"
+	}
+	if equalASCII(raw, "session/close") {
+		return "session/close"
+	}
+	if equalASCII(raw, "session/request_permission") {
+		return "session/request_permission"
+	}
+	if equalASCII(raw, "fs/read_text_file") {
+		return "fs/read_text_file"
+	}
+	if equalASCII(raw, "fs/write_text_file") {
+		return "fs/write_text_file"
+	}
+	return string(raw)
+}
+
+func scanJSONString(bytes []byte, i int) ([]byte, bool, int, bool) {
+	if i >= len(bytes) || bytes[i] != '"' {
+		return nil, false, i, false
+	}
+	start := i + 1
+	escaped := false
+	for i = start; i < len(bytes); i++ {
+		switch bytes[i] {
+		case '\\':
+			escaped = true
+			i++
+			if i >= len(bytes) {
+				return nil, escaped, i, false
+			}
+		case '"':
+			return bytes[start:i], escaped, i + 1, true
+		case 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+			16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31:
+			return nil, escaped, i, false
+		}
+	}
+	return nil, escaped, i, false
+}
+
+func unquoteJSONString(raw []byte, escaped bool) (string, bool) {
+	if !escaped {
+		return string(raw), true
+	}
+	quoted := make([]byte, 0, len(raw)+2)
+	quoted = append(quoted, '"')
+	quoted = append(quoted, raw...)
+	quoted = append(quoted, '"')
+	value, err := strconv.Unquote(string(quoted))
+	return value, err == nil
+}
+
+func scanJSONValue(bytes []byte, i int) (int, bool) {
+	i = skipJSONSpace(bytes, i)
+	if i >= len(bytes) {
+		return i, false
+	}
+	switch bytes[i] {
+	case '"':
+		_, _, end, ok := scanJSONString(bytes, i)
+		return end, ok
+	case '{', '[':
+		return scanJSONComposite(bytes, i)
+	default:
+		return scanJSONLiteral(bytes, i)
+	}
+}
+
+func scanJSONComposite(bytes []byte, i int) (int, bool) {
+	var stack [64]byte
+	depth := 1
+	stack[0] = matchingJSONClose(bytes[i])
+	i++
+	for i < len(bytes) {
+		switch bytes[i] {
+		case '"':
+			_, _, end, ok := scanJSONString(bytes, i)
+			if !ok {
+				return i, false
+			}
+			i = end
+			continue
+		case '{', '[':
+			if depth == len(stack) {
+				return scanJSONCompositeSlow(bytes, i, stack[:], depth)
+			}
+			stack[depth] = matchingJSONClose(bytes[i])
+			depth++
+		case '}', ']':
+			if depth == 0 || bytes[i] != stack[depth-1] {
+				return i, false
+			}
+			depth--
+			if depth == 0 {
+				return i + 1, true
+			}
+		}
+		i++
+	}
+	return i, false
+}
+
+func scanJSONCompositeSlow(bytes []byte, i int, initial []byte, depth int) (int, bool) {
+	stack := append([]byte(nil), initial[:depth]...)
+	for i < len(bytes) {
+		switch bytes[i] {
+		case '"':
+			_, _, end, ok := scanJSONString(bytes, i)
+			if !ok {
+				return i, false
+			}
+			i = end
+			continue
+		case '{', '[':
+			stack = append(stack, matchingJSONClose(bytes[i]))
+		case '}', ']':
+			if len(stack) == 0 || bytes[i] != stack[len(stack)-1] {
+				return i, false
+			}
+			stack = stack[:len(stack)-1]
+			if len(stack) == 0 {
+				return i + 1, true
+			}
+		}
+		i++
+	}
+	return i, false
+}
+
+func scanJSONLiteral(bytes []byte, i int) (int, bool) {
+	start := i
+	for i < len(bytes) {
+		switch bytes[i] {
+		case ',', '}', ']', ' ', '\n', '\r', '\t':
+			return i, isValidJSONLiteral(bytes[start:i])
+		}
+		i++
+	}
+	return i, isValidJSONLiteral(bytes[start:i])
+}
+
+func isValidJSONLiteral(value []byte) bool {
+	if len(value) == 0 {
+		return false
+	}
+	if equalASCII(value, "true") || equalASCII(value, "false") || equalASCII(value, "null") {
+		return true
+	}
+	return isValidJSONNumber(value)
+}
+
+func isValidJSONNumber(value []byte) bool {
+	i := 0
+	if value[i] == '-' {
+		i++
+		if i == len(value) {
+			return false
+		}
+	}
+	if value[i] == '0' {
+		i++
+	} else if value[i] >= '1' && value[i] <= '9' {
+		for i < len(value) && value[i] >= '0' && value[i] <= '9' {
+			i++
+		}
+	} else {
+		return false
+	}
+	if i < len(value) && value[i] == '.' {
+		i++
+		start := i
+		for i < len(value) && value[i] >= '0' && value[i] <= '9' {
+			i++
+		}
+		if i == start {
+			return false
+		}
+	}
+	if i < len(value) && (value[i] == 'e' || value[i] == 'E') {
+		i++
+		if i < len(value) && (value[i] == '+' || value[i] == '-') {
+			i++
+		}
+		start := i
+		for i < len(value) && value[i] >= '0' && value[i] <= '9' {
+			i++
+		}
+		if i == start {
+			return false
+		}
+	}
+	return i == len(value)
+}
+
+func matchingJSONClose(open byte) byte {
+	if open == '{' {
+		return '}'
+	}
+	return ']'
+}
+
+func skipJSONSpace(bytes []byte, i int) int {
+	for i < len(bytes) {
+		switch bytes[i] {
+		case ' ', '\n', '\r', '\t':
+			i++
+		default:
+			return i
+		}
+	}
+	return i
 }
 
 func parseRPCID(raw json.RawMessage) (int64, bool) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -53,7 +54,7 @@ type activeTurn struct {
 	id         string
 	events     chan TurnEvent
 	completion chan TurnResult
-	outputText string
+	outputText strings.Builder
 }
 
 type sessionBootstrap struct {
@@ -216,7 +217,7 @@ func (d *acpSessionDriver) runPrompt(ctx context.Context, active *activeTurn, pr
 		return
 	}
 	d.mu.RLock()
-	outputText := active.outputText
+	outputText := active.outputText.String()
 	d.mu.RUnlock()
 	completion := TurnCompletion{TurnID: active.id, OutputText: outputText, StopReason: resp.StopReason, Usage: resp.Usage}
 	d.finishTurn(active, completion, nil)
@@ -253,7 +254,7 @@ func (d *acpSessionDriver) handleSessionUpdate(notification SessionNotification)
 	switch update.SessionUpdate {
 	case "agent_message_chunk":
 		if active != nil {
-			active.outputText += update.Text
+			active.outputText.WriteString(update.Text)
 		}
 	case "current_mode_update":
 		if update.CurrentModeID != "" {

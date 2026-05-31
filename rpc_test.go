@@ -94,3 +94,35 @@ func TestParseRPCIDSupportsNumericResponses(t *testing.T) {
 		}
 	}
 }
+
+func TestParseRPCMessageExtractsEnvelopeWithoutFullUnmarshal(t *testing.T) {
+	msg, ok := parseRPCMessage([]byte(`{"jsonrpc":"2.0","id":42,"result":{"items":[1,{"name":"ok"}]}}`))
+	if !ok {
+		t.Fatalf("parseRPCMessage() failed")
+	}
+	if string(msg.ID) != "42" {
+		t.Fatalf("ID = %q", msg.ID)
+	}
+	if string(msg.Result) != `{"items":[1,{"name":"ok"}]}` {
+		t.Fatalf("Result = %s", msg.Result)
+	}
+}
+
+func TestParseRPCMessageSupportsEscapedMethod(t *testing.T) {
+	msg, ok := parseRPCMessage([]byte(`{"jsonrpc":"2.0","method":"method/\"quoted\"","params":{"value":"a,b}"}}`))
+	if !ok {
+		t.Fatalf("parseRPCMessage() failed")
+	}
+	if msg.Method != `method/"quoted"` {
+		t.Fatalf("Method = %q", msg.Method)
+	}
+	if string(msg.Params) != `{"value":"a,b}"}` {
+		t.Fatalf("Params = %s", msg.Params)
+	}
+}
+
+func TestParseRPCMessageRejectsInvalidLiteral(t *testing.T) {
+	if _, ok := parseRPCMessage([]byte(`{"jsonrpc":"2.0","id":x,"result":null}`)); ok {
+		t.Fatalf("parseRPCMessage() accepted invalid literal")
+	}
+}
