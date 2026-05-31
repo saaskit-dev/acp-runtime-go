@@ -98,6 +98,14 @@ Built binaries are written to `bin/`:
 
 Public runtime policy names remain exact: `yolo`, `accept-edits`, and `read-only`.
 
+## Performance Notes
+
+The default RPC APIs accept ordinary Go structs and keep the host integration simple:
+`Peer.Call(ctx, method, params, &result)` and `Peer.Notify(ctx, method, params)`.
+High-throughput hosts that already hold encoded JSON can use `Peer.CallRaw` and
+`Peer.NotifyRaw` with `json.RawMessage` to avoid interface boxing and repeated parameter
+marshalling on hot paths.
+
 ## Simulator
 
 The Go simulator is a deterministic ACP stdio agent. It supports:

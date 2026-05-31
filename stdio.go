@@ -46,11 +46,13 @@ func NewStdioConnectionFactory(options StdioFactoryOptions) ConnectionFactory {
 		if err := cmd.Start(); err != nil {
 			return ConnectionHandle{}, wrapError(ErrorProcess, "stdio.spawn", "failed to spawn ACP stdio process", err)
 		}
-		peer := NewPeer(stdout, stdin, PeerOptions{OnRawMessage: func(direction string, message json.RawMessage) {
-			if options.OnACPMessage != nil {
+		peerOptions := PeerOptions{}
+		if options.OnACPMessage != nil {
+			peerOptions.OnRawMessage = func(direction string, message json.RawMessage) {
 				options.OnACPMessage(direction, message)
 			}
-		}})
+		}
+		peer := NewPeer(stdout, stdin, peerOptions)
 		conn := NewConnection(peer, input.Client)
 		startCtx, cancelStart := context.WithCancel(context.Background())
 		done := make(chan error, 1)

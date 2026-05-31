@@ -95,6 +95,11 @@ make lint
 
 公共 runtime policy 名称保持精确：`yolo`、`accept-edits`、`read-only`。
 
+## 性能说明
+
+默认 RPC API 接收普通 Go struct，优先保证宿主集成简洁：`Peer.Call(ctx, method, params, &result)` 和 `Peer.Notify(ctx, method, params)`。
+高吞吐宿主如果已经持有编码后的 JSON，可直接使用 `Peer.CallRaw` 和 `Peer.NotifyRaw` 传入 `json.RawMessage`，避免热路径上的 interface 装箱和重复参数编码。
+
 ## Simulator
 
 Go simulator 是确定性的 ACP stdio agent，支持：
