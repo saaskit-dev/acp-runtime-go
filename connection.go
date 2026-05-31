@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"strings"
 )
 
 type Connection struct {
-	peer *Peer
+	peer          *Peer
+	observability ObservabilityOptions
 }
 
 type ConnectionHandle struct {
@@ -32,7 +34,11 @@ type Client struct {
 }
 
 func NewConnection(peer *Peer, client Client) *Connection {
-	conn := &Connection{peer: peer}
+	return NewConnectionWithObservability(peer, client, ObservabilityOptions{})
+}
+
+func NewConnectionWithObservability(peer *Peer, client Client, observability ObservabilityOptions) *Connection {
+	conn := &Connection{peer: peer, observability: observability}
 	if client.Authority.Permission != nil {
 		peer.RegisterRequest("session/request_permission", func(ctx context.Context, raw json.RawMessage) (any, error) {
 			var req struct {
@@ -55,7 +61,7 @@ func NewConnection(peer *Peer, client Client) *Connection {
 			if err != nil {
 				return nil, err
 			}
-			return map[string]any{"outcome": decision.Outcome, "optionId": decision.OptionID}, nil
+			return permissionResponse{Outcome: decision.Outcome, OptionID: decision.OptionID}, nil
 		})
 	}
 	if client.Authority.Filesystem != nil {
@@ -70,7 +76,7 @@ func NewConnection(peer *Peer, client Client) *Connection {
 			if err != nil {
 				return nil, err
 			}
-			return map[string]any{"content": text}, nil
+			return readTextFileResponse{Content: text}, nil
 		})
 		peer.RegisterRequest("fs/write_text_file", func(ctx context.Context, raw json.RawMessage) (any, error) {
 			var req struct {
@@ -80,7 +86,7 @@ func NewConnection(peer *Peer, client Client) *Connection {
 			if err := json.Unmarshal(raw, &req); err != nil {
 				return nil, err
 			}
-			return map[string]any{}, client.Authority.Filesystem.WriteTextFile(ctx, req.Path, req.Content)
+			return emptyResponse{}, client.Authority.Filesystem.WriteTextFile(ctx, req.Path, req.Content)
 		})
 	}
 	return conn
@@ -89,9 +95,11 @@ func NewConnection(peer *Peer, client Client) *Connection {
 func (c *Connection) SetSessionUpdateHandler(handler func(context.Context, SessionNotification)) {
 	c.peer.RegisterNotification("session/update", func(ctx context.Context, raw json.RawMessage) {
 		var notification SessionNotification
-		if err := json.Unmarshal(raw, &notification); err == nil {
-			handler(ctx, notification)
+		if err := json.Unmarshal(raw, &notification); err != nil {
+			c.emitProtocolError(ctx, "session/update", raw, err)
+			return
 		}
+		handler(ctx, notification)
 	})
 }
 
@@ -184,7 +192,7 @@ func defaultClient(options RuntimeOptions, handlers AuthorityHandlers) Client {
 				ReadTextFile:  handlers.Filesystem != nil,
 				WriteTextFile: handlers.Filesystem != nil,
 			},
-			Auth: ClientAuthCapabilities{Terminal: true},
+			Auth: ClientAuthCapabilities{Terminal: handlers.Terminal != nil},
 		},
 		Authority: handlers,
 	}
@@ -211,4 +219,35 @@ func envSlice(env map[string]string) []string {
 		out = append(out, key+"="+value)
 	}
 	return out
+}
+
+type permissionResponse struct {
+	Outcome  string `json:"outcome"`
+	OptionID string `json:"optionId,omitempty"`
+}
+
+type readTextFileResponse struct {
+	Content string `json:"content"`
+}
+
+type emptyResponse struct{}
+
+func (c *Connection) emitProtocolError(ctx context.Context, method string, raw json.RawMessage, err error) {
+	if c.observability.OnProtocolError == nil {
+		return
+	}
+	event := ProtocolErrorEvent{Method: method, Err: err}
+	if shouldCaptureProtocolErrorRaw(c.observability.CaptureContent) {
+		event.Raw = copyRawMessage(raw)
+	}
+	c.observability.OnProtocolError(ctx, event)
+}
+
+func shouldCaptureProtocolErrorRaw(mode string) bool {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "all", "full", "raw":
+		return true
+	default:
+		return false
+	}
 }

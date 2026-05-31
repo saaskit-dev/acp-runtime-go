@@ -447,7 +447,16 @@ type TerminalSnapshot struct {
 }
 
 type ObservabilityOptions struct {
-	CaptureContent string
+	CaptureContent  string
+	OnProtocolError ProtocolErrorHandler
+}
+
+type ProtocolErrorHandler func(ctx Context, event ProtocolErrorEvent)
+
+type ProtocolErrorEvent struct {
+	Method string
+	Err    error
+	Raw    json.RawMessage
 }
 
 type StartSessionOptions struct {

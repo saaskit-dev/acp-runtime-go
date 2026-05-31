@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"unicode/utf8"
 )
 
 type RPCError struct {
@@ -66,6 +67,7 @@ type Peer struct {
 const (
 	defaultRPCReadBufferSize = 64 * 1024
 	maxRPCMessageSize        = 16 * 1024 * 1024
+	maxRPCScanDepth          = 128
 )
 
 var (
@@ -506,7 +508,7 @@ func parseRPCMessage(line []byte) (rpcMessage, bool) {
 			return msg, false
 		}
 		if line[i] == '}' {
-			return msg, true
+			return msg, skipJSONSpace(line, i+1) == len(line)
 		}
 		key, keyEscaped, next, ok := scanJSONString(line, i)
 		if !ok {
@@ -561,8 +563,11 @@ func parseRPCMessage(line []byte) (rpcMessage, bool) {
 		switch line[i] {
 		case ',':
 			i++
+			if next := skipJSONSpace(line, i); next < len(line) && line[next] == '}' {
+				return msg, false
+			}
 		case '}':
-			return msg, true
+			return msg, skipJSONSpace(line, i+1) == len(line)
 		default:
 			return msg, false
 		}
@@ -710,7 +715,25 @@ func scanJSONString(bytes []byte, i int) ([]byte, bool, int, bool) {
 			if i >= len(bytes) {
 				return nil, escaped, i, false
 			}
+			switch bytes[i] {
+			case '"', '\\', '/', 'b', 'f', 'n', 'r', 't':
+			case 'u':
+				if i+4 >= len(bytes) {
+					return nil, escaped, i, false
+				}
+				for j := i + 1; j <= i+4; j++ {
+					if !isJSONHex(bytes[j]) {
+						return nil, escaped, j, false
+					}
+				}
+				i += 4
+			default:
+				return nil, escaped, i, false
+			}
 		case '"':
+			if !utf8.Valid(bytes[start:i]) {
+				return nil, escaped, i, false
+			}
 			return bytes[start:i], escaped, i + 1, true
 		case 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
 			16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31:
@@ -718,6 +741,10 @@ func scanJSONString(bytes []byte, i int) ([]byte, bool, int, bool) {
 		}
 	}
 	return nil, escaped, i, false
+}
+
+func isJSONHex(ch byte) bool {
+	return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')
 }
 
 func unquoteJSONString(raw []byte, escaped bool) (string, bool) {
@@ -733,6 +760,10 @@ func unquoteJSONString(raw []byte, escaped bool) (string, bool) {
 }
 
 func scanJSONValue(bytes []byte, i int) (int, bool) {
+	return scanJSONValueDepth(bytes, i, 0)
+}
+
+func scanJSONValueDepth(bytes []byte, i int, depth int) (int, bool) {
 	i = skipJSONSpace(bytes, i)
 	if i >= len(bytes) {
 		return i, false
@@ -741,72 +772,79 @@ func scanJSONValue(bytes []byte, i int) (int, bool) {
 	case '"':
 		_, _, end, ok := scanJSONString(bytes, i)
 		return end, ok
-	case '{', '[':
-		return scanJSONComposite(bytes, i)
+	case '{':
+		return scanJSONObject(bytes, i, depth+1)
+	case '[':
+		return scanJSONArray(bytes, i, depth+1)
 	default:
 		return scanJSONLiteral(bytes, i)
 	}
 }
 
-func scanJSONComposite(bytes []byte, i int) (int, bool) {
-	var stack [64]byte
-	depth := 1
-	stack[0] = matchingJSONClose(bytes[i])
-	i++
-	for i < len(bytes) {
-		switch bytes[i] {
-		case '"':
-			_, _, end, ok := scanJSONString(bytes, i)
-			if !ok {
-				return i, false
-			}
-			i = end
-			continue
-		case '{', '[':
-			if depth == len(stack) {
-				return scanJSONCompositeSlow(bytes, i, stack[:], depth)
-			}
-			stack[depth] = matchingJSONClose(bytes[i])
-			depth++
-		case '}', ']':
-			if depth == 0 || bytes[i] != stack[depth-1] {
-				return i, false
-			}
-			depth--
-			if depth == 0 {
-				return i + 1, true
-			}
-		}
-		i++
+func scanJSONObject(bytes []byte, i int, depth int) (int, bool) {
+	if depth > maxRPCScanDepth {
+		return i, false
 	}
-	return i, false
+	i++
+	i = skipJSONSpace(bytes, i)
+	if i < len(bytes) && bytes[i] == '}' {
+		return i + 1, true
+	}
+	for {
+		_, _, next, ok := scanJSONString(bytes, i)
+		if !ok {
+			return i, false
+		}
+		i = skipJSONSpace(bytes, next)
+		if i >= len(bytes) || bytes[i] != ':' {
+			return i, false
+		}
+		next, ok = scanJSONValueDepth(bytes, i+1, depth)
+		if !ok {
+			return i, false
+		}
+		i = skipJSONSpace(bytes, next)
+		if i >= len(bytes) {
+			return i, false
+		}
+		switch bytes[i] {
+		case ',':
+			i = skipJSONSpace(bytes, i+1)
+		case '}':
+			return i + 1, true
+		default:
+			return i, false
+		}
+	}
 }
 
-func scanJSONCompositeSlow(bytes []byte, i int, initial []byte, depth int) (int, bool) {
-	stack := append([]byte(nil), initial[:depth]...)
-	for i < len(bytes) {
-		switch bytes[i] {
-		case '"':
-			_, _, end, ok := scanJSONString(bytes, i)
-			if !ok {
-				return i, false
-			}
-			i = end
-			continue
-		case '{', '[':
-			stack = append(stack, matchingJSONClose(bytes[i]))
-		case '}', ']':
-			if len(stack) == 0 || bytes[i] != stack[len(stack)-1] {
-				return i, false
-			}
-			stack = stack[:len(stack)-1]
-			if len(stack) == 0 {
-				return i + 1, true
-			}
-		}
-		i++
+func scanJSONArray(bytes []byte, i int, depth int) (int, bool) {
+	if depth > maxRPCScanDepth {
+		return i, false
 	}
-	return i, false
+	i++
+	i = skipJSONSpace(bytes, i)
+	if i < len(bytes) && bytes[i] == ']' {
+		return i + 1, true
+	}
+	for {
+		next, ok := scanJSONValueDepth(bytes, i, depth)
+		if !ok {
+			return i, false
+		}
+		i = skipJSONSpace(bytes, next)
+		if i >= len(bytes) {
+			return i, false
+		}
+		switch bytes[i] {
+		case ',':
+			i = skipJSONSpace(bytes, i+1)
+		case ']':
+			return i + 1, true
+		default:
+			return i, false
+		}
+	}
 }
 
 func scanJSONLiteral(bytes []byte, i int) (int, bool) {
@@ -872,13 +910,6 @@ func isValidJSONNumber(value []byte) bool {
 		}
 	}
 	return i == len(value)
-}
-
-func matchingJSONClose(open byte) byte {
-	if open == '{' {
-		return '}'
-	}
-	return ']'
 }
 
 func skipJSONSpace(bytes []byte, i int) int {

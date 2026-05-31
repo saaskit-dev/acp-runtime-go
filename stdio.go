@@ -54,7 +54,7 @@ func NewStdioConnectionFactory(options StdioFactoryOptions) ConnectionFactory {
 			}
 		}
 		peer := NewPeer(stdout, stdin, peerOptions)
-		conn := NewConnection(peer, input.Client)
+		conn := NewConnectionWithObservability(peer, input.Client, input.Observability)
 		startCtx, cancelStart := context.WithCancel(context.WithoutCancel(ctx))
 		done := make(chan error, 1)
 		go func() {
