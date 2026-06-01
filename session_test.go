@@ -64,6 +64,85 @@ func TestNormalizeMCPServersEncodesEmptyArray(t *testing.T) {
 	}
 }
 
+func TestMCPServerMarshalIncludesRequiredEmptyArrays(t *testing.T) {
+	tests := []struct {
+		name string
+		in   MCPServer
+		keys []string
+	}{
+		{
+			name: "stdio",
+			in:   MCPServer{Name: "fs", Type: "stdio", Command: "mcp-server"},
+			keys: []string{"args", "env"},
+		},
+		{
+			name: "http",
+			in:   MCPServer{Name: "remote", Type: "http", URL: "https://example.com/mcp"},
+			keys: []string{"headers"},
+		},
+		{
+			name: "sse",
+			in:   MCPServer{Name: "events", Type: "sse", URL: "https://example.com/sse"},
+			keys: []string{"headers"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bytes, err := json.Marshal(tt.in)
+			if err != nil {
+				t.Fatalf("Marshal() error = %v", err)
+			}
+			var got map[string]json.RawMessage
+			if err := json.Unmarshal(bytes, &got); err != nil {
+				t.Fatalf("Unmarshal() error = %v", err)
+			}
+			for _, key := range tt.keys {
+				raw, ok := got[key]
+				if !ok {
+					t.Fatalf("MCPServer JSON = %s, missing %q", bytes, key)
+				}
+				if string(raw) != "[]" {
+					t.Fatalf("MCPServer JSON %q = %s, want []", key, raw)
+				}
+			}
+			if tt.name == "stdio" {
+				if _, ok := got["type"]; ok {
+					t.Fatalf("MCPServer JSON = %s, want no type field for stdio", bytes)
+				}
+			}
+		})
+	}
+}
+
+func TestSetSessionConfigOptionUsesConfigIDWireField(t *testing.T) {
+	req := SetSessionConfigOptionRequest{SessionID: "s1", OptionID: "model", Value: "opus"}
+	bytes, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(bytes, &got); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if _, ok := got["configId"]; !ok {
+		t.Fatalf("SetSessionConfigOptionRequest JSON = %s, missing configId", bytes)
+	}
+	if _, ok := got["optionId"]; ok {
+		t.Fatalf("SetSessionConfigOptionRequest JSON = %s, want no optionId", bytes)
+	}
+}
+
+func TestSetSessionConfigOptionAcceptsLegacyOptionID(t *testing.T) {
+	var req SetSessionConfigOptionRequest
+	raw := []byte(`{"sessionId":"s1","optionId":"model","value":"opus"}`)
+	if err := json.Unmarshal(raw, &req); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if req.OptionID != "model" {
+		t.Fatalf("OptionID = %q, want model", req.OptionID)
+	}
+}
+
 func TestSessionUpdateAcceptsSingleContentBlock(t *testing.T) {
 	var notification SessionNotification
 	raw := []byte(`{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"OK"}}}`)

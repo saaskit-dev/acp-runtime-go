@@ -14,8 +14,8 @@
 
 - ACP protocol version: `1`
 - ACP source repo: `https://github.com/agentclientprotocol/agent-client-protocol`
-- ACP source ref: `v0.11.4`
-- Last verified against upstream docs: `2026-04-08`
+- ACP source ref: `v0.13.4`
+- Last verified against upstream docs: `2026-06-01`
 
 ## 快速开始
 

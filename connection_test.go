@@ -66,14 +66,21 @@ func TestProtocolErrorRawRequiresCaptureContent(t *testing.T) {
 	}
 }
 
-func TestDefaultClientAuthTerminalReflectsHandler(t *testing.T) {
+func TestDefaultClientTerminalReflectsHandler(t *testing.T) {
 	withoutTerminal := defaultClient(RuntimeOptions{}, AuthorityHandlers{})
-	if withoutTerminal.Capabilities.Auth.Terminal {
-		t.Fatalf("Auth.Terminal = true, want false without terminal handler")
+	if withoutTerminal.Capabilities.Terminal {
+		t.Fatalf("Terminal = true, want false without terminal handler")
 	}
 	withTerminal := defaultClient(RuntimeOptions{}, AuthorityHandlers{Terminal: noopTerminalHandler{}})
-	if !withTerminal.Capabilities.Auth.Terminal {
-		t.Fatalf("Auth.Terminal = false, want true with terminal handler")
+	if !withTerminal.Capabilities.Terminal {
+		t.Fatalf("Terminal = false, want true with terminal handler")
+	}
+	encoded, err := json.Marshal(withTerminal.Capabilities)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if bytes.Contains(encoded, []byte(`"auth"`)) {
+		t.Fatalf("ClientCapabilities JSON = %s, want no auth field", encoded)
 	}
 }
 

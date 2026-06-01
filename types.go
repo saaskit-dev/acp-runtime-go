@@ -9,10 +9,10 @@ const (
 	ProtocolVersion = 1
 
 	ACPProtocolSourceRepo        = "https://github.com/agentclientprotocol/agent-client-protocol"
-	ACPProtocolSourceRef         = "v0.11.4"
+	ACPProtocolSourceRef         = "v0.13.4"
 	ACPProtocolDocsURL           = "https://agentclientprotocol.com/protocol/overview"
 	ACPProtocolDocsSchemaURL     = "https://agentclientprotocol.com/protocol/draft/schema"
-	ACPProtocolAlignmentVerified = "2026-04-08"
+	ACPProtocolAlignmentVerified = "2026-06-01"
 
 	RuntimeSnapshotVersion = 1
 
@@ -56,15 +56,86 @@ type MCPServer struct {
 	Extra   map[string]string `json:"-"`
 }
 
+func (s MCPServer) MarshalJSON() ([]byte, error) {
+	type stdioWire struct {
+		Name    string         `json:"name"`
+		Command string         `json:"command,omitempty"`
+		Args    []string       `json:"args"`
+		CWD     string         `json:"cwd,omitempty"`
+		Env     []EnvVariable  `json:"env"`
+		Meta    map[string]any `json:"_meta,omitempty"`
+	}
+	type httpWire struct {
+		Name    string         `json:"name"`
+		Type    string         `json:"type,omitempty"`
+		URL     string         `json:"url,omitempty"`
+		Headers []HTTPHeader   `json:"headers"`
+		Meta    map[string]any `json:"_meta,omitempty"`
+	}
+	if s.isRemoteMCPServer() {
+		headers := s.Headers
+		if headers == nil {
+			headers = []HTTPHeader{}
+		}
+		return json.Marshal(httpWire{
+			Name:    s.Name,
+			Type:    s.Type,
+			URL:     s.URL,
+			Headers: headers,
+			Meta:    s.Meta,
+		})
+	}
+	args := s.Args
+	if args == nil {
+		args = []string{}
+	}
+	env := s.Env
+	if env == nil {
+		env = []EnvVariable{}
+	}
+	return json.Marshal(stdioWire{
+		Name:    s.Name,
+		Command: s.Command,
+		Args:    args,
+		CWD:     s.CWD,
+		Env:     env,
+		Meta:    s.Meta,
+	})
+}
+
+func (s *MCPServer) UnmarshalJSON(data []byte) error {
+	type wire MCPServer
+	var out wire
+	if err := json.Unmarshal(data, &out); err != nil {
+		return err
+	}
+	*s = MCPServer(out)
+	if len(data) > 0 {
+		s.Raw = append(s.Raw[:0], data...)
+	}
+	if s.isRemoteMCPServer() {
+		if s.Headers == nil {
+			s.Headers = []HTTPHeader{}
+		}
+	} else {
+		if s.Args == nil {
+			s.Args = []string{}
+		}
+		if s.Env == nil {
+			s.Env = []EnvVariable{}
+		}
+	}
+	return nil
+}
+
+func (s MCPServer) isRemoteMCPServer() bool {
+	return s.Type == "http" || s.Type == "sse" || s.URL != ""
+}
+
 type ClientCapabilities struct {
 	Terminal bool                       `json:"terminal"`
 	FS       FilesystemCapabilities     `json:"fs"`
-	Auth     ClientAuthCapabilities     `json:"auth"`
 	Meta     map[string]json.RawMessage `json:"_meta,omitempty"`
-}
-
-type ClientAuthCapabilities struct {
-	Terminal bool `json:"terminal"`
 }
 
 type FilesystemCapabilities struct {
@@ -222,9 +293,32 @@ type SetSessionModeRequest struct {
 type SetSessionModeResponse struct{}
 
 type SetSessionConfigOptionRequest struct {
-	SessionID string `json:"sessionId"`
-	OptionID  string `json:"optionId"`
-	Value     any    `json:"value"`
+	SessionID string         `json:"sessionId"`
+	OptionID  string         `json:"configId"`
+	Value     any            `json:"value"`
+	Meta      map[string]any `json:"_meta,omitempty"`
+}
+
+func (r *SetSessionConfigOptionRequest) UnmarshalJSON(data []byte) error {
+	type wire struct {
+		SessionID string         `json:"sessionId"`
+		ConfigID  string         `json:"configId"`
+		OptionID  string         `json:"optionId"`
+		Value     any            `json:"value"`
+		Meta      map[string]any `json:"_meta,omitempty"`
+	}
+	var out wire
+	if err := json.Unmarshal(data, &out); err != nil {
+		return err
+	}
+	r.SessionID = out.SessionID
+	r.OptionID = out.ConfigID
+	if r.OptionID == "" {
+		r.OptionID = out.OptionID
+	}
+	r.Value = out.Value
+	r.Meta = out.Meta
+	return nil
 }
 
 type SetSessionConfigOptionResponse struct{}

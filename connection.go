@@ -192,7 +192,6 @@ func defaultClient(options RuntimeOptions, handlers AuthorityHandlers) Client {
 				ReadTextFile:  handlers.Filesystem != nil,
 				WriteTextFile: handlers.Filesystem != nil,
 			},
-			Auth: ClientAuthCapabilities{Terminal: handlers.Terminal != nil},
 		},
 		Authority: handlers,
 	}
