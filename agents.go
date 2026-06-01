@@ -13,7 +13,7 @@ const (
 )
 
 func CreateCodexAgent(overrides Agent) Agent {
-	return mergeAgent(Agent{Type: CodexACPRegistryID, Command: "codex", Args: []string{"acp"}}, overrides)
+	return mergeAgent(Agent{Type: CodexACPRegistryID, Command: "npm", Args: []string{"exec", "--yes", "@zed-industries/codex-acp@0.15.0", "--"}}, overrides)
 }
 
 func CreateClaudeCodeAgent(overrides Agent) Agent {
