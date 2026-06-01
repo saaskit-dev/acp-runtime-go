@@ -30,7 +30,7 @@ func (s *SessionService) Create(ctx context.Context, input StartSessionOptions) 
 	if err != nil {
 		return nil, wrapError(ErrorCreate, "session.start", "failed to bootstrap ACP session", err)
 	}
-	req := NewSessionRequest{CWD: input.CWD, MCPServers: input.MCPServers, AdditionalDirectories: input.AdditionalDirectories, Meta: sessionMeta}
+	req := NewSessionRequest{CWD: input.CWD, MCPServers: normalizeMCPServers(input.MCPServers), AdditionalDirectories: input.AdditionalDirectories, Meta: sessionMeta}
 	resp, err := bootstrap.Connection.NewSession(ctx, req)
 	if err != nil {
 		_ = bootstrap.Dispose(ctx)
@@ -50,7 +50,7 @@ func (s *SessionService) Load(ctx context.Context, input LoadSessionOptions) (Se
 	if err != nil {
 		return nil, wrapError(ErrorLoad, "session.load", "failed to bootstrap ACP session", err)
 	}
-	resp, err := bootstrap.Connection.LoadSession(ctx, LoadSessionRequest{SessionID: input.SessionID, CWD: input.CWD, MCPServers: input.MCPServers, AdditionalDirectories: input.AdditionalDirectories})
+	resp, err := bootstrap.Connection.LoadSession(ctx, LoadSessionRequest{SessionID: input.SessionID, CWD: input.CWD, MCPServers: normalizeMCPServers(input.MCPServers), AdditionalDirectories: input.AdditionalDirectories})
 	if err != nil {
 		_ = bootstrap.Dispose(ctx)
 		return nil, wrapError(ErrorLoad, "session.load", "failed to load ACP session", err)
@@ -64,7 +64,7 @@ func (s *SessionService) Resume(ctx context.Context, input ResumeSessionOptions)
 	if err != nil {
 		return nil, wrapError(ErrorResume, "session.resume", "failed to bootstrap ACP session", err)
 	}
-	resp, err := bootstrap.Connection.ResumeSession(ctx, ResumeSessionRequest{SessionID: input.SessionID, CWD: input.CWD, MCPServers: input.MCPServers, AdditionalDirectories: input.AdditionalDirectories})
+	resp, err := bootstrap.Connection.ResumeSession(ctx, ResumeSessionRequest{SessionID: input.SessionID, CWD: input.CWD, MCPServers: normalizeMCPServers(input.MCPServers), AdditionalDirectories: input.AdditionalDirectories})
 	if err != nil {
 		_ = bootstrap.Dispose(ctx)
 		return nil, wrapError(ErrorResume, "session.resume", "failed to resume ACP session", err)
@@ -83,7 +83,7 @@ func (s *SessionService) Fork(ctx context.Context, input ForkSessionOptions) (Se
 	if err != nil {
 		return nil, wrapError(ErrorFork, "session.fork", "failed to bootstrap ACP session", err)
 	}
-	resp, err := bootstrap.Connection.ForkSession(ctx, ForkSessionRequest{SessionID: input.SessionID, CWD: input.CWD, MCPServers: input.MCPServers, AdditionalDirectories: input.AdditionalDirectories})
+	resp, err := bootstrap.Connection.ForkSession(ctx, ForkSessionRequest{SessionID: input.SessionID, CWD: input.CWD, MCPServers: normalizeMCPServers(input.MCPServers), AdditionalDirectories: input.AdditionalDirectories})
 	if err != nil {
 		_ = bootstrap.Dispose(ctx)
 		return nil, wrapError(ErrorFork, "session.fork", "failed to fork ACP session", err)
@@ -162,6 +162,13 @@ func isAuthenticationNotImplemented(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "authentication not implemented")
+}
+
+func normalizeMCPServers(servers []MCPServer) []MCPServer {
+	if servers == nil {
+		return []MCPServer{}
+	}
+	return servers
 }
 
 func applyInitialConfig(ctx context.Context, driver *acpSessionDriver, config InitialConfig) (InitialConfigReport, error) {

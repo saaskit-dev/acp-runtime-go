@@ -2,6 +2,7 @@ package acpruntime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -49,6 +50,39 @@ func TestSessionCloseIsConcurrentSafe(t *testing.T) {
 	wg.Wait()
 	if got := session.Status(); got != "closed" {
 		t.Fatalf("Status() = %q, want closed", got)
+	}
+}
+
+func TestNormalizeMCPServersEncodesEmptyArray(t *testing.T) {
+	req := NewSessionRequest{CWD: "/tmp/project", MCPServers: normalizeMCPServers(nil)}
+	bytes, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if string(bytes) != `{"cwd":"/tmp/project","mcpServers":[]}` {
+		t.Fatalf("NewSessionRequest JSON = %s, want empty mcpServers array", bytes)
+	}
+}
+
+func TestSessionUpdateAcceptsSingleContentBlock(t *testing.T) {
+	var notification SessionNotification
+	raw := []byte(`{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"OK"}}}`)
+	if err := json.Unmarshal(raw, &notification); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if got := sessionUpdateText(notification.Update); got != "OK" {
+		t.Fatalf("sessionUpdateText() = %q, want OK", got)
+	}
+}
+
+func TestSessionUpdateAcceptsContentBlockArray(t *testing.T) {
+	var notification SessionNotification
+	raw := []byte(`{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":[{"type":"text","text":"OK"}]}}`)
+	if err := json.Unmarshal(raw, &notification); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if got := sessionUpdateText(notification.Update); got != "OK" {
+		t.Fatalf("sessionUpdateText() = %q, want OK", got)
 	}
 }
 

@@ -17,7 +17,7 @@ func CreateCodexAgent(overrides Agent) Agent {
 }
 
 func CreateClaudeCodeAgent(overrides Agent) Agent {
-	return mergeAgent(Agent{Type: ClaudeCodeACPRegistryID, Command: "claude", Args: []string{"--acp"}}, overrides)
+	return mergeAgent(Agent{Type: ClaudeCodeACPRegistryID, Command: "npm", Args: []string{"exec", "--yes", "@zed-industries/claude-agent-acp@0.23.1", "--"}}, overrides)
 }
 
 func CreateGeminiAgent(overrides Agent) Agent {

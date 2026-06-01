@@ -255,6 +255,22 @@ type ContentBlock struct {
 	Meta        map[string]any  `json:"_meta,omitempty"`
 }
 
+type ContentBlocks []ContentBlock
+
+func (blocks *ContentBlocks) UnmarshalJSON(data []byte) error {
+	var list []ContentBlock
+	if err := json.Unmarshal(data, &list); err == nil {
+		*blocks = list
+		return nil
+	}
+	var single ContentBlock
+	if err := json.Unmarshal(data, &single); err != nil {
+		return err
+	}
+	*blocks = []ContentBlock{single}
+	return nil
+}
+
 type SessionMode struct {
 	ID          string         `json:"id"`
 	Name        string         `json:"name"`
@@ -317,7 +333,7 @@ type SessionUpdate struct {
 	Kind           *string               `json:"kind,omitempty"`
 	Status         *string               `json:"status,omitempty"`
 	Locations      []ToolLocation        `json:"locations,omitempty"`
-	Content        []ContentBlock        `json:"content,omitempty"`
+	Content        ContentBlocks         `json:"content,omitempty"`
 	RawInput       json.RawMessage       `json:"rawInput,omitempty"`
 	RawOutput      json.RawMessage       `json:"rawOutput,omitempty"`
 	Entries        []PlanEntry           `json:"entries,omitempty"`

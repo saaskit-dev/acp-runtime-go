@@ -254,7 +254,7 @@ func (d *acpSessionDriver) handleSessionUpdate(notification SessionNotification)
 	switch update.SessionUpdate {
 	case "agent_message_chunk":
 		if active != nil {
-			active.outputText.WriteString(update.Text)
+			active.outputText.WriteString(sessionUpdateText(update))
 		}
 	case "current_mode_update":
 		if update.CurrentModeID != "" {
@@ -297,7 +297,7 @@ func (d *acpSessionDriver) handleSessionUpdate(notification SessionNotification)
 			if update.Status != nil {
 				status = *update.Status
 			}
-			snapshot := ToolCallSnapshot{ID: id, Title: title, Kind: kind, Status: status, Content: update.Content, RawInput: update.RawInput, RawOutput: update.RawOutput, UpdatedAt: time.Now()}
+			snapshot := ToolCallSnapshot{ID: id, Title: title, Kind: kind, Status: status, Content: []ContentBlock(update.Content), RawInput: update.RawInput, RawOutput: update.RawOutput, UpdatedAt: time.Now()}
 			d.toolCalls[id] = snapshot
 			d.operations[id] = Operation{ID: id, Kind: d.profile.MapOperationKind(kind), Phase: operationPhase(status), Title: title, Target: inferOperationTarget(update), UpdatedAt: time.Now()}
 		}
@@ -315,7 +315,7 @@ func (d *acpSessionDriver) handleSessionUpdate(notification SessionNotification)
 				snapshot.Status = *update.Status
 			}
 			if update.Content != nil {
-				snapshot.Content = update.Content
+				snapshot.Content = []ContentBlock(update.Content)
 			}
 			if len(update.RawInput) > 0 {
 				snapshot.RawInput = update.RawInput
@@ -335,9 +335,9 @@ func (d *acpSessionDriver) handleSessionUpdate(notification SessionNotification)
 	if active != nil {
 		switch update.SessionUpdate {
 		case "agent_message_chunk":
-			active.events <- TurnEvent{Type: "text", TurnID: active.id, Text: update.Text}
+			active.events <- TurnEvent{Type: "text", TurnID: active.id, Text: sessionUpdateText(update)}
 		case "agent_thought_chunk":
-			active.events <- TurnEvent{Type: "thinking", TurnID: active.id, Thinking: update.Text}
+			active.events <- TurnEvent{Type: "thinking", TurnID: active.id, Thinking: sessionUpdateText(update)}
 		case "plan":
 			active.events <- TurnEvent{Type: "plan_updated", TurnID: active.id, Plan: update.Entries}
 		case "usage_update":
@@ -354,6 +354,18 @@ func (d *acpSessionDriver) handleSessionUpdate(notification SessionNotification)
 			}
 		}
 	}
+}
+
+func sessionUpdateText(update SessionUpdate) string {
+	if update.Text != "" {
+		return update.Text
+	}
+	for _, block := range update.Content {
+		if block.Type == "text" {
+			return block.Text
+		}
+	}
+	return ""
 }
 
 func operationPhase(status string) string {

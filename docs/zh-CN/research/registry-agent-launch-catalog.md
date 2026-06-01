@@ -92,7 +92,7 @@ uvx <package> ...
 | `amp-acp` | Amp | binary | 下载后执行 `./amp-acp` |
 | `auggie` | Auggie CLI | npx | `npx @augmentcode/auggie@0.21.0 --acp` |
 | `autohand` | Autohand Code | npx | `npx @autohandai/autohand-acp@0.2.1` |
-| `claude-acp` | Claude Agent | npx | `npx @agentclientprotocol/claude-agent-acp@0.24.2` |
+| `claude-acp` | Claude Agent | npx | `npm exec --yes @zed-industries/claude-agent-acp@0.23.1 --` |
 | `cline` | Cline | npx | `npx cline@2.11.0 --acp` |
 | `codebuddy-code` | Codebuddy Code | npx | `npx @tencent-ai/codebuddy-code@2.70.1 --acp` |
 | `codex-acp` | Codex CLI | binary / npx | `npx @zed-industries/codex-acp@0.10.0` 或下载后执行 `./codex-acp` |
