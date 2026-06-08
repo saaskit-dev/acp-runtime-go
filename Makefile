@@ -13,15 +13,17 @@ help:
 		'  make fuzz-smoke' \
 		'  make runtime simulator' \
 		'  make runtime <registry-agent-id>' \
+		'  ./run openai-server --agent <registry-agent-id>' \
 		'  make harness-admission' \
 		'  make clean'
 
 clean:
-	rm -rf $(BIN_DIR) .tmp harness-outputs acp-runtime acp-simulator-agent acp-harness
+	rm -rf $(BIN_DIR) .tmp harness-outputs acp-runtime acp-openai-server acp-simulator-agent acp-harness
 
 build:
 	mkdir -p $(BIN_DIR)
 	go build -o $(BIN_DIR)/acp-runtime ./cmd/acp-runtime
+	go build -o $(BIN_DIR)/acp-openai-server ./cmd/acp-openai-server
 	go build -o $(BIN_DIR)/acp-simulator-agent ./cmd/acp-simulator-agent
 	go build -o $(BIN_DIR)/acp-harness ./cmd/acp-harness
 
@@ -57,6 +59,7 @@ harness-full: build
 
 install: build
 	install -m 0755 $(BIN_DIR)/acp-runtime /usr/local/bin/acp-runtime
+	install -m 0755 $(BIN_DIR)/acp-openai-server /usr/local/bin/acp-openai-server
 	install -m 0755 $(BIN_DIR)/acp-simulator-agent /usr/local/bin/acp-simulator-agent
 	install -m 0755 $(BIN_DIR)/acp-harness /usr/local/bin/acp-harness
 

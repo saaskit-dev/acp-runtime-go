@@ -76,8 +76,39 @@ make lint
 Built binaries are written to `bin/`:
 
 - `bin/acp-runtime`
+- `bin/acp-openai-server`
 - `bin/acp-simulator-agent`
 - `bin/acp-harness`
+
+## OpenAI-Compatible Server
+
+The repository includes a local OpenAI-compatible HTTP gateway:
+
+```bash
+./run openai-server --listen 127.0.0.1:8080 --agent claude --cwd "$PWD"
+```
+
+Main endpoints:
+
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+- `GET /v1/acp/sessions`
+- `DELETE /v1/acp/sessions/{id}`
+
+Without `X-ACP-Session-ID`, requests create a temporary ACP session and close it after one turn. To reuse an ACP session, send `X-ACP-Session-Mode: persistent` on the first request; the server returns `X-ACP-Session-ID` in the response headers:
+
+```bash
+curl -i http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'X-ACP-Session-Mode: persistent' \
+  -d '{"model":"claude","messages":[{"role":"user","content":"Summarize this repository."}]}'
+```
+
+Follow-up requests with the same `X-ACP-Session-ID` reuse the ACP session. When reusing a session, the default input mode sends only the last user message as the next turn, so OpenAI clients that replay the full `messages` array do not duplicate history inside the ACP session. Use `X-ACP-Input-Mode: replay` to explicitly send the full replayed context.
+
+Only one turn may run at a time per ACP session; concurrent requests return `session_busy`. Sessions are isolated by API key/owner, agent, cwd, and system prompt hash, and expire according to `--session-ttl`.
+
+`GET /v1/acp/sessions` returns both the gateway session id and the underlying `acp_session_id`, so operators can see which sessions were opened and are managed by this gateway. On shutdown, the gateway closes every registered managed ACP session and the runtime it created. `SIGINT`, `SIGTERM`, periodic TTL cleanup, and `DELETE /v1/acp/sessions/{id}` all trigger cleanup so local ACP agent processes do not leak.
 
 ## Repository Layout
 

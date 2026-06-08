@@ -15,6 +15,9 @@ case "$target" in
   runtime)
     exec go run ./cmd/acp-runtime "$@"
     ;;
+  openai-server)
+    exec go run ./cmd/acp-openai-server "$@"
+    ;;
   simulator)
     exec go run ./cmd/acp-simulator-agent "$@"
     ;;
