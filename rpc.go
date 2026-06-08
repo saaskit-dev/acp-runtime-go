@@ -23,10 +23,38 @@ func (e *RPCError) Error() string {
 	if e == nil {
 		return "<nil>"
 	}
+	detail := formatRPCErrorData(e.Data)
 	if e.Code != 0 {
+		if detail != "" {
+			return fmt.Sprintf("rpc error %d: %s: %s", e.Code, e.Message, detail)
+		}
 		return fmt.Sprintf("rpc error %d: %s", e.Code, e.Message)
 	}
+	if detail != "" && e.Message != "" {
+		return fmt.Sprintf("%s: %s", e.Message, detail)
+	}
 	return e.Message
+}
+
+func formatRPCErrorData(data json.RawMessage) string {
+	if len(data) == 0 || string(data) == "null" {
+		return ""
+	}
+	var text string
+	if err := json.Unmarshal(data, &text); err == nil {
+		return text
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(data, &fields); err == nil {
+		for _, key := range []string{"message", "error", "detail", "reason", "stderr", "stdout"} {
+			if value, ok := fields[key]; ok {
+				if text, ok := value.(string); ok && text != "" {
+					return text
+				}
+			}
+		}
+	}
+	return string(data)
 }
 
 type rpcMessage struct {

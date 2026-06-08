@@ -132,6 +132,59 @@ func TestSetSessionConfigOptionUsesConfigIDWireField(t *testing.T) {
 	}
 }
 
+func TestSessionUpdateTextPreservesWhitespaceOnlyChunks(t *testing.T) {
+	raw := []byte(`{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","type":"text","text":"\n\n"}}`)
+	var notification SessionNotification
+	if err := json.Unmarshal(raw, &notification); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if got := sessionUpdateText(notification.Update); got != "\n\n" {
+		t.Fatalf("sessionUpdateText() = %q, want newline chunk", got)
+	}
+}
+
+func TestSessionDriverPreservesMarkdownWhitespaceChunks(t *testing.T) {
+	active := &activeTurn{
+		id:         "turn-1",
+		events:     make(chan TurnEvent, 8),
+		completion: make(chan TurnResult, 1),
+	}
+	driver := &acpSessionDriver{
+		sessionID:   "session-1",
+		currentTurn: active,
+		status:      "running",
+		metadata:    RuntimeSessionMetadata{SessionID: "session-1"},
+		toolCalls:   map[string]ToolCallSnapshot{},
+		operations:  map[string]Operation{},
+		permissions: map[string]PermissionRequestSnapshot{},
+		rawConfig:   map[string]any{},
+	}
+	for _, text := range []string{"## 标题", "\n\n", "```javascript", "\n", "function renderMessages() {}", "\n", "```", "\n"} {
+		driver.handleSessionUpdate(SessionNotification{
+			SessionID: "session-1",
+			Update: SessionUpdate{
+				SessionUpdate: "agent_message_chunk",
+				Type:          "text",
+				Text:          text,
+			},
+		})
+	}
+	driver.mu.RLock()
+	got := active.outputText.String()
+	driver.mu.RUnlock()
+	want := "## 标题\n\n```javascript\nfunction renderMessages() {}\n```\n"
+	if got != want {
+		t.Fatalf("outputText = %q, want %q", got, want)
+	}
+	var gotEvents []string
+	for len(active.events) > 0 {
+		gotEvents = append(gotEvents, (<-active.events).Text)
+	}
+	if len(gotEvents) != 8 || gotEvents[1] != "\n\n" || gotEvents[3] != "\n" {
+		t.Fatalf("text events = %#v, want whitespace chunks preserved", gotEvents)
+	}
+}
+
 func TestSetSessionConfigOptionAcceptsLegacyOptionID(t *testing.T) {
 	var req SetSessionConfigOptionRequest
 	raw := []byte(`{"sessionId":"s1","optionId":"model","value":"opus"}`)

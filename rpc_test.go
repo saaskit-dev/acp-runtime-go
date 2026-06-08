@@ -83,6 +83,37 @@ func TestPeerRawMessageHookExcludesFrameDelimiter(t *testing.T) {
 	}
 }
 
+func TestRPCErrorIncludesDataInErrorString(t *testing.T) {
+	tests := []struct {
+		name string
+		err  *RPCError
+		want string
+	}{
+		{
+			name: "string data",
+			err:  &RPCError{Code: -32603, Message: "Internal error", Data: json.RawMessage(`"Claude Code failed: missing auth"`)},
+			want: "rpc error -32603: Internal error: Claude Code failed: missing auth",
+		},
+		{
+			name: "object message",
+			err:  &RPCError{Code: -32603, Message: "Internal error", Data: json.RawMessage(`{"message":"spawn failed","stderr":"ignored"}`)},
+			want: "rpc error -32603: Internal error: spawn failed",
+		},
+		{
+			name: "raw object fallback",
+			err:  &RPCError{Code: -32603, Message: "Internal error", Data: json.RawMessage(`{"code":"E_AUTH"}`)},
+			want: `rpc error -32603: Internal error: {"code":"E_AUTH"}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.err.Error(); got != tt.want {
+				t.Fatalf("Error() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseRPCIDSupportsNumericResponses(t *testing.T) {
 	for _, raw := range []json.RawMessage{
 		json.RawMessage(`42`),
