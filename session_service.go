@@ -38,7 +38,7 @@ func (s *SessionService) Create(ctx context.Context, input StartSessionOptions) 
 	}
 	bootstrap.SessionResponse = resp
 	driver := newACPSessionDriver(bootstrap)
-	if _, err := applyInitialConfig(ctx, driver, input.InitialConfig); err != nil {
+	if _, err := applyInitialConfig(ctx, driver, input.InitialConfig, profile); err != nil {
 		_ = driver.Close(ctx)
 		return nil, wrapError(ErrorInitialConfig, "session.initial_config", "failed to apply initial config", err)
 	}
@@ -71,7 +71,7 @@ func (s *SessionService) Resume(ctx context.Context, input ResumeSessionOptions)
 	}
 	bootstrap.SessionResponse = resp
 	driver := newACPSessionDriver(bootstrap)
-	if _, err := applyInitialConfig(ctx, driver, input.InitialConfig); err != nil {
+	if _, err := applyInitialConfig(ctx, driver, input.InitialConfig, bootstrap.Profile); err != nil {
 		_ = driver.Close(ctx)
 		return nil, wrapError(ErrorInitialConfig, "session.initial_config", "failed to apply initial config", err)
 	}
@@ -171,16 +171,31 @@ func normalizeMCPServers(servers []MCPServer) []MCPServer {
 	return servers
 }
 
-func applyInitialConfig(ctx context.Context, driver *acpSessionDriver, config InitialConfig) (InitialConfigReport, error) {
+func applyInitialConfig(ctx context.Context, driver *acpSessionDriver, config InitialConfig, profile AgentProfile) (InitialConfigReport, error) {
 	var report InitialConfigReport
 	if config.Mode != nil {
 		mode, ok := config.Mode.(string)
 		if ok {
-			if err := driver.SetAgentMode(ctx, mode); err != nil {
+			appliedMode, err := applyInitialConfigMode(ctx, driver, mode, profile)
+			if err != nil {
 				return report, err
 			}
-			report.Applied = append(report.Applied, InitialConfigReportItem{Key: "mode", ID: "mode", Value: mode})
+			report.Applied = append(report.Applied, InitialConfigReportItem{Key: "mode", ID: "mode", Value: appliedMode})
 		}
+	}
+	if config.Model != nil {
+		item, err := applyInitialConfigOption(ctx, driver, profile, "model", config.Model)
+		if err != nil {
+			return report, err
+		}
+		report.Applied = append(report.Applied, item)
+	}
+	if config.Effort != nil {
+		item, err := applyInitialConfigOption(ctx, driver, profile, "effort", config.Effort)
+		if err != nil {
+			return report, err
+		}
+		report.Applied = append(report.Applied, item)
 	}
 	for id, value := range config.Raw {
 		if err := driver.SetAgentConfigOption(ctx, id, value); err != nil {
@@ -189,4 +204,74 @@ func applyInitialConfig(ctx context.Context, driver *acpSessionDriver, config In
 		report.Applied = append(report.Applied, InitialConfigReportItem{Key: id, ID: id, Value: value})
 	}
 	return report, nil
+}
+
+func applyInitialConfigOption(ctx context.Context, driver *acpSessionDriver, profile AgentProfile, key string, value any) (InitialConfigReportItem, error) {
+	optionID := selectInitialConfigOption(driver.metadata.AgentConfigOptions, profile, key)
+	if optionID == "" {
+		return InitialConfigReportItem{Key: key, Value: value, Reason: "option_not_found"}, nil
+	}
+	var lastErr error
+	for _, alias := range initialConfigAliases(profile, key, value) {
+		if err := driver.SetAgentConfigOption(ctx, optionID, alias); err != nil {
+			lastErr = err
+			continue
+		}
+		return InitialConfigReportItem{Key: key, ID: optionID, Value: alias}, nil
+	}
+	if lastErr != nil {
+		return InitialConfigReportItem{}, lastErr
+	}
+	return InitialConfigReportItem{Key: key, Value: value, Reason: "option_not_applied"}, nil
+}
+
+func selectInitialConfigOption(options []RuntimeAgentConfigOption, profile AgentProfile, key string) string {
+	selector := InitialConfigOptionSelector{IDs: []string{key}}
+	if profile.CreateInitialConfigOptionSelector != nil {
+		selector = profile.CreateInitialConfigOptionSelector(key)
+	}
+	for _, option := range options {
+		for _, id := range selector.IDs {
+			if strings.EqualFold(option.ID, id) {
+				return option.ID
+			}
+		}
+		for _, category := range selector.Categories {
+			if strings.EqualFold(option.Category, category) {
+				return option.ID
+			}
+		}
+	}
+	return ""
+}
+
+func applyInitialConfigMode(ctx context.Context, driver *acpSessionDriver, mode string, profile AgentProfile) (string, error) {
+	aliases := initialConfigAliases(profile, "mode", mode)
+	var lastErr error
+	for _, alias := range aliases {
+		modeID, ok := alias.(string)
+		if !ok || strings.TrimSpace(modeID) == "" {
+			continue
+		}
+		if err := driver.SetAgentMode(ctx, modeID); err != nil {
+			lastErr = err
+			continue
+		}
+		return modeID, nil
+	}
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", driver.SetAgentMode(ctx, mode)
+}
+
+func initialConfigAliases(profile AgentProfile, key string, value any) []any {
+	if profile.CreateInitialConfigAliases == nil {
+		return []any{value}
+	}
+	aliases := profile.CreateInitialConfigAliases(key, value)
+	if len(aliases) == 0 {
+		return []any{value}
+	}
+	return aliases
 }

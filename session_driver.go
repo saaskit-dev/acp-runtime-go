@@ -112,6 +112,11 @@ func metadataFromSessionResponse(resp NewSessionResponse) RuntimeSessionMetadata
 			metadata.AgentModes = append(metadata.AgentModes, RuntimeAgentMode{ID: mode.ID, Name: mode.Name, Description: mode.Description})
 		}
 	}
+	if resp.Models != nil {
+		for _, model := range resp.Models.AvailableModels {
+			metadata.AgentModels = append(metadata.AgentModels, RuntimeAgentModel{ID: model.ID, Name: model.Name, Description: model.Description})
+		}
+	}
 	for _, option := range resp.ConfigOptions {
 		metadata.AgentConfigOptions = append(metadata.AgentConfigOptions, runtimeConfigOptionFromACP(option))
 	}

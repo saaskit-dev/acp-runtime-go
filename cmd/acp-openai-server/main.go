@@ -21,24 +21,43 @@ import (
 func main() {
 	var listen string
 	var agentID string
+	var agentSet bool
 	var cwd string
 	var apiKey string
 	var ttl time.Duration
 	var allowHeaderCWD bool
 	var models string
+	var agents string
+	var discoverModels bool
+	var modelDiscoveryTTL time.Duration
 
 	flag.StringVar(&listen, "listen", "127.0.0.1:8080", "HTTP listen address")
-	flag.StringVar(&agentID, "agent", acp.LocalSimulatorAgentACPRegistryID, "default ACP agent id or alias")
-	flag.StringVar(&cwd, "cwd", "", "session working directory")
+	flag.StringVar(&agentID, "agent", "", "default ACP agent id or alias; defaults to the first --agents entry")
+	flag.StringVar(&cwd, "cwd", "", "session working directory; defaults to the user home directory")
 	flag.StringVar(&apiKey, "api-key", "", "optional API key required as Bearer token or X-API-Key")
 	flag.DurationVar(&ttl, "session-ttl", 30*time.Minute, "persistent ACP session TTL")
 	flag.BoolVar(&allowHeaderCWD, "allow-header-cwd", false, "allow X-ACP-CWD to override working directory")
-	flag.StringVar(&models, "models", "", "comma-separated model ids returned by /v1/models")
+	flag.StringVar(&models, "models", "", "comma-separated OpenAI model ids returned by /v1/models, e.g. claude/sonnet,codex/gpt-5.5")
+	flag.StringVar(&agents, "agents", "claude,codex", "comma-separated ACP agent ids or aliases; first entry is the default agent")
+	flag.BoolVar(&discoverModels, "discover-models", true, "probe ACP agents and add discovered models to /v1/models")
+	flag.DurationVar(&modelDiscoveryTTL, "model-discovery-ttl", 10*time.Minute, "TTL for discovered /v1/models entries")
 	flag.Parse()
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "agent" {
+			agentSet = true
+		}
+	})
+	agentIDs := splitCSV(agents)
+	if len(agentIDs) == 0 {
+		agentIDs = []string{acp.LocalSimulatorAgentACPRegistryID}
+	}
+	if !agentSet || strings.TrimSpace(agentID) == "" {
+		agentID = agentIDs[0]
+	}
 
 	if cwd == "" {
 		var err error
-		cwd, err = os.Getwd()
+		cwd, err = os.UserHomeDir()
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -48,14 +67,18 @@ func main() {
 	defer stop()
 
 	server := openaiserver.NewServer(openaiserver.Config{
-		ConnectionFactory: acp.NewStdioConnectionFactory(acp.StdioFactoryOptions{Stderr: "inherit"}),
-		DefaultAgentID:    agentID,
-		ResolveAgent:      resolveAgent,
-		CWD:               cwd,
-		SessionTTL:        ttl,
-		APIKey:            apiKey,
-		AllowHeaderCWD:    allowHeaderCWD,
-		Models:            splitCSV(models, agentID),
+		ConnectionFactory:          acp.NewStdioConnectionFactory(acp.StdioFactoryOptions{Stderr: "inherit"}),
+		DiscoveryConnectionFactory: acp.NewStdioConnectionFactory(acp.StdioFactoryOptions{Stderr: "ignore"}),
+		DefaultAgentID:             agentID,
+		ResolveAgent:               resolveAgent,
+		CWD:                        cwd,
+		SessionTTL:                 ttl,
+		APIKey:                     apiKey,
+		AllowHeaderCWD:             allowHeaderCWD,
+		Models:                     splitCSV(models),
+		Agents:                     agentIDs,
+		DiscoverModels:             discoverModels,
+		ModelDiscoveryTTL:          modelDiscoveryTTL,
 	})
 
 	httpServer := &http.Server{Addr: listen, Handler: server.Handler()}
@@ -101,7 +124,7 @@ func resolveAgent(ctx context.Context, agentID string) (acp.Agent, error) {
 	return agent, nil
 }
 
-func splitCSV(value string, fallback string) []string {
+func splitCSV(value string) []string {
 	if strings.TrimSpace(value) == "" {
 		return nil
 	}
@@ -110,9 +133,6 @@ func splitCSV(value string, fallback string) []string {
 		if trimmed := strings.TrimSpace(item); trimmed != "" {
 			out = append(out, trimmed)
 		}
-	}
-	if len(out) == 0 && fallback != "" {
-		out = append(out, fallback)
 	}
 	return out
 }

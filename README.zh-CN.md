@@ -82,7 +82,7 @@ make lint
 本仓库提供一个本地 OpenAI-compatible HTTP gateway：
 
 ```bash
-./run openai-server --listen 127.0.0.1:8080 --agent claude --cwd "$PWD"
+./run openai-server
 ```
 
 主要接口：
@@ -92,18 +92,28 @@ make lint
 - `GET /v1/acp/sessions`
 - `DELETE /v1/acp/sessions/{id}`
 
+`GET /v1/models` 返回可直接用于 OpenAI `model` 字段的模型 ID。模型 ID 可以带 ACP agent 前缀：
+
+- `claude/sonnet`：启动 `claude` ACP agent，并设置 ACP config `model=sonnet`
+- `codex/gpt-5.5`：启动 `codex` ACP agent，并设置 ACP config `model=gpt-5.5`
+- `gpt-5.5`：使用 `--agents` 的第一项，并设置 ACP config `model=gpt-5.5`
+
+开启 `--discover-models` 后，服务会探测 `--agents` 指定的 agent，读取 ACP model metadata 或 `model` config option 的可选值，立刻关闭探测 session，并按 `--model-discovery-ttl` 缓存探测结果。显式 `--models` 配置始终会保留；agent 没有暴露模型信息或探测失败时，它就是 fallback。
+
+默认 `--agents` 是 `claude,codex`，默认开启模型探测，默认 `--cwd` 是用户 home 目录。可选的 `--agent` 可以覆盖默认 agent，但常规用法是只配置 `--agents`；它的第一项就是默认 agent。
+
 默认没有 `X-ACP-Session-ID` 时，请求会创建临时 ACP session，完成一个 turn 后关闭。需要复用 ACP session 时，在第一次请求加 `X-ACP-Session-Mode: persistent`，服务会在响应头返回 `X-ACP-Session-ID`：
 
 ```bash
 curl -i http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -H 'X-ACP-Session-Mode: persistent' \
-  -d '{"model":"claude","messages":[{"role":"user","content":"Summarize this repository."}]}'
+  -d '{"model":"claude/sonnet","messages":[{"role":"user","content":"Summarize this repository."}]}'
 ```
 
 后续请求带同一个 `X-ACP-Session-ID` 会复用该 ACP session。复用 session 时默认只把最后一条 user message 作为新 turn 输入，避免把 OpenAI 客户端重放的完整 `messages` 再次塞入已有 ACP session。需要显式重放完整上下文时，传 `X-ACP-Input-Mode: replay`。
 
-同一个 ACP session 同一时间只允许一个 turn；并发命中会返回 `session_busy`。session 按 API key/owner、agent、cwd 和 system prompt hash 做隔离，并由 `--session-ttl` 控制空闲过期。
+同一个 ACP session 同一时间只允许一个 turn；并发命中会返回 `session_busy`。session 按 API key/owner、agent、model、cwd 和 system prompt hash 做隔离，并由 `--session-ttl` 控制空闲过期。
 
 `GET /v1/acp/sessions` 会返回 gateway session id 和底层 `acp_session_id`，用于确认哪些 session 是该 gateway 开启并管理的。服务退出时会关闭所有由该 gateway 登记的 managed ACP session 和它自己创建的 runtime；`SIGINT`、`SIGTERM`、TTL 定时清理以及 `DELETE /v1/acp/sessions/{id}` 都会触发对应清理，避免本地 ACP agent 进程泄露。
 

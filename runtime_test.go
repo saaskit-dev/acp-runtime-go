@@ -41,6 +41,83 @@ func TestRuntimeStartsSimulatorOverStdio(t *testing.T) {
 	}
 }
 
+func TestRuntimeAppliesInitialMode(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cwd := t.TempDir()
+	storage := t.TempDir()
+	simulatorBin := buildSimulatorBinary(t)
+	agent := Agent{
+		Type:    LocalSimulatorAgentACPRegistryID,
+		Command: simulatorBin,
+		Args:    []string{"--auth-mode", "none", "--storage-dir", storage},
+	}
+	runtime := NewRuntime(NewStdioConnectionFactory(StdioFactoryOptions{}), RuntimeOptions{})
+	session, err := runtime.StartSession(ctx, StartSessionOptions{
+		Agent: agent,
+		CWD:   cwd,
+		InitialConfig: InitialConfig{
+			Mode: "yolo",
+		},
+	})
+	if err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+	defer session.Close(context.Background())
+	if got := session.Metadata().CurrentModeID; got != "yolo" {
+		t.Fatalf("CurrentModeID = %q, want yolo", got)
+	}
+}
+
+func TestRuntimeAppliesInitialModelAndEffort(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cwd := t.TempDir()
+	storage := t.TempDir()
+	simulatorBin := buildSimulatorBinary(t)
+	agent := Agent{
+		Type:    LocalSimulatorAgentACPRegistryID,
+		Command: simulatorBin,
+		Args:    []string{"--auth-mode", "none", "--storage-dir", storage},
+	}
+	runtime := NewRuntime(NewStdioConnectionFactory(StdioFactoryOptions{}), RuntimeOptions{})
+	session, err := runtime.StartSession(ctx, StartSessionOptions{
+		Agent: agent,
+		CWD:   cwd,
+		InitialConfig: InitialConfig{
+			Model:  "claude",
+			Effort: "high",
+		},
+	})
+	if err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+	defer session.Close(context.Background())
+	if got := configOptionValue(session.Metadata().AgentConfigOptions, "model"); got != "claude" {
+		t.Fatalf("model option = %v, want claude", got)
+	}
+	if got := configOptionValue(session.Metadata().AgentConfigOptions, "reasoning_effort"); got != "high" {
+		t.Fatalf("reasoning_effort option = %v, want high", got)
+	}
+}
+
+func TestClaudeInitialModeYoloAliasesToBypassPermissions(t *testing.T) {
+	profile := ResolveAgentProfile(Agent{Type: ClaudeCodeACPRegistryID})
+	aliases := initialConfigAliases(profile, "mode", "yolo")
+	if len(aliases) != 2 || aliases[0] != "bypassPermissions" || aliases[1] != "yolo" {
+		t.Fatalf("aliases = %#v, want bypassPermissions then yolo", aliases)
+	}
+}
+
+func configOptionValue(options []RuntimeAgentConfigOption, id string) any {
+	for _, option := range options {
+		if option.ID == id {
+			return option.Value
+		}
+	}
+	return nil
+}
+
 func TestSimulatorWriteProducesOperation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()

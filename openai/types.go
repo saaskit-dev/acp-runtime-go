@@ -52,6 +52,60 @@ type streamOptions struct {
 	IncludeObfuscation bool `json:"include_obfuscation,omitempty"`
 }
 
+type responseRequest struct {
+	Model              string                     `json:"model"`
+	Input              responseInput              `json:"input"`
+	Instructions       string                     `json:"instructions,omitempty"`
+	Stream             bool                       `json:"stream,omitempty"`
+	PreviousResponseID string                     `json:"previous_response_id,omitempty"`
+	Store              *bool                      `json:"store,omitempty"`
+	Metadata           map[string]any             `json:"metadata,omitempty"`
+	MaxOutputTokens    *int                       `json:"max_output_tokens,omitempty"`
+	Temperature        *float64                   `json:"temperature,omitempty"`
+	TopP               *float64                   `json:"top_p,omitempty"`
+	Tools              []json.RawMessage          `json:"tools,omitempty"`
+	ToolChoice         any                        `json:"tool_choice,omitempty"`
+	Text               *responseTextConfig        `json:"text,omitempty"`
+	Reasoning          *responseReasoningConfig   `json:"reasoning,omitempty"`
+	Extra              map[string]json.RawMessage `json:"-"`
+}
+
+type responseReasoningConfig struct {
+	Effort  string `json:"effort,omitempty"`
+	Summary string `json:"summary,omitempty"`
+}
+
+type responseTextConfig struct {
+	Format *responseTextFormat `json:"format,omitempty"`
+}
+
+type responseTextFormat struct {
+	Type string `json:"type"`
+}
+
+type responseInput struct {
+	Text  string
+	Items []responseInputItem
+	Set   bool
+}
+
+type responseInputItem struct {
+	Type    string               `json:"type,omitempty"`
+	Role    string               `json:"role,omitempty"`
+	Content responseInputContent `json:"content,omitempty"`
+}
+
+type responseInputContent struct {
+	Text  string
+	Parts []responseContentPart
+}
+
+type responseContentPart struct {
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	ImageURL any    `json:"image_url,omitempty"`
+}
+
 func (c *messageContent) UnmarshalJSON(data []byte) error {
 	var text string
 	if err := json.Unmarshal(data, &text); err == nil {
@@ -77,6 +131,89 @@ func (c messageContent) text() string {
 	for _, part := range c.Parts {
 		switch part.Type {
 		case "text", "input_text":
+			if part.Text != "" {
+				parts = append(parts, part.Text)
+			}
+		case "image_url", "input_image":
+			parts = append(parts, "[image]")
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+func (i *responseInput) UnmarshalJSON(data []byte) error {
+	i.Set = true
+	var text string
+	if err := json.Unmarshal(data, &text); err == nil {
+		i.Text = text
+		return nil
+	}
+	var items []responseInputItem
+	if err := json.Unmarshal(data, &items); err == nil {
+		i.Items = items
+		return nil
+	}
+	if string(data) == "null" {
+		return nil
+	}
+	return fmt.Errorf("unsupported response input")
+}
+
+func (i responseInput) empty() bool {
+	return strings.TrimSpace(i.Text) == "" && len(i.Items) == 0
+}
+
+func (i responseInput) text() string {
+	if i.Text != "" {
+		return i.Text
+	}
+	var out []string
+	for _, item := range i.Items {
+		text := strings.TrimSpace(item.Content.text())
+		if text == "" {
+			continue
+		}
+		switch item.Role {
+		case "system":
+			out = append(out, "[System]\n"+text)
+		case "developer":
+			out = append(out, "[Developer]\n"+text)
+		case "assistant":
+			out = append(out, "[Previous assistant response]\n"+text)
+		case "tool":
+			out = append(out, "[Tool result]\n"+text)
+		default:
+			out = append(out, text)
+		}
+	}
+	return strings.Join(out, "\n\n")
+}
+
+func (c *responseInputContent) UnmarshalJSON(data []byte) error {
+	var text string
+	if err := json.Unmarshal(data, &text); err == nil {
+		c.Text = text
+		return nil
+	}
+	var parts []responseContentPart
+	if err := json.Unmarshal(data, &parts); err == nil {
+		c.Parts = parts
+		return nil
+	}
+	if string(data) == "null" {
+		return nil
+	}
+	return fmt.Errorf("unsupported response input content")
+}
+
+func (c responseInputContent) text() string {
+	if c.Text != "" {
+		return c.Text
+	}
+	var parts []string
+	for _, part := range c.Parts {
+		switch part.Type {
+		case "text", "input_text", "output_text":
 			if part.Text != "" {
 				parts = append(parts, part.Text)
 			}
@@ -120,6 +257,38 @@ type openAIUsage struct {
 	TotalTokens      uint64 `json:"total_tokens"`
 }
 
+type responseObject struct {
+	ID         string               `json:"id"`
+	Object     string               `json:"object"`
+	CreatedAt  int64                `json:"created_at"`
+	Status     string               `json:"status"`
+	Model      string               `json:"model"`
+	Output     []responseOutputItem `json:"output"`
+	OutputText string               `json:"output_text,omitempty"`
+	Usage      *responseUsage       `json:"usage,omitempty"`
+	Metadata   map[string]any       `json:"metadata,omitempty"`
+}
+
+type responseOutputItem struct {
+	ID      string                  `json:"id"`
+	Type    string                  `json:"type"`
+	Status  string                  `json:"status"`
+	Role    string                  `json:"role"`
+	Content []responseOutputContent `json:"content"`
+}
+
+type responseOutputContent struct {
+	Type        string `json:"type"`
+	Text        string `json:"text"`
+	Annotations []any  `json:"annotations"`
+}
+
+type responseUsage struct {
+	InputTokens  uint64 `json:"input_tokens"`
+	OutputTokens uint64 `json:"output_tokens"`
+	TotalTokens  uint64 `json:"total_tokens"`
+}
+
 type openAIErrorResponse struct {
 	Error openAIError `json:"error"`
 }
@@ -153,6 +322,7 @@ type sessionListEntry struct {
 	ACPSessionID string `json:"acp_session_id"`
 	Object       string `json:"object"`
 	Agent        string `json:"agent"`
+	Model        string `json:"model,omitempty"`
 	CWD          string `json:"cwd"`
 	Busy         bool   `json:"busy"`
 	Tainted      bool   `json:"tainted"`

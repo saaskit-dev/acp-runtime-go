@@ -663,12 +663,19 @@ type RuntimeSessionMetadata struct {
 	Title              string
 	UpdatedAt          string
 	AgentModes         []RuntimeAgentMode
+	AgentModels        []RuntimeAgentModel
 	CurrentModeID      string
 	AgentConfigOptions []RuntimeAgentConfigOption
 	AvailableCommands  []AvailableCommand
 }
 
 type RuntimeAgentMode struct {
+	ID          string
+	Name        string
+	Description string
+}
+
+type RuntimeAgentModel struct {
 	ID          string
 	Name        string
 	Description string
