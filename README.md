@@ -17,8 +17,8 @@ Protocol alignment:
 
 - ACP protocol version: `1`
 - ACP source repo: `https://github.com/agentclientprotocol/agent-client-protocol`
-- ACP source ref: `v0.13.4`
-- Last verified against upstream docs: `2026-06-01`
+- ACP source ref: `schema-v1.17.0`
+- Last verified against upstream docs: `2026-07-05`
 
 ## Quick Start
 

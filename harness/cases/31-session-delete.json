@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "id": "protocol.session-delete",
+  "kind": "protocol",
+  "title": "Session Delete",
+  "protocolDependencies": [
+    "initialize",
+    "session/new",
+    "session/delete"
+  ],
+  "steps": [
+    {
+      "type": "initialize"
+    },
+    {
+      "type": "session-new"
+    },
+    {
+      "type": "session-delete"
+    }
+  ],
+  "assertions": [
+    {
+      "type": "transcript-has-method",
+      "method": "session/delete"
+    }
+  ]
+}

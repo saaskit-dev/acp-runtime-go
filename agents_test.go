@@ -10,7 +10,7 @@ func TestCreateCodexAgentUsesACPWrapper(t *testing.T) {
 	if agent.Command != "npm" {
 		t.Fatalf("Command = %q, want npm", agent.Command)
 	}
-	assertAgentArgs(t, agent.Args, []string{"exec", "--yes", "@zed-industries/codex-acp@0.15.0", "--"})
+	assertAgentArgs(t, agent.Args, []string{"exec", "--yes", "@zed-industries/codex-acp@0.16.0", "--"})
 }
 
 func TestCreateClaudeCodeAgentUsesACPWrapper(t *testing.T) {

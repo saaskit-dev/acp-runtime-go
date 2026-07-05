@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	acp "github.com/saaskit-dev/acp-runtime-go"
 )
@@ -49,7 +51,7 @@ func (r Runner) Run(ctx context.Context, c Case) (Result, error) {
 		case "authenticate":
 			result.Transcript = append(result.Transcript, TranscriptEntry{Method: "authenticate"})
 		case "session-new":
-			created, err := runtime.StartSession(ctx, acp.StartSessionOptions{Agent: r.Agent, CWD: cwd})
+			created, err := runtime.StartSession(ctx, acp.StartSessionOptions{Agent: r.Agent, CWD: cwd, Handlers: acp.AuthorityHandlers{Terminal: &harnessTerminalHandler{}}})
 			if err != nil {
 				return result, err
 			}
@@ -135,6 +137,16 @@ func (r Runner) Run(ctx context.Context, c Case) (Result, error) {
 				_, _ = session.CancelTurn(ctx, step.TurnRef)
 			}
 			result.Transcript = append(result.Transcript, TranscriptEntry{Method: "session/cancel"})
+		case "session-delete":
+			if session != nil {
+				_ = session.Delete(ctx)
+			}
+			result.Transcript = append(result.Transcript, TranscriptEntry{Method: "session/delete"})
+		case "logout":
+			if session != nil {
+				_ = session.Logout(ctx)
+			}
+			result.Transcript = append(result.Transcript, TranscriptEntry{Method: "logout"})
 		case "wait-for-event":
 			eventType := step.EventType
 			if eventType == "" {
@@ -317,4 +329,148 @@ func hasMethod(entries []TranscriptEntry, method string) bool {
 
 func DefaultCasePath(name string) string {
 	return filepath.Join("harness", "cases", name)
+}
+
+// harnessTerminalHandler is an in-process ACP TerminalHandler backed by
+// os/exec. It lets the simulator agent exercise the full terminal round-trip
+// (terminal/create -> terminal/output -> terminal/wait_for_exit -> terminal/kill
+// -> terminal/release) during harness runs without a real shell.
+type harnessTerminalHandler struct {
+	mu        sync.Mutex
+	terminals map[string]*harnessTerminal
+	nextSeq   int
+}
+
+type harnessTerminal struct {
+	cmd    *exec.Cmd
+	output strings.Builder
+	mu     sync.Mutex
+	done   chan struct{}
+	exit   *acp.TerminalExitStatus
+}
+
+func (h *harnessTerminalHandler) ensure() {
+	if h.terminals == nil {
+		h.terminals = map[string]*harnessTerminal{}
+	}
+}
+
+func (h *harnessTerminalHandler) CreateTerminal(ctx acp.Context, req acp.CreateTerminalRequest) (acp.CreateTerminalResult, error) {
+	h.mu.Lock()
+	h.ensure()
+	h.nextSeq++
+	id := fmt.Sprintf("harness-term-%d", h.nextSeq)
+	h.mu.Unlock()
+	cmd := exec.Command(req.Command, req.Args...)
+	if req.CWD != "" {
+		cmd.Dir = req.CWD
+	}
+	if len(req.Env) > 0 {
+		env := os.Environ()
+		for _, e := range req.Env {
+			env = append(env, e.Name+"="+e.Value)
+		}
+		cmd.Env = env
+	}
+	pipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return acp.CreateTerminalResult{}, err
+	}
+	cmd.Stderr = cmd.Stdout
+	term := &harnessTerminal{cmd: cmd, done: make(chan struct{})}
+	if err := cmd.Start(); err != nil {
+		return acp.CreateTerminalResult{}, err
+	}
+	go func() {
+		defer close(term.done)
+		buf := make([]byte, 4096)
+		for {
+			n, err := pipe.Read(buf)
+			if n > 0 {
+				term.mu.Lock()
+				term.output.Write(buf[:n])
+				term.mu.Unlock()
+			}
+			if err != nil {
+				break
+			}
+		}
+		waitErr := cmd.Wait()
+		term.mu.Lock()
+		term.exit = exitStatusFromErr(waitErr)
+		term.mu.Unlock()
+	}()
+	h.mu.Lock()
+	h.terminals[id] = term
+	h.mu.Unlock()
+	return acp.CreateTerminalResult{TerminalID: id}, nil
+}
+
+func (h *harnessTerminalHandler) Output(ctx acp.Context, terminalID string) (acp.TerminalOutputResult, error) {
+	h.mu.Lock()
+	term := h.terminals[terminalID]
+	h.mu.Unlock()
+	if term == nil {
+		return acp.TerminalOutputResult{}, fmt.Errorf("unknown terminal %q", terminalID)
+	}
+	term.mu.Lock()
+	out := term.output.String()
+	status := term.exit
+	term.mu.Unlock()
+	return acp.TerminalOutputResult{Output: out, ExitStatus: status}, nil
+}
+
+func (h *harnessTerminalHandler) WaitForExit(ctx acp.Context, terminalID string) (acp.TerminalExitStatus, error) {
+	h.mu.Lock()
+	term := h.terminals[terminalID]
+	h.mu.Unlock()
+	if term == nil {
+		return acp.TerminalExitStatus{}, fmt.Errorf("unknown terminal %q", terminalID)
+	}
+	select {
+	case <-term.done:
+	case <-ctx.Done():
+		return acp.TerminalExitStatus{}, ctx.Err()
+	}
+	term.mu.Lock()
+	defer term.mu.Unlock()
+	if term.exit == nil {
+		return acp.TerminalExitStatus{}, nil
+	}
+	return *term.exit, nil
+}
+
+func (h *harnessTerminalHandler) Kill(ctx acp.Context, terminalID string) error {
+	h.mu.Lock()
+	term := h.terminals[terminalID]
+	h.mu.Unlock()
+	if term == nil || term.cmd.Process == nil {
+		return nil
+	}
+	return term.cmd.Process.Kill()
+}
+
+func (h *harnessTerminalHandler) Release(ctx acp.Context, terminalID string) error {
+	h.mu.Lock()
+	term := h.terminals[terminalID]
+	delete(h.terminals, terminalID)
+	h.mu.Unlock()
+	if term != nil && term.cmd.Process != nil {
+		_ = term.cmd.Process.Kill()
+		<-term.done
+	}
+	return nil
+}
+
+func exitStatusFromErr(err error) *acp.TerminalExitStatus {
+	if err == nil {
+		code := uint32(0)
+		return &acp.TerminalExitStatus{ExitCode: &code}
+	}
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		code := uint32(exitErr.ExitCode())
+		return &acp.TerminalExitStatus{ExitCode: &code}
+	}
+	sig := "unknown"
+	return &acp.TerminalExitStatus{Signal: &sig}
 }

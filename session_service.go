@@ -2,6 +2,7 @@ package acpruntime
 
 import (
 	"context"
+	"errors"
 	"strings"
 )
 
@@ -30,6 +31,7 @@ func (s *SessionService) Create(ctx context.Context, input StartSessionOptions) 
 	if err != nil {
 		return nil, wrapError(ErrorCreate, "session.start", "failed to bootstrap ACP session", err)
 	}
+	bootstrap.QueuePolicy = resolveQueuePolicy(input.Queue)
 	req := NewSessionRequest{CWD: input.CWD, MCPServers: normalizeMCPServers(input.MCPServers), AdditionalDirectories: input.AdditionalDirectories, Meta: sessionMeta}
 	resp, err := bootstrap.Connection.NewSession(ctx, req)
 	if err != nil {
@@ -64,6 +66,7 @@ func (s *SessionService) Resume(ctx context.Context, input ResumeSessionOptions)
 	if err != nil {
 		return nil, wrapError(ErrorResume, "session.resume", "failed to bootstrap ACP session", err)
 	}
+	bootstrap.QueuePolicy = resolveQueuePolicy(input.Queue)
 	resp, err := bootstrap.Connection.ResumeSession(ctx, ResumeSessionRequest{SessionID: input.SessionID, CWD: input.CWD, MCPServers: normalizeMCPServers(input.MCPServers), AdditionalDirectories: input.AdditionalDirectories})
 	if err != nil {
 		_ = bootstrap.Dispose(ctx)
@@ -103,9 +106,18 @@ func (s *SessionService) ListAgentSessions(ctx context.Context, input ListSessio
 	if err != nil {
 		return RuntimeSessionList{}, wrapError(ErrorList, "session.list", "failed to list ACP sessions", err)
 	}
+	// StoredSessionsEnabled tells the runtime whether the agent's sessions are
+	// durably persisted (source "stored") or just an in-memory/remote view
+	// (source "remote"). Hosts use this distinction to decide whether
+	// session/load will succeed and whether to surface the sessions in a
+	// history UI.
+	source := "remote"
+	if s.options.StoredSessionsEnabled {
+		source = "stored"
+	}
 	out := RuntimeSessionList{NextCursor: resp.NextCursor}
 	for _, session := range resp.Sessions {
-		ref := RuntimeSessionReference{ID: session.SessionID, AgentType: input.Agent.Type, CWD: session.CWD, Source: "remote"}
+		ref := RuntimeSessionReference{ID: session.SessionID, AgentType: input.Agent.Type, CWD: session.CWD, Source: source}
 		if session.Title != nil {
 			ref.Title = *session.Title
 		}
@@ -164,11 +176,40 @@ func isAuthenticationNotImplemented(err error) bool {
 	return strings.Contains(msg, "authentication not implemented")
 }
 
+// isMethodNotImplemented reports whether err is a JSON-RPC -32601
+// "method not found" response. Used to gracefully tolerate agents that have not
+// implemented newer stable-v1 methods (e.g. logout, session/delete) so callers
+// do not see hard failures when targeting older adapter versions.
+func isMethodNotImplemented(err error) bool {
+	if err == nil {
+		return false
+	}
+	var rpcErr *RPCError
+	if errors.As(err, &rpcErr) {
+		return rpcErr.Code == -32601
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "method not found") || strings.Contains(msg, `"method not found"`)
+}
+
 func normalizeMCPServers(servers []MCPServer) []MCPServer {
 	if servers == nil {
 		return []MCPServer{}
 	}
 	return servers
+}
+
+// resolveQueuePolicy normalizes the host-supplied QueuePolicyInput into the
+// internal QueuePolicy that governs turn-event delivery. The default ("buffer")
+// streams every intermediate event; "drop" suppresses intermediate events so
+// the consumer only observes the final completion. This is a runtime-level
+// behavior, not an ACP wire field.
+func resolveQueuePolicy(input QueuePolicyInput) QueuePolicy {
+	delivery := strings.ToLower(strings.TrimSpace(input.Delivery))
+	if delivery == "" {
+		delivery = "buffer"
+	}
+	return QueuePolicy{Delivery: delivery}
 }
 
 func applyInitialConfig(ctx context.Context, driver *acpSessionDriver, config InitialConfig, profile AgentProfile) (InitialConfigReport, error) {

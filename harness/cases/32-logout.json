@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "id": "protocol.logout",
+  "kind": "protocol",
+  "title": "Logout",
+  "protocolDependencies": [
+    "initialize",
+    "session/new",
+    "logout"
+  ],
+  "steps": [
+    {
+      "type": "initialize"
+    },
+    {
+      "type": "session-new"
+    },
+    {
+      "type": "logout"
+    }
+  ],
+  "assertions": [
+    {
+      "type": "transcript-has-method",
+      "method": "logout"
+    }
+  ]
+}

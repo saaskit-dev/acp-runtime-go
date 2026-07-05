@@ -235,6 +235,10 @@ type testSessionDriver struct {
 
 func (d *testSessionDriver) Close(context.Context) error { return nil }
 
+func (d *testSessionDriver) Delete(context.Context) error { return nil }
+
+func (d *testSessionDriver) Logout(context.Context) error { return nil }
+
 func (d *testSessionDriver) CancelTurn(context.Context, string) (bool, error) { return true, nil }
 
 func (d *testSessionDriver) SetAgentMode(context.Context, string) error { return nil }

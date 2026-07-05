@@ -9,10 +9,10 @@ const (
 	ProtocolVersion = 1
 
 	ACPProtocolSourceRepo        = "https://github.com/agentclientprotocol/agent-client-protocol"
-	ACPProtocolSourceRef         = "v0.13.4"
-	ACPProtocolDocsURL           = "https://agentclientprotocol.com/protocol/overview"
-	ACPProtocolDocsSchemaURL     = "https://agentclientprotocol.com/protocol/draft/schema"
-	ACPProtocolAlignmentVerified = "2026-06-01"
+	ACPProtocolSourceRef         = "schema-v1.17.0"
+	ACPProtocolDocsURL           = "https://agentclientprotocol.com/protocol/v1/overview"
+	ACPProtocolDocsSchemaURL     = "https://agentclientprotocol.com/protocol/v1/schema"
+	ACPProtocolAlignmentVerified = "2026-07-05"
 
 	RuntimeSnapshotVersion = 1
 
@@ -282,6 +282,21 @@ type CloseSessionRequest struct {
 
 type CloseSessionResponse struct{}
 
+// DeleteSessionRequest deletes a session's persistent history. Unlike
+// session/close (which just ends the active session), session/delete removes
+// the session from the agent's storage so it can no longer be loaded/resumed.
+type DeleteSessionRequest struct {
+	SessionID string `json:"sessionId"`
+}
+
+type DeleteSessionResponse struct{}
+
+// LogoutRequest asks the agent to discard any cached credentials. Stable since
+// ACP v1; agents that advertised auth methods during initialize should honor it.
+type LogoutRequest struct{}
+
+type LogoutResponse struct{}
+
 type CancelRequest struct {
 	SessionID string `json:"sessionId"`
 }
@@ -533,29 +548,49 @@ type FilesystemHandler interface {
 	WriteTextFile(ctx Context, path, text string) error
 }
 
+// TerminalHandler implements the host side of the ACP terminal methods
+// (terminal/create, terminal/output, terminal/wait_for_exit, terminal/kill,
+// terminal/release). All five are invoked by the agent and implemented by the
+// host; see https://agentclientprotocol.com/protocol/v1/terminals.
 type TerminalHandler interface {
-	CreateTerminal(ctx Context, request TerminalStartRequest) (TerminalSnapshot, error)
-	Output(ctx Context, terminalID string) (TerminalSnapshot, error)
-	Wait(ctx Context, terminalID string) (TerminalSnapshot, error)
-	Kill(ctx Context, terminalID string) (TerminalSnapshot, error)
-	Release(ctx Context, terminalID string) (TerminalSnapshot, error)
+	CreateTerminal(ctx Context, request CreateTerminalRequest) (CreateTerminalResult, error)
+	Output(ctx Context, terminalID string) (TerminalOutputResult, error)
+	WaitForExit(ctx Context, terminalID string) (TerminalExitStatus, error)
+	Kill(ctx Context, terminalID string) error
+	Release(ctx Context, terminalID string) error
 }
 
-type TerminalStartRequest struct {
-	Command string
-	Args    []string
-	CWD     string
-	Env     map[string]string
+// CreateTerminalRequest is the runtime representation of a terminal/create
+// request. Env is []EnvVariable on the wire (ACP v1), not a map.
+type CreateTerminalRequest struct {
+	SessionID       string
+	Command         string
+	Args            []string
+	Env             []EnvVariable
+	CWD             string
+	OutputByteLimit *uint64
 }
 
-type TerminalSnapshot struct {
-	ID        string
-	Command   string
-	Status    string
-	Output    string
-	ExitCode  *int
-	StartedAt time.Time
-	UpdatedAt time.Time
+// CreateTerminalResult is returned immediately by CreateTerminal; the command
+// keeps running asynchronously and is observed via Output/WaitForExit.
+type CreateTerminalResult struct {
+	TerminalID string
+}
+
+// TerminalOutputResult is the runtime representation of terminal/output. It
+// returns the output captured so far without blocking for exit.
+type TerminalOutputResult struct {
+	Output     string
+	Truncated  bool
+	ExitStatus *TerminalExitStatus // present only after the command has exited
+}
+
+// TerminalExitStatus conveys how a terminal command ended. Normal exit sets
+// ExitCode (and leaves Signal nil); termination by signal sets Signal (and
+// leaves ExitCode nil). This mirrors the ACP TerminalExitStatus shape.
+type TerminalExitStatus struct {
+	ExitCode *uint32 // nil when terminated by signal
+	Signal   *string // nil when exited normally
 }
 
 type ObservabilityOptions struct {

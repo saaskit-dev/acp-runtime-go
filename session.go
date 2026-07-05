@@ -53,6 +53,34 @@ func (s *Session) Close(ctx context.Context) error {
 	return s.driver.Close(ctx)
 }
 
+// Delete issues session/delete to remove the session's persistent history from
+// the agent, then closes the session locally. Use this instead of Close when
+// the host wants the session forgotten rather than just ended.
+func (s *Session) Delete(ctx context.Context) error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.closed = true
+	s.mu.Unlock()
+	if s.runtime != nil {
+		s.runtime.unregister(s.driver)
+	}
+	return s.driver.Delete(ctx)
+}
+
+// Logout asks the agent to discard cached credentials (logout). It does not
+// close the session; pair with Close or Delete as needed.
+func (s *Session) Logout(ctx context.Context) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return sessionClosedError("session.logout")
+	}
+	return s.driver.Logout(ctx)
+}
+
 func (s *Session) StartTurn(ctx context.Context, prompt RuntimePrompt) TurnHandle {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

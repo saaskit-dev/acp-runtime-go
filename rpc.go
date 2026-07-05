@@ -88,6 +88,12 @@ type Peer struct {
 	requestHandlers      map[string]RPCHandler
 	notificationHandlers map[string]RPCNotificationHandler
 
+	// inboundCancel tracks in-flight inbound requests by their raw id so that a
+	// $/cancel_request notification from the peer can cancel them. The cancel
+	// func cancels the per-request context passed to the handler.
+	inboundCancelMu sync.Mutex
+	inboundCancel   map[string]context.CancelFunc
+
 	closed    chan struct{}
 	closeOnce sync.Once
 }
@@ -108,15 +114,36 @@ var (
 )
 
 func NewPeer(r io.Reader, w io.Writer, opts PeerOptions) *Peer {
-	return &Peer{
+	p := &Peer{
 		reader:               bufio.NewReaderSize(r, defaultRPCReadBufferSize),
 		writer:               w,
 		opts:                 opts,
 		pending:              map[int64]chan rpcMessage{},
 		requestHandlers:      map[string]RPCHandler{},
 		notificationHandlers: map[string]RPCNotificationHandler{},
+		inboundCancel:        map[string]context.CancelFunc{},
 		closed:               make(chan struct{}),
 	}
+	// Auto-register the protocol-level $/cancel_request notification handler so
+	// every Peer can honor peer-initiated cancellation of in-flight inbound
+	// requests (ACP schema-v1.17.0, x-side: "protocol", bidirectional). Callers
+	// may still override via RegisterNotification if they need custom behavior.
+	p.notificationHandlers["$/cancel_request"] = func(ctx context.Context, raw json.RawMessage) {
+		var params struct {
+			RequestID json.RawMessage `json:"requestId"`
+		}
+		if err := json.Unmarshal(raw, &params); err != nil || len(params.RequestID) == 0 {
+			return // malformed cancel; per spec, silently ignore
+		}
+		idKey := string(trimJSONSpace(params.RequestID))
+		p.inboundCancelMu.Lock()
+		cancel, ok := p.inboundCancel[idKey]
+		p.inboundCancelMu.Unlock()
+		if ok {
+			cancel() // best-effort; handler MAY honor cancellation
+		}
+	}
+	return p
 }
 
 func (p *Peer) RegisterRequest(method string, handler RPCHandler) {
@@ -175,6 +202,13 @@ func (p *Peer) Close() {
 			close(ch)
 		}
 		p.pendingMu.Unlock()
+		// Cancel any in-flight inbound requests so handlers can exit promptly.
+		p.inboundCancelMu.Lock()
+		for id, cancel := range p.inboundCancel {
+			cancel()
+			delete(p.inboundCancel, id)
+		}
+		p.inboundCancelMu.Unlock()
 	})
 }
 
@@ -217,9 +251,21 @@ func (p *Peer) callRaw(ctx context.Context, method string, params json.RawMessag
 	}
 	select {
 	case <-ctx.Done():
+		// Best-effort JSON-RPC cancellation: notify the peer that the in-flight
+		// request identified by idValue is cancelled ($/cancel_request, stabilized
+		// in ACP schema-v1.17.0 / JSON-RPC 2.0 spec). The peer may ignore it.
+		// Remove from pending first so a late response is dropped, not delivered.
 		p.pendingMu.Lock()
+		_, stillPending := p.pending[idValue]
 		delete(p.pending, idValue)
 		p.pendingMu.Unlock()
+		if stillPending {
+			// Per ACP schema-v1.17.0 CancelRequestNotification, the param field
+			// is "requestId" (camelCase), typed as RequestId (null|int64|string).
+			// We emit the same int64 id we assigned in the original request.
+			cancelParams, _ := json.Marshal(map[string]any{"requestId": json.RawMessage(idBytes)})
+			_ = p.writeMessage(rpcMessage{JSONRPC: "2.0", Method: "$/cancel_request", Params: cancelParams})
+		}
 		return nil, ctx.Err()
 	case <-p.closed:
 		return nil, io.ErrClosedPipe
@@ -275,11 +321,37 @@ func (p *Peer) handleRequest(ctx context.Context, msg rpcMessage) {
 		_ = p.writeMessage(rpcMessage{JSONRPC: "2.0", ID: msg.ID, Error: &RPCError{Code: -32601, Message: "method not found"}})
 		return
 	}
-	result, err := handler(ctx, msg.Params)
+	// Create a cancellable child context and register it so a peer-sent
+	// $/cancel_request can interrupt this handler. Per ACP schema-v1.17.0,
+	// honoring cancellation is MAY (best-effort); handlers that don't check
+	// ctx simply run to completion. The original request still gets a final
+	// response (normal result or -32800 if the handler returns ctx.Err()).
+	reqCtx, cancel := context.WithCancel(ctx)
+	idKey := string(msg.ID)
+	p.inboundCancelMu.Lock()
+	p.inboundCancel[idKey] = cancel
+	p.inboundCancelMu.Unlock()
+	defer func() {
+		cancel()
+		// Best-effort cleanup. IDs are unique per-peer (monotonic on our side,
+		// and peers rarely reuse ids), so a stale entry is unlikely; if a
+		// re-entrant same-id request raced us, the worst case is deleting an
+		// entry that will be re-added, which is harmless.
+		p.inboundCancelMu.Lock()
+		delete(p.inboundCancel, idKey)
+		p.inboundCancelMu.Unlock()
+	}()
+	result, err := handler(reqCtx, msg.Params)
 	if err != nil {
 		var rpcErr *RPCError
 		if !errors.As(err, &rpcErr) {
-			rpcErr = &RPCError{Code: -32000, Message: err.Error()}
+			// If the handler surfaced a context cancellation, report it as the
+			// ACP -32800 "Request cancelled" error code per schema-v1.17.0.
+			if errors.Is(err, context.Canceled) {
+				rpcErr = &RPCError{Code: -32800, Message: "Request cancelled"}
+			} else {
+				rpcErr = &RPCError{Code: -32000, Message: err.Error()}
+			}
 		}
 		_ = p.writeMessage(rpcMessage{JSONRPC: "2.0", ID: msg.ID, Error: rpcErr})
 		return
@@ -412,10 +484,14 @@ func appendMethodValue(dst []byte, method string) []byte {
 		return append(dst, `"fs/write_text_file"`...)
 	case "initialize":
 		return append(dst, `"initialize"`...)
+	case "logout":
+		return append(dst, `"logout"`...)
 	case "session/cancel":
 		return append(dst, `"session/cancel"`...)
 	case "session/close":
 		return append(dst, `"session/close"`...)
+	case "session/delete":
+		return append(dst, `"session/delete"`...)
 	case "session/fork":
 		return append(dst, `"session/fork"`...)
 	case "session/list":
@@ -436,6 +512,16 @@ func appendMethodValue(dst []byte, method string) []byte {
 		return append(dst, `"session/set_mode"`...)
 	case "session/update":
 		return append(dst, `"session/update"`...)
+	case "terminal/create":
+		return append(dst, `"terminal/create"`...)
+	case "terminal/kill":
+		return append(dst, `"terminal/kill"`...)
+	case "terminal/output":
+		return append(dst, `"terminal/output"`...)
+	case "terminal/release":
+		return append(dst, `"terminal/release"`...)
+	case "terminal/wait_for_exit":
+		return append(dst, `"terminal/wait_for_exit"`...)
 	default:
 		return strconv.AppendQuote(dst, method)
 	}
@@ -693,6 +779,9 @@ func canonicalRPCMethod(raw []byte) string {
 	if equalASCII(raw, "authenticate") {
 		return "authenticate"
 	}
+	if equalASCII(raw, "logout") {
+		return "logout"
+	}
 	if equalASCII(raw, "session/new") {
 		return "session/new"
 	}
@@ -717,6 +806,9 @@ func canonicalRPCMethod(raw []byte) string {
 	if equalASCII(raw, "session/close") {
 		return "session/close"
 	}
+	if equalASCII(raw, "session/delete") {
+		return "session/delete"
+	}
 	if equalASCII(raw, "session/request_permission") {
 		return "session/request_permission"
 	}
@@ -725,6 +817,21 @@ func canonicalRPCMethod(raw []byte) string {
 	}
 	if equalASCII(raw, "fs/write_text_file") {
 		return "fs/write_text_file"
+	}
+	if equalASCII(raw, "terminal/create") {
+		return "terminal/create"
+	}
+	if equalASCII(raw, "terminal/output") {
+		return "terminal/output"
+	}
+	if equalASCII(raw, "terminal/wait_for_exit") {
+		return "terminal/wait_for_exit"
+	}
+	if equalASCII(raw, "terminal/kill") {
+		return "terminal/kill"
+	}
+	if equalASCII(raw, "terminal/release") {
+		return "terminal/release"
 	}
 	return string(raw)
 }

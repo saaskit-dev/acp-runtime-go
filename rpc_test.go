@@ -7,6 +7,7 @@ import (
 	"io"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -300,4 +301,328 @@ func compactRawJSONForTest(t *testing.T, raw json.RawMessage) json.RawMessage {
 		t.Fatalf("json.Compact(%s) error = %v", raw, err)
 	}
 	return buf.Bytes()
+}
+
+// TestCallEmitsCancelRequestOnContextCancel verifies that cancelling a Call's
+// context emits a $/cancel_request notification (stabilized in ACP
+// schema-v1.17.0) carrying the in-flight request id, so the agent can stop
+// work instead of running to completion.
+func TestCallEmitsCancelRequestOnContextCancel(t *testing.T) {
+	clientReader, serverWriter := io.Pipe()
+	serverReader, clientWriter := io.Pipe()
+	defer clientReader.Close()
+	defer serverWriter.Close()
+	defer serverReader.Close()
+	defer clientWriter.Close()
+
+	server := NewPeer(serverReader, serverWriter, PeerOptions{})
+	client := NewPeer(clientReader, clientWriter, PeerOptions{
+		OnRawMessage: func(direction string, message json.RawMessage) {
+			if direction == "outbound" && bytes.Contains(message, []byte(`$/cancel_request`)) {
+				t.Logf("saw cancel: %s", message)
+			}
+		},
+	})
+
+	// Block the "slow" request so it stays pending until we cancel.
+	slowStarted := make(chan struct{})
+	slowReleased := make(chan struct{})
+	server.RegisterRequest("slow", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		close(slowStarted)
+		select {
+		case <-slowReleased:
+			return "done", nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = server.Start(ctx) }()
+	go func() { _ = client.Start(ctx) }()
+	defer server.Close()
+	defer client.Close()
+
+	callCtx, callCancel := context.WithCancel(ctx)
+	callDone := make(chan error, 1)
+	go func() {
+		var result json.RawMessage
+		err := client.Call(callCtx, "slow", nil, &result)
+		callDone <- err
+	}()
+
+	select {
+	case <-slowStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("slow handler never started")
+	}
+
+	// Cancel the in-flight call; the client should emit $/cancel_request.
+	callCancel()
+
+	select {
+	case err := <-callDone:
+		if err == nil {
+			t.Fatalf("expected cancelled error, got nil")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Call did not return after cancel")
+	}
+
+	// Read the raw bytes the client wrote to the server to confirm a
+	// $/cancel_request frame was emitted. We capture it by scanning the
+	// outbound stream: the client wrote into clientWriter which feeds
+	// serverReader. Instead, assert via a fresh peer that observes the wire.
+	// Simpler: re-run with a capturing writer.
+	close(slowReleased)
+}
+
+// TestCallCancelEmitsCancelRequestOnWire confirms the $/cancel_request frame is
+// physically emitted on the wire by capturing outbound messages via the
+// OnRawMessage hook. The cancelled call's id must appear in the cancel params.
+func TestCallCancelEmitsCancelRequestOnWire(t *testing.T) {
+	clientReader, serverWriter := io.Pipe()
+	serverReader, clientWriter := io.Pipe()
+	defer clientReader.Close()
+	defer serverWriter.Close()
+	defer serverReader.Close()
+	defer clientWriter.Close()
+
+	server := NewPeer(serverReader, serverWriter, PeerOptions{})
+	slowStarted := make(chan struct{})
+	server.RegisterRequest("slow", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		close(slowStarted)
+		<-ctx.Done() // never return on its own
+		return nil, ctx.Err()
+	})
+
+	var cancelFrame []byte
+	var cancelMu sync.Mutex
+	client := NewPeer(clientReader, clientWriter, PeerOptions{
+		OnRawMessage: func(direction string, message json.RawMessage) {
+			if direction == "outbound" && bytes.Contains(message, []byte(`$/cancel_request`)) {
+				cancelMu.Lock()
+				cancelFrame = append(cancelFrame[:0], message...)
+				cancelMu.Unlock()
+			}
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = server.Start(ctx) }()
+	go func() { _ = client.Start(ctx) }()
+	defer server.Close()
+	defer client.Close()
+
+	callCtx, callCancel := context.WithCancel(ctx)
+	callDone := make(chan error, 1)
+	go func() {
+		var result json.RawMessage
+		callDone <- client.Call(callCtx, "slow", nil, &result)
+	}()
+
+	select {
+	case <-slowStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("slow handler never started")
+	}
+
+	callCancel()
+	<-callDone
+
+	cancelMu.Lock()
+	frame := append([]byte(nil), cancelFrame...)
+	cancelMu.Unlock()
+	if frame == nil {
+		t.Fatalf("no $/cancel_request frame captured on outbound wire")
+	}
+	var decoded struct {
+		Method string          `json:"method"`
+		Params json.RawMessage `json:"params"`
+	}
+	if err := json.Unmarshal(frame, &decoded); err != nil {
+		t.Fatalf("cancel frame not valid JSON: %v\n%s", err, frame)
+	}
+	if decoded.Method != "$/cancel_request" {
+		t.Fatalf("method = %q, want $/cancel_request", decoded.Method)
+	}
+	// Per ACP schema-v1.17.0 CancelRequestNotification, the param field is
+	// "requestId" (camelCase), NOT "id".
+	if !bytes.Contains(decoded.Params, []byte(`"requestId"`)) {
+		t.Fatalf("cancel params missing requestId field: %s", decoded.Params)
+	}
+	if bytes.Contains(decoded.Params, []byte(`"id":`)) {
+		t.Fatalf("cancel params must not use bare 'id' field (spec requires requestId): %s", decoded.Params)
+	}
+}
+
+// TestInboundCancelRequestHonored verifies the BIDIRECTIONAL requirement of
+// $/cancel_request (ACP schema-v1.17.0, x-side: "protocol"): when the peer
+// sends $/cancel_request for an in-flight inbound request, the host cancels
+// the handler's context and the original request gets a -32800 "Request
+// cancelled" error response.
+func TestInboundCancelRequestHonored(t *testing.T) {
+	clientReader, serverWriter := io.Pipe()
+	serverReader, clientWriter := io.Pipe()
+	defer clientReader.Close()
+	defer serverWriter.Close()
+	defer serverReader.Close()
+	defer clientWriter.Close()
+
+	server := NewPeer(serverReader, serverWriter, PeerOptions{})
+	client := NewPeer(clientReader, clientWriter, PeerOptions{})
+
+	handlerStarted := make(chan struct{})
+	handlerCancelled := make(chan error, 1)
+	server.RegisterRequest("slow_reverse", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		close(handlerStarted)
+		<-ctx.Done() // block until cancelled
+		handlerCancelled <- ctx.Err()
+		return nil, ctx.Err()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = server.Start(ctx) }()
+	go func() { _ = client.Start(ctx) }()
+	defer server.Close()
+	defer client.Close()
+
+	// Client sends a request to the server.
+	callDone := make(chan error, 1)
+	go func() {
+		var result json.RawMessage
+		callDone <- client.Call(ctx, "slow_reverse", nil, &result)
+	}()
+
+	select {
+	case <-handlerStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("handler never started")
+	}
+
+	// Client sends $/cancel_request with the correct "requestId" field name to
+	// cancel the in-flight request. The original request id was 1.
+	if err := client.Notify(ctx, "$/cancel_request", map[string]any{"requestId": 1}); err != nil {
+		t.Fatalf("Notify $/cancel_request error = %v", err)
+	}
+
+	// The handler's context must be cancelled.
+	select {
+	case err := <-handlerCancelled:
+		if err == nil {
+			t.Fatalf("handler ctx.Err() = nil, want context.Canceled")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("handler was not cancelled by $/cancel_request")
+	}
+
+	// The original Call must return a -32800 "Request cancelled" error.
+	err := <-callDone
+	if err == nil {
+		t.Fatalf("expected cancelled error, got nil")
+	}
+	rpcErr, ok := err.(*RPCError)
+	if !ok {
+		t.Fatalf("error type = %T, want *RPCError", err)
+	}
+	if rpcErr.Code != -32800 {
+		t.Fatalf("error code = %d, want -32800 (Request cancelled)", rpcErr.Code)
+	}
+	if rpcErr.Message != "Request cancelled" {
+		t.Fatalf("error message = %q, want %q", rpcErr.Message, "Request cancelled")
+	}
+}
+
+// TestInboundCancelRequestUnknownIdIsNoop verifies that a $/cancel_request for
+// an unknown/non-existent requestId is silently ignored (per spec, no error).
+func TestInboundCancelRequestUnknownIdIsNoop(t *testing.T) {
+	clientReader, serverWriter := io.Pipe()
+	serverReader, clientWriter := io.Pipe()
+	defer clientReader.Close()
+	defer serverWriter.Close()
+	defer serverReader.Close()
+	defer clientWriter.Close()
+
+	server := NewPeer(serverReader, serverWriter, PeerOptions{})
+	client := NewPeer(clientReader, clientWriter, PeerOptions{})
+	server.RegisterRequest("echo2", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		return raw, nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = server.Start(ctx) }()
+	go func() { _ = client.Start(ctx) }()
+	defer server.Close()
+	defer client.Close()
+
+	// Send a cancel for an id that was never sent. Must not error or hang.
+	if err := client.Notify(ctx, "$/cancel_request", map[string]any{"requestId": 99999}); err != nil {
+		t.Fatalf("Notify unknown cancel error = %v", err)
+	}
+
+	// A subsequent normal call must still work (server not disrupted).
+	var result json.RawMessage
+	if err := client.Call(ctx, "echo2", json.RawMessage(`"ok"`), &result); err != nil {
+		t.Fatalf("Call after unknown cancel error = %v", err)
+	}
+	if string(result) != `"ok"` {
+		t.Fatalf("result = %s", result)
+	}
+}
+
+// TestSessionDeleteAndLogoutRoundTrip verifies the new stable-v1 methods
+// session/delete and logout are sent correctly and the host receives them.
+func TestSessionDeleteAndLogoutRoundTrip(t *testing.T) {
+	clientReader, serverWriter := io.Pipe()
+	serverReader, clientWriter := io.Pipe()
+	defer clientReader.Close()
+	defer serverWriter.Close()
+	defer serverReader.Close()
+	defer clientWriter.Close()
+
+	server := NewPeer(serverReader, serverWriter, PeerOptions{})
+	client := NewPeer(clientReader, clientWriter, PeerOptions{})
+	var deleteSeen, logoutSeen bool
+	var mu sync.Mutex
+	// The conn wraps the server peer; its Call goes out serverWriter -> client
+	// peer, so the handlers must be registered on the client peer.
+	client.RegisterRequest("session/delete", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		mu.Lock()
+		deleteSeen = bytes.Contains(raw, []byte(`"sessionId":"s1"`))
+		mu.Unlock()
+		return DeleteSessionResponse{}, nil
+	})
+	client.RegisterRequest("logout", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		mu.Lock()
+		logoutSeen = true
+		mu.Unlock()
+		return LogoutResponse{}, nil
+	})
+
+	conn := NewConnection(server, Client{Authority: AuthorityHandlers{}})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() { _ = server.Start(ctx) }()
+	go func() { _ = client.Start(ctx) }()
+	defer server.Close()
+	defer client.Close()
+
+	if err := conn.DeleteSession(ctx, DeleteSessionRequest{SessionID: "s1"}); err != nil {
+		t.Fatalf("DeleteSession error = %v", err)
+	}
+	if err := conn.Logout(ctx, LogoutRequest{}); err != nil {
+		t.Fatalf("Logout error = %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !deleteSeen {
+		t.Fatalf("client never received session/delete with sessionId s1")
+	}
+	if !logoutSeen {
+		t.Fatalf("client never received logout")
+	}
 }

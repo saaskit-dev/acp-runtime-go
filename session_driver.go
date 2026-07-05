@@ -11,6 +11,8 @@ import (
 
 type SessionDriver interface {
 	Close(context.Context) error
+	Delete(context.Context) error
+	Logout(context.Context) error
 	CancelTurn(context.Context, string) (bool, error)
 	SetAgentMode(context.Context, string) error
 	SetAgentConfigOption(context.Context, string, any) error
@@ -48,6 +50,7 @@ type acpSessionDriver struct {
 	currentTurn  *activeTurn
 	turnSeq      int
 	rawConfig    map[string]any
+	queuePolicy  QueuePolicy
 }
 
 type activeTurn struct {
@@ -55,6 +58,12 @@ type activeTurn struct {
 	events     chan TurnEvent
 	completion chan TurnResult
 	outputText strings.Builder
+	// dropIntermediate, when true, suppresses intermediate TurnEvents (text
+	// chunks, tool/plan updates) so the consumer only sees the final
+	// completion. Driven by QueuePolicy.Delivery == "drop". State mutation in
+	// handleSessionUpdate (toolCalls/operations maps, outputText) still occurs
+	// regardless, so the read model stays consistent.
+	dropIntermediate bool
 }
 
 type sessionBootstrap struct {
@@ -66,6 +75,7 @@ type sessionBootstrap struct {
 	InitializeResponse InitializeResponse
 	SessionResponse    NewSessionResponse
 	Profile            AgentProfile
+	QueuePolicy        QueuePolicy
 }
 
 func newACPSessionDriver(bootstrap sessionBootstrap) *acpSessionDriver {
@@ -84,12 +94,37 @@ func newACPSessionDriver(bootstrap sessionBootstrap) *acpSessionDriver {
 		operations:   map[string]Operation{},
 		permissions:  map[string]PermissionRequestSnapshot{},
 		rawConfig:    map[string]any{},
+		queuePolicy:  bootstrap.QueuePolicy,
 	}
 	driver.metadata.SessionID = bootstrap.SessionResponse.SessionID
 	bootstrap.Connection.SetSessionUpdateHandler(func(ctx context.Context, notification SessionNotification) {
 		driver.handleSessionUpdate(notification)
 	})
+	bootstrap.Connection.SetPermissionObserver(func(req PermissionRequest, decision PermissionDecision) {
+		driver.recordPermission(req, decision)
+	})
 	return driver
+}
+
+// recordPermission stores a permission request and its host-decided outcome in
+// the read model. It is invoked by the Connection whenever the agent sends a
+// session/request_permission request (reverse direction). Keyed by ToolCallID
+// when present, otherwise by a synthetic id so multiple unattributed requests
+// do not collide.
+func (d *acpSessionDriver) recordPermission(req PermissionRequest, decision PermissionDecision) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	id := req.ToolCallID
+	if id == "" {
+		d.turnSeq++
+		id = fmt.Sprintf("permission-%d", d.turnSeq)
+	}
+	d.permissions[id] = PermissionRequestSnapshot{
+		ID:        id,
+		Phase:     "decided",
+		Operation: decision.Outcome,
+		Request:   req,
+	}
 }
 
 func capabilitiesFromInitialize(resp InitializeResponse) RuntimeCapabilities {
@@ -159,6 +194,37 @@ func (d *acpSessionDriver) Close(ctx context.Context) error {
 	return nil
 }
 
+// Delete issues session/delete (removes the session from the agent's persistent
+// storage) and then tears down the connection like Close. Agents that do not
+// implement session/delete will return an error, which the caller may treat as
+// non-fatal (the session is still closed locally).
+func (d *acpSessionDriver) Delete(ctx context.Context) error {
+	d.mu.Lock()
+	if d.status == "closed" {
+		d.mu.Unlock()
+		return nil
+	}
+	d.status = "closed"
+	d.mu.Unlock()
+	_ = d.connection.DeleteSession(ctx, DeleteSessionRequest{SessionID: d.sessionID})
+	if d.dispose != nil {
+		return d.dispose(ctx)
+	}
+	return nil
+}
+
+// Logout asks the agent to discard cached credentials (logout). Unlike
+// Close/Delete it does not end the session; callers may follow it with Close.
+// Agents that have not implemented logout (common in current adapter versions)
+// return JSON-RPC method-not-found, which we treat as success so callers do not
+// need to special-case older agents.
+func (d *acpSessionDriver) Logout(ctx context.Context) error {
+	if err := d.connection.Logout(ctx, LogoutRequest{}); err != nil && !isMethodNotImplemented(err) {
+		return err
+	}
+	return nil
+}
+
 func (d *acpSessionDriver) CancelTurn(ctx context.Context, turnID string) (bool, error) {
 	d.mu.RLock()
 	active := d.currentTurn
@@ -203,9 +269,10 @@ func (d *acpSessionDriver) StartTurn(ctx context.Context, prompt RuntimePrompt) 
 	d.turnSeq++
 	turnID := fmt.Sprintf("turn-%d", d.turnSeq)
 	active := &activeTurn{
-		id:         turnID,
-		events:     make(chan TurnEvent, 64),
-		completion: make(chan TurnResult, 1),
+		id:               turnID,
+		events:           make(chan TurnEvent, 64),
+		completion:       make(chan TurnResult, 1),
+		dropIntermediate: d.queuePolicy.Delivery == "drop",
 	}
 	d.currentTurn = active
 	d.status = "running"
@@ -341,6 +408,11 @@ func (d *acpSessionDriver) handleSessionUpdate(notification SessionNotification)
 	}
 	d.mu.Unlock()
 	if active != nil {
+		// In "drop" delivery mode the consumer only wants the final completion;
+		// suppress intermediate events but keep mutating the read model above.
+		if active.dropIntermediate {
+			return
+		}
 		switch update.SessionUpdate {
 		case "agent_message_chunk":
 			active.events <- TurnEvent{Type: "text", TurnID: active.id, Text: sessionUpdateText(update)}

@@ -22,6 +22,8 @@ const (
 	AuthNone     AuthMode = "none"
 	AuthOptional AuthMode = "optional"
 	AuthRequired AuthMode = "required"
+
+	runPendingStatus = "pending"
 )
 
 type Options struct {
@@ -36,8 +38,9 @@ type Agent struct {
 	options Options
 	peer    *acp.Peer
 
-	mu       sync.Mutex
-	sessions map[string]*Session
+	mu                 sync.Mutex
+	sessions           map[string]*Session
+	clientCapabilities acp.ClientCapabilities
 }
 
 type Session struct {
@@ -92,6 +95,8 @@ func (a *Agent) register(peer *acp.Peer) {
 	peer.RegisterRequest("session/set_mode", a.handleSetMode)
 	peer.RegisterRequest("session/set_config_option", a.handleSetConfigOption)
 	peer.RegisterRequest("session/close", a.handleCloseSession)
+	peer.RegisterRequest("session/delete", a.handleDeleteSession)
+	peer.RegisterRequest("logout", a.handleLogout)
 	peer.RegisterNotification("session/cancel", func(context.Context, json.RawMessage) {})
 }
 
@@ -103,6 +108,9 @@ func (a *Agent) handleInitialize(ctx context.Context, raw json.RawMessage) (any,
 	if req.ProtocolVersion != acp.ProtocolVersion {
 		return nil, invalidParams(fmt.Sprintf("unsupported protocolVersion %d", req.ProtocolVersion))
 	}
+	a.mu.Lock()
+	a.clientCapabilities = req.ClientCapabilities
+	a.mu.Unlock()
 	resp := acp.InitializeResponse{
 		ProtocolVersion: acp.ProtocolVersion,
 		AgentInfo:       &acp.Implementation{Name: a.options.Name, Version: a.options.Version},
@@ -290,6 +298,26 @@ func (a *Agent) handleCloseSession(ctx context.Context, raw json.RawMessage) (an
 	return acp.CloseSessionResponse{}, nil
 }
 
+// handleDeleteSession implements session/delete: remove the session from
+// persistent storage so it can no longer be loaded/resumed.
+func (a *Agent) handleDeleteSession(ctx context.Context, raw json.RawMessage) (any, error) {
+	var req acp.DeleteSessionRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, invalidParams(err.Error())
+	}
+	a.mu.Lock()
+	delete(a.sessions, req.SessionID)
+	a.mu.Unlock()
+	_ = os.Remove(filepath.Join(a.options.StorageDir, req.SessionID+".json"))
+	return acp.DeleteSessionResponse{}, nil
+}
+
+// handleLogout implements logout: a no-op for the simulator since it holds no
+// real credentials, but it must be implemented for protocol completeness.
+func (a *Agent) handleLogout(ctx context.Context, raw json.RawMessage) (any, error) {
+	return acp.LogoutResponse{}, nil
+}
+
 func (a *Agent) createSession(cwd string, additional []string, mcp []acp.MCPServer) *Session {
 	return &Session{
 		ID:                    newID(),
@@ -345,6 +373,95 @@ func (a *Agent) findSession(id string) (*Session, error) {
 
 func (a *Agent) notify(ctx context.Context, sessionID string, update acp.SessionUpdate) error {
 	return a.peer.Notify(ctx, "session/update", acp.SessionNotification{SessionID: sessionID, Update: update})
+}
+
+// runViaTerminal performs a real terminal round-trip against the host:
+// terminal/create -> terminal/wait_for_exit -> terminal/release. It returns
+// the command's combined output and true on success, or "" / false if any RPC
+// failed (caller falls back to a synthetic result).
+func (a *Agent) runViaTerminal(ctx context.Context, sessionID, command string, args []string) (string, bool) {
+	var createResp struct {
+		TerminalID string `json:"terminalId"`
+	}
+	if err := a.peer.Call(ctx, "terminal/create", map[string]any{
+		"sessionId": sessionID,
+		"command":   command,
+		"args":      args,
+		"cwd":       nil,
+	}, &createResp); err != nil {
+		return "", false
+	}
+	if createResp.TerminalID == "" {
+		return "", false
+	}
+	defer func() {
+		_ = a.peer.Call(ctx, "terminal/release", map[string]any{
+			"sessionId":  sessionID,
+			"terminalId": createResp.TerminalID,
+		}, nil)
+	}()
+
+	var outputResp struct {
+		Output     string `json:"output"`
+		Truncated  bool   `json:"truncated"`
+		ExitStatus *struct {
+			ExitCode *uint32 `json:"exitCode"`
+			Signal   *string `json:"signal"`
+		} `json:"exitStatus"`
+	}
+	// Poll terminal/output a bounded number of times until exit, then a final
+	// wait_for_exit to guarantee completion. For the simulator's short-lived
+	// commands a single output poll + wait is sufficient; the loop handles
+	// slower hosts.
+	var combined strings.Builder
+	for i := 0; i < 10; i++ {
+		outputResp = struct {
+			Output     string `json:"output"`
+			Truncated  bool   `json:"truncated"`
+			ExitStatus *struct {
+				ExitCode *uint32 `json:"exitCode"`
+				Signal   *string `json:"signal"`
+			} `json:"exitStatus"`
+		}{}
+		if err := a.peer.Call(ctx, "terminal/output", map[string]any{
+			"sessionId":  sessionID,
+			"terminalId": createResp.TerminalID,
+		}, &outputResp); err != nil {
+			return "", false
+		}
+		combined.WriteString(outputResp.Output)
+		if outputResp.ExitStatus != nil {
+			return strings.TrimSpace(combined.String()), true
+		}
+		select {
+		case <-ctx.Done():
+			return strings.TrimSpace(combined.String()), true
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	// Final blocking wait for exit.
+	if err := a.peer.Call(ctx, "terminal/wait_for_exit", map[string]any{
+		"sessionId":  sessionID,
+		"terminalId": createResp.TerminalID,
+	}, nil); err != nil {
+		return strings.TrimSpace(combined.String()), true
+	}
+	// One more output fetch for the tail.
+	outputResp = struct {
+		Output     string `json:"output"`
+		Truncated  bool   `json:"truncated"`
+		ExitStatus *struct {
+			ExitCode *uint32 `json:"exitCode"`
+			Signal   *string `json:"signal"`
+		} `json:"exitStatus"`
+	}{}
+	if err := a.peer.Call(ctx, "terminal/output", map[string]any{
+		"sessionId":  sessionID,
+		"terminalId": createResp.TerminalID,
+	}, &outputResp); err == nil {
+		combined.WriteString(outputResp.Output)
+	}
+	return strings.TrimSpace(combined.String()), true
 }
 
 type action struct {
@@ -456,8 +573,23 @@ func (a *Agent) executeAction(ctx context.Context, session *Session, action acti
 		status := "completed"
 		toolID := newID()
 		raw, _ := json.Marshal(map[string]any{"command": action.command, "args": action.args})
-		_ = a.notify(ctx, session.ID, acp.SessionUpdate{SessionUpdate: "tool_call", ToolCallID: toolID, Title: &title, Kind: &kind, Status: &status, RawInput: raw})
-		return a.streamText(ctx, session.ID, "Ran "+action.command+".")
+		pendingStatus := runPendingStatus
+		_ = a.notify(ctx, session.ID, acp.SessionUpdate{SessionUpdate: "tool_call", ToolCallID: toolID, Title: &title, Kind: &kind, Status: &pendingStatus, RawInput: raw})
+		// If the host advertises terminal capability, perform a real terminal
+		// round-trip (terminal/create -> terminal/wait_for_exit -> terminal/release)
+		// so the simulator exercises the host's TerminalHandler end-to-end. When
+		// the host lacks terminal support, fall back to a synthetic tool result.
+		output := "Ran " + action.command + "."
+		a.mu.Lock()
+		terminalSupported := a.clientCapabilities.Terminal
+		a.mu.Unlock()
+		if terminalSupported {
+			if runOutput, ok := a.runViaTerminal(ctx, session.ID, action.command, action.args); ok {
+				output = runOutput
+			}
+		}
+		_ = a.notify(ctx, session.ID, acp.SessionUpdate{SessionUpdate: "tool_call_update", ToolCallID: toolID, Title: &title, Kind: &kind, Status: &status, RawInput: raw, RawOutput: []byte(output)})
+		return a.streamText(ctx, session.ID, output)
 	case "rename":
 		session.Title = action.title
 		updated := now()

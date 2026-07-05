@@ -12,7 +12,7 @@ Language:
 - Local Claude Code: `claude --version` -> `2.1.121 (Claude Code)`
 - ACP adapter: `npm exec --yes @zed-industries/claude-agent-acp@0.23.1 --`
 - Adapter SDK dependency: `@agentclientprotocol/sdk@0.17.0`
-- Upstream protocol schema checked against `agent-client-protocol@v0.13.4`.
+- Upstream protocol schema checked against `agent-client-protocol@schema-v1.17.0` (re-verified 2026-07-05; the `configId`/`auth` observations below were originally established against `v0.13.4` and remain accurate).
 - Status: admitted for interactive session, config/mode, file, terminal, and write scenarios; session history operations have wrapper-level limitations when run against an empty newly-created session.
 
 ## Evidence

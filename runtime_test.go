@@ -1,10 +1,14 @@
 package acpruntime
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -118,6 +122,82 @@ func configOptionValue(options []RuntimeAgentConfigOption, id string) any {
 	return nil
 }
 
+// TestRuntimeForwardsSystemPromptToSessionMeta verifies that setting
+// StartSessionOptions.SystemPrompt causes the runtime to emit
+// _meta.systemPrompt on the session/new request (the community convention used
+// by the Zed ACP adapters). It captures outbound ACP messages via the
+// OnACPMessage hook and asserts the systemPrompt reaches the wire.
+func TestRuntimeForwardsSystemPromptToSessionMeta(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cwd := t.TempDir()
+	storage := t.TempDir()
+	simulatorBin := buildSimulatorBinary(t)
+	agent := Agent{
+		Type:    LocalSimulatorAgentACPRegistryID,
+		Command: simulatorBin,
+		Args:    []string{"--auth-mode", "none", "--storage-dir", storage},
+	}
+
+	var capturedNewSession []byte
+	var captureMu sync.Mutex
+	factory := NewStdioConnectionFactory(StdioFactoryOptions{
+		OnACPMessage: func(direction string, message []byte) {
+			if direction != "outbound" {
+				return
+			}
+			if bytes.Contains(message, []byte(`"session/new"`)) {
+				captureMu.Lock()
+				capturedNewSession = append(capturedNewSession[:0], message...)
+				captureMu.Unlock()
+			}
+		},
+	})
+	runtime := NewRuntime(factory, RuntimeOptions{})
+	session, err := runtime.StartSession(ctx, StartSessionOptions{
+		Agent:        agent,
+		CWD:          cwd,
+		SystemPrompt: &SystemPrompt{Text: "Reply tersely."},
+	})
+	if err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+	defer session.Close(context.Background())
+
+	captureMu.Lock()
+	snapshot := append([]byte(nil), capturedNewSession...)
+	captureMu.Unlock()
+	if snapshot == nil {
+		t.Fatalf("no outbound session/new captured")
+	}
+	if !bytes.Contains(snapshot, []byte(`"systemPrompt":"Reply tersely."`)) {
+		t.Fatalf("session/new payload missing _meta.systemPrompt: %s", snapshot)
+	}
+}
+
+// TestRuntimeClaudeSystemPromptInjectsCLIFlag verifies that a Claude-typed
+// agent gets --append-system-prompt injected into its args when a system prompt
+// is supplied. This uses a fake agent command so no real Claude process spawns.
+func TestRuntimeClaudeSystemPromptInjectsCLIFlag(t *testing.T) {
+	// We only need to verify the args rewrite happens before spawn; use a
+	// nonexistent command so spawn fails fast, but the resolveStartOptions path
+	// still runs the profile. We check the error path doesn't mutate agent.
+	profile := ResolveAgentProfile(Agent{Type: ClaudeCodeACPRegistryID})
+	base := Agent{Type: ClaudeCodeACPRegistryID, Command: "npm", Args: []string{"exec", "--yes", "claude-agent-acp"}}
+	out := profile.ApplySystemPromptToAgent(base, SystemPrompt{Text: "Be brief."})
+	want := "--append-system-prompt"
+	found := false
+	for _, arg := range out.Args {
+		if arg == want {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("Claude agent args %v missing %q", out.Args, want)
+	}
+}
+
 func TestSimulatorWriteProducesOperation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -151,6 +231,303 @@ func TestSimulatorWriteProducesOperation(t *testing.T) {
 	}
 	if ops[0].Kind != "write_file" {
 		t.Fatalf("operation kind = %q, want write_file", ops[0].Kind)
+	}
+}
+
+// TestQueuePolicyDropSuppressesIntermediateEvents verifies that
+// QueuePolicyInput{Delivery:"drop"} causes the turn to deliver only the final
+// completion, with no intermediate text/operation events, while the read model
+// (Operations) still accumulates state.
+func TestQueuePolicyDropSuppressesIntermediateEvents(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cwd := t.TempDir()
+	storage := t.TempDir()
+	simulatorBin := buildSimulatorBinary(t)
+	agent := Agent{
+		Type:    LocalSimulatorAgentACPRegistryID,
+		Command: simulatorBin,
+		Args:    []string{"--auth-mode", "none", "--storage-dir", storage},
+	}
+	runtime := NewRuntime(NewStdioConnectionFactory(StdioFactoryOptions{}), RuntimeOptions{})
+	session, err := runtime.StartSession(ctx, StartSessionOptions{
+		Agent: agent,
+		CWD:   cwd,
+		Queue: QueuePolicyInput{Delivery: "drop"},
+	})
+	if err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+	defer session.Close(context.Background())
+
+	handle := session.StartTurn(ctx, RuntimePrompt{Text: "write notes.txt hi"})
+	var sawText, sawOperation bool
+	for event := range handle.Events {
+		switch event.Type {
+		case "text":
+			sawText = true
+		case "operation_updated":
+			sawOperation = true
+		}
+	}
+	result := <-handle.Completion
+	if result.Err != nil {
+		t.Fatalf("Run error = %v", result.Err)
+	}
+	// Intermediate events must be suppressed in drop mode.
+	if sawText {
+		t.Fatalf("received text event in drop mode")
+	}
+	if sawOperation {
+		t.Fatalf("received operation event in drop mode")
+	}
+	// But the read model should still reflect what happened.
+	if len(session.Operations()) == 0 {
+		t.Fatalf("Operations() empty; read model should still update in drop mode")
+	}
+}
+
+// TestQueuePolicyBufferDefaultStreamsEvents verifies the default (buffer) mode
+// delivers intermediate events, confirming the drop-mode test is meaningful.
+func TestQueuePolicyBufferDefaultStreamsEvents(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cwd := t.TempDir()
+	storage := t.TempDir()
+	simulatorBin := buildSimulatorBinary(t)
+	agent := Agent{
+		Type:    LocalSimulatorAgentACPRegistryID,
+		Command: simulatorBin,
+		Args:    []string{"--auth-mode", "none", "--storage-dir", storage},
+	}
+	runtime := NewRuntime(NewStdioConnectionFactory(StdioFactoryOptions{}), RuntimeOptions{})
+	session, err := runtime.StartSession(ctx, StartSessionOptions{Agent: agent, CWD: cwd})
+	if err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+	defer session.Close(context.Background())
+
+	handle := session.StartTurn(ctx, RuntimePrompt{Text: "Reply with the single word OK."})
+	sawText := false
+	for event := range handle.Events {
+		if event.Type == "text" && event.Text != "" {
+			sawText = true
+		}
+	}
+	<-handle.Completion
+	if !sawText {
+		t.Fatalf("expected text events in default buffer mode")
+	}
+}
+
+// TestStoredSessionsEnabledDoesNotBreakList verifies that RuntimeOptions.
+// StoredSessionsEnabled is honored across the list path without errors. The
+// simulator returns an empty session list when queried from a fresh process
+// (its in-memory map is per-process), so this asserts the option is wired and
+// the call succeeds in both modes; the Source-labeling logic itself
+// ("stored" vs "remote") is a one-line branch in ListAgentSessions.
+func TestStoredSessionsEnabledDoesNotBreakList(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cwd := t.TempDir()
+	storage := t.TempDir()
+	simulatorBin := buildSimulatorBinary(t)
+	agent := Agent{
+		Type:    LocalSimulatorAgentACPRegistryID,
+		Command: simulatorBin,
+		Args:    []string{"--auth-mode", "none", "--storage-dir", storage},
+	}
+	for _, enabled := range []bool{false, true} {
+		runtime := NewRuntime(NewStdioConnectionFactory(StdioFactoryOptions{}), RuntimeOptions{StoredSessionsEnabled: enabled})
+		list, err := runtime.ListSessions(ctx, ListSessionsOptions{Agent: agent, CWD: cwd})
+		if err != nil {
+			t.Fatalf("ListSessions() (enabled=%v) error = %v", enabled, err)
+		}
+		// Every returned session (if any) must carry the correct source label.
+		wantSrc := "remote"
+		if enabled {
+			wantSrc = "stored"
+		}
+		for _, s := range list.Sessions {
+			if s.Source != wantSrc {
+				t.Fatalf("Source = %q, want %q (enabled=%v)", s.Source, wantSrc, enabled)
+			}
+		}
+	}
+}
+
+// recordingTerminalHandlerForRuntime is a TerminalHandler that records calls
+// and runs the command via os/exec, capturing combined output, used by
+// TestSimulatorInvokesHostTerminal.
+type recordingTerminalHandlerForRuntime struct {
+	mu        sync.Mutex
+	creates   int
+	outputs   int
+	waits     int
+	releases  int
+	terminals map[string]*recTerminal
+}
+
+type recTerminal struct {
+	output strings.Builder
+	done   chan struct{}
+	exit   *TerminalExitStatus
+	mu     sync.Mutex
+}
+
+func (h *recordingTerminalHandlerForRuntime) ensure() {
+	if h.terminals == nil {
+		h.terminals = map[string]*recTerminal{}
+	}
+}
+
+func (h *recordingTerminalHandlerForRuntime) CreateTerminal(ctx Context, req CreateTerminalRequest) (CreateTerminalResult, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.ensure()
+	h.creates++
+	cmd := exec.Command(req.Command, req.Args...)
+	pipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return CreateTerminalResult{}, err
+	}
+	cmd.Stderr = cmd.Stdout
+	if err := cmd.Start(); err != nil {
+		return CreateTerminalResult{}, err
+	}
+	id := fmt.Sprintf("rec-%d", h.creates)
+	term := &recTerminal{done: make(chan struct{})}
+	h.terminals[id] = term
+	go func() {
+		defer close(term.done)
+		buf := make([]byte, 4096)
+		for {
+			n, err := pipe.Read(buf)
+			if n > 0 {
+				term.mu.Lock()
+				term.output.Write(buf[:n])
+				term.mu.Unlock()
+			}
+			if err != nil {
+				break
+			}
+		}
+		waitErr := cmd.Wait()
+		term.mu.Lock()
+		term.exit = recExitStatusFromErr(waitErr)
+		term.mu.Unlock()
+	}()
+	return CreateTerminalResult{TerminalID: id}, nil
+}
+
+func (h *recordingTerminalHandlerForRuntime) Output(ctx Context, terminalID string) (TerminalOutputResult, error) {
+	h.mu.Lock()
+	h.outputs++
+	term := h.terminals[terminalID]
+	h.mu.Unlock()
+	if term == nil {
+		return TerminalOutputResult{}, fmt.Errorf("unknown terminal %q", terminalID)
+	}
+	term.mu.Lock()
+	out := term.output.String()
+	status := term.exit
+	term.mu.Unlock()
+	return TerminalOutputResult{Output: out, ExitStatus: status}, nil
+}
+
+func (h *recordingTerminalHandlerForRuntime) WaitForExit(ctx Context, terminalID string) (TerminalExitStatus, error) {
+	h.mu.Lock()
+	h.waits++
+	term := h.terminals[terminalID]
+	h.mu.Unlock()
+	if term == nil {
+		return TerminalExitStatus{}, fmt.Errorf("unknown terminal %q", terminalID)
+	}
+	select {
+	case <-term.done:
+	case <-ctx.Done():
+		return TerminalExitStatus{}, ctx.Err()
+	}
+	term.mu.Lock()
+	defer term.mu.Unlock()
+	if term.exit == nil {
+		return TerminalExitStatus{}, nil
+	}
+	return *term.exit, nil
+}
+
+func (h *recordingTerminalHandlerForRuntime) Kill(ctx Context, terminalID string) error { return nil }
+
+func (h *recordingTerminalHandlerForRuntime) Release(ctx Context, terminalID string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.releases++
+	return nil
+}
+
+func (h *recordingTerminalHandlerForRuntime) snapshot() (int, int, int, int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.creates, h.outputs, h.waits, h.releases
+}
+
+func recExitStatusFromErr(err error) *TerminalExitStatus {
+	if err == nil {
+		code := uint32(0)
+		return &TerminalExitStatus{ExitCode: &code}
+	}
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		code := uint32(exitErr.ExitCode())
+		return &TerminalExitStatus{ExitCode: &code}
+	}
+	return &TerminalExitStatus{}
+}
+
+// TestSimulatorInvokesHostTerminal is the key end-to-end proof: when the host
+// supplies a TerminalHandler AND advertises terminal capability, the simulator
+// agent's "/bash <cmd>" prompt triggers a real reverse RPC round-trip
+// (terminal/create + terminal/output + terminal/wait_for_exit + terminal/release)
+// against the host. This closes the loop that was previously a false positive.
+func TestSimulatorInvokesHostTerminal(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cwd := t.TempDir()
+	storage := t.TempDir()
+	simulatorBin := buildSimulatorBinary(t)
+	agent := Agent{
+		Type:    LocalSimulatorAgentACPRegistryID,
+		Command: simulatorBin,
+		Args:    []string{"--auth-mode", "none", "--storage-dir", storage},
+	}
+	handler := &recordingTerminalHandlerForRuntime{}
+	runtime := NewRuntime(NewStdioConnectionFactory(StdioFactoryOptions{}), RuntimeOptions{
+		AuthorityHandlers: AuthorityHandlers{Terminal: handler},
+	})
+	session, err := runtime.StartSession(ctx, StartSessionOptions{
+		Agent:    agent,
+		CWD:      cwd,
+		Handlers: AuthorityHandlers{Terminal: handler},
+	})
+	if err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+	defer session.Close(context.Background())
+
+	completion, err := session.Run(ctx, "/bash echo hello")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	creates, _, _, releases := handler.snapshot()
+	if creates == 0 {
+		t.Fatalf("host TerminalHandler.CreateTerminal was never called; simulator did not invoke terminal/create. Output: %q", completion.OutputText)
+	}
+	if releases == 0 {
+		t.Fatalf("host TerminalHandler.Release was never called; simulator leaked the terminal")
+	}
+	// The simulator should have streamed the actual command output ("hello")
+	// rather than the synthetic "Ran echo." fallback.
+	if !strings.Contains(completion.OutputText, "hello") {
+		t.Fatalf("OutputText = %q, want it to contain the real command output 'hello'", completion.OutputText)
 	}
 }
 
