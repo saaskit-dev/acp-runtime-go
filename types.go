@@ -222,11 +222,12 @@ type NewSessionRequest struct {
 }
 
 type NewSessionResponse struct {
-	SessionID     string                `json:"sessionId"`
-	Modes         *SessionModeState     `json:"modes,omitempty"`
-	Models        *SessionModelState    `json:"models,omitempty"`
-	ConfigOptions []SessionConfigOption `json:"configOptions,omitempty"`
-	Meta          map[string]any        `json:"_meta,omitempty"`
+	SessionID         string                `json:"sessionId"`
+	Modes             *SessionModeState     `json:"modes,omitempty"`
+	Models            *SessionModelState    `json:"models,omitempty"`
+	ConfigOptions     []SessionConfigOption `json:"configOptions,omitempty"`
+	AvailableCommands []AvailableCommand    `json:"availableCommands,omitempty"`
+	Meta              map[string]any        `json:"_meta,omitempty"`
 }
 
 type LoadSessionRequest struct {
@@ -419,21 +420,22 @@ type SessionNotification struct {
 }
 
 type SessionUpdate struct {
-	SessionUpdate  string                `json:"sessionUpdate"`
-	Type           string                `json:"type,omitempty"`
-	Text           string                `json:"text,omitempty"`
-	ToolCallID     string                `json:"toolCallId,omitempty"`
-	Title          *string               `json:"title,omitempty"`
-	Kind           *string               `json:"kind,omitempty"`
-	Status         *string               `json:"status,omitempty"`
-	Locations      []ToolLocation        `json:"locations,omitempty"`
-	Content        ContentBlocks         `json:"content,omitempty"`
-	RawInput       json.RawMessage       `json:"rawInput,omitempty"`
-	RawOutput      json.RawMessage       `json:"rawOutput,omitempty"`
-	Entries        []PlanEntry           `json:"entries,omitempty"`
-	CurrentModeID  string                `json:"currentModeId,omitempty"`
-	AvailableModes []SessionMode         `json:"availableModes,omitempty"`
-	ConfigOptions  []SessionConfigOption `json:"configOptions,omitempty"`
+	SessionUpdate     string                `json:"sessionUpdate"`
+	Type              string                `json:"type,omitempty"`
+	Text              string                `json:"text,omitempty"`
+	ToolCallID        string                `json:"toolCallId,omitempty"`
+	Title             *string               `json:"title,omitempty"`
+	Kind              *string               `json:"kind,omitempty"`
+	Status            *string               `json:"status,omitempty"`
+	Locations         []ToolLocation        `json:"locations,omitempty"`
+	Content           ContentBlocks         `json:"content,omitempty"`
+	RawInput          json.RawMessage       `json:"rawInput,omitempty"`
+	RawOutput         json.RawMessage       `json:"rawOutput,omitempty"`
+	Entries           []PlanEntry           `json:"entries,omitempty"`
+	CurrentModeID     string                `json:"currentModeId,omitempty"`
+	AvailableModes    []SessionMode         `json:"availableModes,omitempty"`
+	ConfigOptions     []SessionConfigOption `json:"configOptions,omitempty"`
+	AvailableCommands []AvailableCommand    `json:"availableCommands,omitempty"`
 	SessionInfoUpdate
 	Usage *Usage         `json:"usage,omitempty"`
 	Meta  map[string]any `json:"_meta,omitempty"`

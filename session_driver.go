@@ -120,6 +120,7 @@ func metadataFromSessionResponse(resp NewSessionResponse) RuntimeSessionMetadata
 	for _, option := range resp.ConfigOptions {
 		metadata.AgentConfigOptions = append(metadata.AgentConfigOptions, runtimeConfigOptionFromACP(option))
 	}
+	metadata.AvailableCommands = append([]AvailableCommand(nil), resp.AvailableCommands...)
 	return metadata
 }
 
@@ -287,6 +288,8 @@ func (d *acpSessionDriver) handleSessionUpdate(notification SessionNotification)
 		if update.UpdatedAt != nil {
 			d.metadata.UpdatedAt = *update.UpdatedAt
 		}
+	case "available_commands_update":
+		d.metadata.AvailableCommands = append([]AvailableCommand(nil), update.AvailableCommands...)
 	case "tool_call":
 		id := update.ToolCallID
 		if id != "" {
@@ -347,7 +350,7 @@ func (d *acpSessionDriver) handleSessionUpdate(notification SessionNotification)
 			active.events <- TurnEvent{Type: "plan_updated", TurnID: active.id, Plan: update.Entries}
 		case "usage_update":
 			active.events <- TurnEvent{Type: "usage_updated", TurnID: active.id, Usage: update.Usage}
-		case "session_info_update":
+		case "session_info_update", "available_commands_update":
 			active.events <- TurnEvent{Type: "metadata_updated", TurnID: active.id}
 		case "tool_call", "tool_call_update":
 			if update.ToolCallID != "" {
