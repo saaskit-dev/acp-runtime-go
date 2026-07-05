@@ -92,10 +92,10 @@ uvx <package> ...
 | `amp-acp` | Amp | binary | 下载后执行 `./amp-acp` |
 | `auggie` | Auggie CLI | npx | `npx @augmentcode/auggie@0.21.0 --acp` |
 | `autohand` | Autohand Code | npx | `npx @autohandai/autohand-acp@0.2.1` |
-| `claude-acp` | Claude Agent | npx | `npm exec --yes @zed-industries/claude-agent-acp@0.23.1 --` |
+| `claude-acp` | Claude Agent | npx | `npm exec --yes @agentclientprotocol/claude-agent-acp@0.55.0 --` |
 | `cline` | Cline | npx | `npx cline@2.11.0 --acp` |
 | `codebuddy-code` | Codebuddy Code | npx | `npx @tencent-ai/codebuddy-code@2.70.1 --acp` |
-| `codex-acp` | Codex CLI | binary / npx | `npm exec --yes @zed-industries/codex-acp@0.15.0 --` 或下载后执行 `./codex-acp` |
+| `codex-acp` | Codex CLI | binary / npx | `npm exec --yes @agentclientprotocol/codex-acp@1.1.0 --` 或下载后执行 `./codex-acp` |
 | `corust-agent` | Corust Agent | binary | 下载后执行 `./corust-agent-acp` |
 | `crow-cli` | crow-cli | uvx | `uvx crow-cli acp` |
 | `cursor` | Cursor | binary | 下载后执行 `./dist-package/cursor-agent acp` |

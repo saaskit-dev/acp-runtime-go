@@ -10,7 +10,7 @@ Language:
 - Runtime repo: `acp-runtime-go`
 - Agent id: `codex-acp`
 - Local Codex CLI: `codex --version` -> `codex-cli 0.130.0`
-- ACP adapter: `npm exec --yes @zed-industries/codex-acp@0.15.0 --`
+- ACP adapter: `npm exec --yes @agentclientprotocol/codex-acp@1.1.0 --` (migrated from the deprecated `@zed-industries/codex-acp@0.15.0`; the old package was renamed)
 - Status: admitted for interactive session, config/mode, plan updates, permission denial, file, terminal, write, and multi-turn scenarios.
 
 ## Evidence
@@ -43,7 +43,7 @@ Observed results:
 
 The admission run exposed one launch compatibility gap:
 
-- `CreateCodexAgent` must start the maintained ACP wrapper, not `codex acp`. The Go runtime now uses `npm exec --yes @zed-industries/codex-acp@0.15.0 --`.
+- `CreateCodexAgent` must start the maintained ACP wrapper, not `codex acp`. The Go runtime now uses `npm exec --yes @agentclientprotocol/codex-acp@1.1.0 --`.
 
 ## Current Scope
 

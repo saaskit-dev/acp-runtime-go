@@ -8,7 +8,7 @@
 - Runtime 仓库：`acp-runtime-go`
 - Agent id：`claude-acp`
 - 本机 Claude Code：`claude --version` -> `2.1.121 (Claude Code)`
-- ACP adapter：`npm exec --yes @zed-industries/claude-agent-acp@0.23.1 --`
+- ACP adapter：`npm exec --yes @agentclientprotocol/claude-agent-acp@0.55.0 --`（从已废弃的 `@zed-industries/claude-agent-acp@0.23.1` 迁移；旧包已改名且不再产出输出）
 - Adapter SDK 依赖：`@agentclientprotocol/sdk@0.17.0`
 - 上游协议 schema 已按 `agent-client-protocol@schema-v1.17.0` 核对（2026-07-05 重新验证；下方 `configId`/`auth` 观察最初基于 `v0.13.4` 建立，仍然准确）。
 - 状态：已通过交互 session、config/mode、读文件、执行命令、写文件场景；session history 操作在空的新建 session 上存在 wrapper 层限制。

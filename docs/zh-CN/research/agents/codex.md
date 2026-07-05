@@ -8,7 +8,7 @@
 - Runtime 仓库：`acp-runtime-go`
 - Agent id：`codex-acp`
 - 本机 Codex CLI：`codex --version` -> `codex-cli 0.130.0`
-- ACP adapter：`npm exec --yes @zed-industries/codex-acp@0.15.0 --`
+- ACP adapter：`npm exec --yes @agentclientprotocol/codex-acp@1.1.0 --`（从已废弃的 `@zed-industries/codex-acp@0.15.0` 迁移；旧包已改名）
 - 状态：已通过交互 session、config/mode、plan update、权限拒绝、读文件、执行命令、写文件和多轮场景。
 
 ## 证据
@@ -41,7 +41,7 @@ go run ./cmd/acp-harness --type codex --case harness/cases/16-write-file.json --
 
 本次准入暴露了一个启动兼容缺口：
 
-- `CreateCodexAgent` 必须启动维护中的 ACP wrapper，而不是 `codex acp`。Go runtime 现在使用 `npm exec --yes @zed-industries/codex-acp@0.15.0 --`。
+- `CreateCodexAgent` 必须启动维护中的 ACP wrapper，而不是 `codex acp`。Go runtime 现在使用 `npm exec --yes @agentclientprotocol/codex-acp@1.1.0 --`。
 
 ## 当前覆盖范围
 
