@@ -9,8 +9,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"strconv"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -36,7 +34,7 @@ func NewStdioConnectionFactory(options StdioFactoryOptions) ConnectionFactory {
 		}
 		cmdCtx := context.WithoutCancel(ctx)
 		cmd := exec.CommandContext(cmdCtx, input.Agent.Command, input.Agent.Args...)
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		configureProcessGroup(cmd)
 		cmd.Dir = input.CWD
 		cmd.Env = envSlice(input.Agent.Env)
 		stdin, err := cmd.StdinPipe()
@@ -59,12 +57,7 @@ func NewStdioConnectionFactory(options StdioFactoryOptions) ConnectionFactory {
 		if err := cmd.Start(); err != nil {
 			return ConnectionHandle{}, wrapError(ErrorProcess, "stdio.spawn", "failed to spawn ACP stdio process", err)
 		}
-		processGroupID := 0
-		if cmd.Process != nil {
-			if pgid, err := syscall.Getpgid(cmd.Process.Pid); err == nil {
-				processGroupID = pgid
-			}
-		}
+		processGroupID := processGroupIDAfterStart(cmd)
 		peerOptions := PeerOptions{}
 		if options.OnACPMessage != nil {
 			peerOptions.OnRawMessage = func(direction string, message json.RawMessage) {
@@ -126,58 +119,6 @@ func NewStdioConnectionFactory(options StdioFactoryOptions) ConnectionFactory {
 		}
 		return ConnectionHandle{Connection: conn, Dispose: dispose}, nil
 	}
-}
-
-func signalProcessTree(pgid int, process *os.Process, signal syscall.Signal) error {
-	if process != nil {
-		for _, pid := range descendantPIDs(process.Pid) {
-			_ = syscall.Kill(pid, signal)
-		}
-	}
-	if pgid > 0 {
-		if err := syscall.Kill(-pgid, signal); err == nil {
-			return nil
-		}
-	}
-	if process == nil {
-		return nil
-	}
-	return process.Signal(signal)
-}
-
-func descendantPIDs(rootPID int) []int {
-	if rootPID <= 0 {
-		return nil
-	}
-	output, err := exec.Command("ps", "-axo", "pid=,ppid=").Output()
-	if err != nil {
-		return nil
-	}
-	children := make(map[int][]int)
-	for _, line := range strings.Split(string(output), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 2 {
-			continue
-		}
-		pid, err := strconv.Atoi(fields[0])
-		if err != nil {
-			continue
-		}
-		ppid, err := strconv.Atoi(fields[1])
-		if err != nil {
-			continue
-		}
-		children[ppid] = append(children[ppid], pid)
-	}
-	var descendants []int
-	stack := append([]int(nil), children[rootPID]...)
-	for len(stack) > 0 {
-		pid := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		descendants = append(descendants, pid)
-		stack = append(stack, children[pid]...)
-	}
-	return descendants
 }
 
 type tailWriter struct {

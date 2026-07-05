@@ -1,3 +1,9 @@
+//go:build !windows
+
+// stdio_test.go exercises the Unix process-group teardown path (ps lookups,
+// descendant PIDs, shell process groups). The Windows teardown has no
+// equivalent, so the whole file is Unix-only.
+
 package acpruntime
 
 import (
