@@ -175,6 +175,214 @@ func TestRuntimeForwardsSystemPromptToSessionMeta(t *testing.T) {
 	}
 }
 
+// TestStartSessionMetaPassthrough verifies that StartSessionOptions.Meta is
+// forwarded to the session/new _meta on the wire.
+func TestStartSessionMetaPassthrough(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cwd := t.TempDir()
+	storage := t.TempDir()
+	simulatorBin := buildSimulatorBinary(t)
+	agent := Agent{
+		Type:    LocalSimulatorAgentACPRegistryID,
+		Command: simulatorBin,
+		Args:    []string{"--auth-mode", "none", "--storage-dir", storage},
+	}
+
+	var capturedNewSession []byte
+	var captureMu sync.Mutex
+	factory := NewStdioConnectionFactory(StdioFactoryOptions{
+		OnACPMessage: func(direction string, message []byte) {
+			if direction != "outbound" {
+				return
+			}
+			if bytes.Contains(message, []byte(`"session/new"`)) {
+				captureMu.Lock()
+				capturedNewSession = append(capturedNewSession[:0], message...)
+				captureMu.Unlock()
+			}
+		},
+	})
+	runtime := NewRuntime(factory, RuntimeOptions{})
+	session, err := runtime.StartSession(ctx, StartSessionOptions{
+		Agent: agent,
+		CWD:   cwd,
+		Meta: map[string]any{
+			"customKey": "customValue",
+			"nested":    map[string]any{"inner": 42},
+		},
+	})
+	if err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+	defer session.Close(context.Background())
+
+	captureMu.Lock()
+	snapshot := append([]byte(nil), capturedNewSession...)
+	captureMu.Unlock()
+	if snapshot == nil {
+		t.Fatalf("no outbound session/new captured")
+	}
+	if !bytes.Contains(snapshot, []byte(`"customKey":"customValue"`)) {
+		t.Fatalf("session/new missing _meta.customKey: %s", snapshot)
+	}
+	if !bytes.Contains(snapshot, []byte(`"inner":42`)) {
+		t.Fatalf("session/new missing nested _meta: %s", snapshot)
+	}
+}
+
+// TestMetaMergesWithSystemPromptMeta verifies that caller Meta and
+// SystemPrompt-derived meta coexist in the same _meta object, and that a
+// conflicting nested map key from the caller takes precedence.
+func TestMetaMergesWithSystemPromptMeta(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cwd := t.TempDir()
+	storage := t.TempDir()
+	simulatorBin := buildSimulatorBinary(t)
+	agent := Agent{
+		Type:    LocalSimulatorAgentACPRegistryID,
+		Command: simulatorBin,
+		Args:    []string{"--auth-mode", "none", "--storage-dir", storage},
+	}
+
+	var capturedNewSession []byte
+	var captureMu sync.Mutex
+	factory := NewStdioConnectionFactory(StdioFactoryOptions{
+		OnACPMessage: func(direction string, message []byte) {
+			if direction != "outbound" {
+				return
+			}
+			if bytes.Contains(message, []byte(`"session/new"`)) {
+				captureMu.Lock()
+				capturedNewSession = append(capturedNewSession[:0], message...)
+				captureMu.Unlock()
+			}
+		},
+	})
+	runtime := NewRuntime(factory, RuntimeOptions{})
+	session, err := runtime.StartSession(ctx, StartSessionOptions{
+		Agent:        agent,
+		CWD:          cwd,
+		SystemPrompt: &SystemPrompt{Text: "be brief"},   // produces _meta.systemPrompt
+		Meta:         map[string]any{"claudeCode": "opts"}, // plus a caller key
+	})
+	if err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+	defer session.Close(context.Background())
+
+	captureMu.Lock()
+	snapshot := append([]byte(nil), capturedNewSession...)
+	captureMu.Unlock()
+	// Both keys must coexist in _meta.
+	if !bytes.Contains(snapshot, []byte(`"systemPrompt":"be brief"`)) {
+		t.Fatalf("SystemPrompt meta lost after merge: %s", snapshot)
+	}
+	if !bytes.Contains(snapshot, []byte(`"claudeCode":"opts"`)) {
+		t.Fatalf("caller Meta lost after merge: %s", snapshot)
+	}
+}
+
+// TestMergeSessionMetaDeepMerge is a pure unit test for the merge helper:
+// nested maps merge recursively, scalar conflicts resolved in favor of extra.
+func TestMergeSessionMetaDeepMerge(t *testing.T) {
+	base := map[string]any{
+		"systemPrompt": "keep",
+		"claudeCode":   map[string]any{"tools": []string{"a"}, "kept": 1},
+	}
+	extra := map[string]any{
+		"claudeCode": map[string]any{"disallowedTools": []string{"x"}},
+		"newKey":     "v",
+	}
+	out := mergeSessionMeta(base, extra)
+	if out["systemPrompt"] != "keep" {
+		t.Fatalf("systemPrompt lost: %v", out["systemPrompt"])
+	}
+	if out["newKey"] != "v" {
+		t.Fatalf("newKey lost")
+	}
+	cc, ok := out["claudeCode"].(map[string]any)
+	if !ok {
+		t.Fatalf("claudeCode not merged as map: %#v", out["claudeCode"])
+	}
+	// Nested keys from both sides must survive.
+	if _, ok := cc["tools"]; !ok {
+		t.Fatalf("nested tools lost in deep merge: %#v", cc)
+	}
+	if cc["kept"] != 1 {
+		t.Fatalf("nested kept lost: %#v", cc)
+	}
+	if _, ok := cc["disallowedTools"]; !ok {
+		t.Fatalf("nested disallowedTools lost: %#v", cc)
+	}
+	// Inputs must not be mutated.
+	if _, ok := base["newKey"]; ok {
+		t.Fatalf("base was mutated by merge")
+	}
+}
+
+// TestClaudeOptionsViaMetaReachesSessionNew verifies that ClaudeCodeOptions
+// passed via StartSessionOptions.Meta reaches the session/new _meta on the wire
+// with the correct nested structure.
+func TestClaudeOptionsViaMetaReachesSessionNew(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cwd := t.TempDir()
+	storage := t.TempDir()
+	simulatorBin := buildSimulatorBinary(t)
+	agent := Agent{
+		Type:    LocalSimulatorAgentACPRegistryID,
+		Command: simulatorBin,
+		Args:    []string{"--auth-mode", "none", "--storage-dir", storage},
+	}
+
+	var capturedNewSession []byte
+	var captureMu sync.Mutex
+	factory := NewStdioConnectionFactory(StdioFactoryOptions{
+		OnACPMessage: func(direction string, message []byte) {
+			if direction != "outbound" {
+				return
+			}
+			if bytes.Contains(message, []byte(`"session/new"`)) {
+				captureMu.Lock()
+				capturedNewSession = append(capturedNewSession[:0], message...)
+				captureMu.Unlock()
+			}
+		},
+	})
+	runtime := NewRuntime(factory, RuntimeOptions{})
+	meta := CreateClaudeCodeOptions(ClaudeCodeOptions{
+		DisallowedTools: []string{"WebFetch"},
+	})
+	session, err := runtime.StartSession(ctx, StartSessionOptions{
+		Agent: agent,
+		CWD:   cwd,
+		Meta:  meta,
+	})
+	if err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+	defer session.Close(context.Background())
+
+	captureMu.Lock()
+	snapshot := append([]byte(nil), capturedNewSession...)
+	captureMu.Unlock()
+	if snapshot == nil {
+		t.Fatalf("no outbound session/new captured")
+	}
+	// Verify the full nested path: _meta.claudeCode.options.disallowedTools
+	if !bytes.Contains(snapshot, []byte(`"claudeCode"`)) {
+		t.Fatalf("missing _meta.claudeCode: %s", snapshot)
+	}
+	if !bytes.Contains(snapshot, []byte(`"disallowedTools"`)) {
+		t.Fatalf("missing disallowedTools in _meta.claudeCode.options: %s", snapshot)
+	}
+	if !bytes.Contains(snapshot, []byte(`"WebFetch"`)) {
+		t.Fatalf("missing WebFetch value: %s", snapshot)
+	}
+}
+
 // TestRuntimeClaudeSystemPromptInjectsCLIFlag verifies that a Claude-typed
 // agent gets --append-system-prompt injected into its args when a system prompt
 // is supplied. This uses a fake agent command so no real Claude process spawns.

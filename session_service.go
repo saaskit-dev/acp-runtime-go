@@ -27,6 +27,12 @@ func (s *SessionService) Create(ctx context.Context, input StartSessionOptions) 
 			sessionMeta = profile.CreateSystemPromptSessionMeta(*input.SystemPrompt)
 		}
 	}
+	// Merge caller-supplied Meta (e.g. Claude _meta.claudeCode.options) into the
+	// session/new _meta. Caller keys take precedence over SystemPrompt-derived
+	// meta on conflict.
+	if len(input.Meta) > 0 {
+		sessionMeta = mergeSessionMeta(sessionMeta, input.Meta)
+	}
 	bootstrap, err := s.bootstrap(ctx, agent, input.CWD, input.MCPServers, input.Handlers, profile)
 	if err != nil {
 		return nil, wrapError(ErrorCreate, "session.start", "failed to bootstrap ACP session", err)
@@ -197,6 +203,30 @@ func normalizeMCPServers(servers []MCPServer) []MCPServer {
 		return []MCPServer{}
 	}
 	return servers
+}
+
+// mergeSessionMeta deep-merges two session/new _meta maps. Values from extra
+// (the caller-supplied Meta) take precedence over base (SystemPrompt-derived
+// meta) at every level: for conflicting map keys, if both values are maps they
+// are merged recursively, otherwise extra's value wins. A nil base is treated
+// as empty. The returned map is newly allocated; neither input is mutated.
+func mergeSessionMeta(base, extra map[string]any) map[string]any {
+	out := make(map[string]any, len(base)+len(extra))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range extra {
+		if existing, ok := out[k]; ok {
+			if existMap, ea := existing.(map[string]any); ea {
+				if newMap, nb := v.(map[string]any); nb {
+					out[k] = mergeSessionMeta(existMap, newMap)
+					continue
+				}
+			}
+		}
+		out[k] = v
+	}
+	return out
 }
 
 // resolveQueuePolicy normalizes the host-supplied QueuePolicyInput into the

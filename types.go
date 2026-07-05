@@ -24,7 +24,13 @@ type Agent struct {
 	Type    string            `json:"type"`
 	Command string            `json:"command"`
 	Args    []string          `json:"args,omitempty"`
-	Env     map[string]string `json:"env,omitempty"`
+	// ExtraArgs are appended after Args without replacing the default launch
+	// sequence. This is the safe way to add CLI flags (e.g. --disallowedTools)
+	// to an agent built by CreateClaudeCodeAgent/CreateCodexAgent: setting Args
+	// directly would overwrite the "npm exec ... --" preamble and break spawn.
+	// mergeAgent folds ExtraArgs into Args, so stdio spawns the combined slice.
+	ExtraArgs []string          `json:"extraArgs,omitempty"`
+	Env       map[string]string `json:"env,omitempty"`
 }
 
 type Implementation struct {
@@ -606,6 +612,27 @@ type ProtocolErrorEvent struct {
 	Raw    json.RawMessage
 }
 
+// ClaudeCodeOptions is the structured form of the Claude Code ACP agent's
+// _meta.claudeCode.options. Construct it with CreateClaudeCodeOptions and pass
+// the result as StartSessionOptions.Meta to apply at session creation. These
+// fields map to the underlying Claude Agent SDK options consumed by
+// claude-agent-acp on session/new.
+type ClaudeCodeOptions struct {
+	// Tools explicitly enumerates the only tools the agent may use. An empty
+	// (non-nil) slice disables all built-in tools. When nil, the agent's
+	// default tool preset is used.
+	Tools []string
+	// DisallowedTools removes tools from the model's context entirely (the
+	// model never sees them). Example: []string{"WebFetch", "WebSearch"}.
+	DisallowedTools []string
+	// AllowedTools marks tools that run without a permission prompt. Example:
+	// []string{"Bash(echo:*)", "Read"}. Does not remove other tools.
+	AllowedTools []string
+	// Settings is forwarded to the agent's settings object, supporting the
+	// Claude Code permissions schema, e.g. {"permissions":{"deny":["WebFetch"]}}.
+	Settings map[string]any
+}
+
 type StartSessionOptions struct {
 	Agent                 Agent
 	AgentID               string
@@ -616,6 +643,13 @@ type StartSessionOptions struct {
 	InitialConfig         InitialConfig
 	Queue                 QueuePolicyInput
 	Handlers              AuthorityHandlers
+	// Meta is merged into the session/new _meta object alongside any
+	// SystemPrompt-derived meta. Use this to pass agent-specific structured
+	// configuration (e.g. Claude Code's _meta.claudeCode.options to disable
+	// tools). Top-level keys from Meta take precedence over SystemPrompt meta
+	// on conflict. Only session/new carries _meta; load/resume/fork ignore it
+	// per the ACP schema.
+	Meta map[string]any
 }
 
 type LoadSessionOptions struct {
