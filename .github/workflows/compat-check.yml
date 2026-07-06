@@ -10,11 +10,19 @@ name: compat-check
 # across runs via actions/cache). When the npm latest version matches the
 # cached version, the expensive spawn+prompt is skipped (reported CACHED).
 #
-# Requires repository secrets (configure under Settings → Secrets → Actions):
-#   ANTHROPIC_API_KEY — for the claude-agent-acp smoke test
-#   OPENAI_API_KEY    — for the codex-acp smoke test (CODEX_API_KEY also works)
-# Agents whose key is absent are SKIPPED (not failed), so partial configuration
-# is fine.
+# Two ways to provide credentials (configure under Settings → Secrets → Actions):
+#
+#   Option A — unified router gateway (recommended, single secret pair):
+#     UNIFIED_ROUTER_BASE_URL — e.g. https://your-router/v1
+#     UNIFIED_ROUTER_KEY      — router API key
+#     CLAUDE_GATEWAY_MODEL    — (optional) model for claude, e.g. glm-5.2
+#     CODEX_GATEWAY_MODEL     — (optional) model for codex, defaults to deepseek-chat
+#
+#   Option B — direct provider keys:
+#     ANTHROPIC_API_KEY — for the claude-agent-acp smoke test
+#     OPENAI_API_KEY    — for the codex-acp smoke test (CODEX_API_KEY also works)
+#
+# Agents whose key is absent (and no gateway) are SKIPPED (not failed).
 
 on:
   schedule:
@@ -53,6 +61,15 @@ jobs:
 
       - name: Run compat check
         id: check
+        env:
+          # Option A: unified router gateway (single secret pair covers both agents)
+          UNIFIED_ROUTER_BASE_URL: ${{ secrets.UNIFIED_ROUTER_BASE_URL }}
+          UNIFIED_ROUTER_KEY: ${{ secrets.UNIFIED_ROUTER_KEY }}
+          CLAUDE_GATEWAY_MODEL: ${{ secrets.CLAUDE_GATEWAY_MODEL }}
+          CODEX_GATEWAY_MODEL: ${{ secrets.CODEX_GATEWAY_MODEL }}
+          # Option B: direct provider keys (alternative to gateway)
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           # Capture output to a file so the issue-creation step can embed it.
           set +e

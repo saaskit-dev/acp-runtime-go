@@ -36,6 +36,14 @@ import (
 // output chain is confirmed working.
 const sentinelToken = "COMPAT_OK"
 
+// Gateway env vars. When both are set, the check runs each agent through the
+// unified router gateway (a single base URL + key) instead of requiring
+// separate ANTHROPIC_API_KEY / OPENAI_API_KEY secrets.
+const (
+	gatewayBaseURLEnv = "UNIFIED_ROUTER_BASE_URL"
+	gatewayKeyEnv     = "UNIFIED_ROUTER_KEY"
+)
+
 type agentCheck struct {
 	name      string // human label
 	pkg       string // npm package name for version query + cache key
@@ -48,13 +56,13 @@ func main() {
 		{
 			name:      "claude-agent-acp",
 			pkg:       "@agentclientprotocol/claude-agent-acp",
-			buildFunc: func() acp.Agent { return acp.CreateClaudeCodeAgent(acp.Agent{}) },
+			buildFunc: buildClaudeAgent,
 			apiKeyEnv: "ANTHROPIC_API_KEY",
 		},
 		{
 			name:      "codex-acp",
 			pkg:       "@agentclientprotocol/codex-acp",
-			buildFunc: func() acp.Agent { return acp.CreateCodexAgent(acp.Agent{}) },
+			buildFunc: buildCodexAgent,
 			apiKeyEnv: "OPENAI_API_KEY", // CODEX_API_KEY also accepted; checked in apiKeyPresent
 		},
 	}
@@ -64,7 +72,11 @@ func main() {
 	cacheDirty := false
 
 	fmt.Printf("acp-compat-check — %s\n", time.Now().UTC().Format("2006-01-02 15:04:05 UTC"))
-	fmt.Printf("cache: %s\n\n", cachePath)
+	fmt.Printf("cache: %s\n", cachePath)
+	if gatewayConfigured() {
+		fmt.Printf("gateway: %s (via %s + %s)\n", os.Getenv(gatewayBaseURLEnv), gatewayBaseURLEnv, gatewayKeyEnv)
+	}
+	fmt.Println()
 
 	hasFailure := false
 
@@ -91,8 +103,8 @@ func main() {
 			fmt.Printf("  (cached was v%s, version changed)\n", cache[c.pkg])
 		}
 
-		if !apiKeyPresent(c.apiKeyEnv) {
-			fmt.Printf("  spawn+prompt: SKIPPED (no %s; version uncached)\n\n", c.apiKeyEnv)
+		if !canRunAgent(c.apiKeyEnv) {
+			fmt.Printf("  spawn+prompt: SKIPPED (no %s and no gateway; version uncached)\n\n", c.apiKeyEnv)
 			continue
 		}
 
@@ -181,6 +193,73 @@ func apiKeyPresent(primary string) bool {
 		return true
 	}
 	return false
+}
+
+// gatewayConfigured reports whether the unified router gateway env vars are
+// both set, enabling single-secret testing of both claude and codex agents.
+func gatewayConfigured() bool {
+	return os.Getenv(gatewayBaseURLEnv) != "" && os.Getenv(gatewayKeyEnv) != ""
+}
+
+// canRunAgent reports whether we have credentials to test this agent: either
+// the agent-specific API key, or the gateway configured (which covers both).
+func canRunAgent(apiKeyEnv string) bool {
+	return apiKeyPresent(apiKeyEnv) || gatewayConfigured()
+}
+
+// buildClaudeAgent constructs a claude-agent-acp Agent. When the gateway is
+// configured, it injects ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY so the agent
+// routes through the unified router instead of the default Anthropic endpoint.
+// When CLAUDE_GATEWAY_MODEL is set (e.g. "glm-5.2" for a gateway that only has
+// domestic models), it overrides the model via ANTHROPIC_MODEL so the gateway
+// can route to a model it actually supports.
+func buildClaudeAgent() acp.Agent {
+	agent := acp.CreateClaudeCodeAgent(acp.Agent{})
+	if gatewayConfigured() {
+		env := map[string]string{
+			"ANTHROPIC_BASE_URL": os.Getenv(gatewayBaseURLEnv),
+			"ANTHROPIC_API_KEY":  os.Getenv(gatewayKeyEnv),
+		}
+		if model := os.Getenv("CLAUDE_GATEWAY_MODEL"); model != "" {
+			env["ANTHROPIC_MODEL"] = model
+		}
+		agent.Env = env
+	}
+	return agent
+}
+
+// buildCodexAgent constructs a codex-acp Agent. When the gateway is configured,
+// it injects CODEX_CONFIG (JSON) pointing codex at the unified router with
+// wire_api=responses, and uses a gateway-native model (deepseek-chat by
+// default, overridable via CODEX_GATEWAY_MODEL). Without the gateway, it uses
+// the default codex agent (expects OPENAI_API_KEY).
+func buildCodexAgent() acp.Agent {
+	agent := acp.CreateCodexAgent(acp.Agent{})
+	if gatewayConfigured() {
+		model := os.Getenv("CODEX_GATEWAY_MODEL")
+		if model == "" {
+			model = "deepseek-chat"
+		}
+		baseURL := os.Getenv(gatewayBaseURLEnv)
+		key := os.Getenv(gatewayKeyEnv)
+		codexConfig := fmt.Sprintf(`{
+  "model_provider": "unified-router",
+  "model": %q,
+  "model_providers": {
+    "unified-router": {
+      "name": "Unified Router",
+      "base_url": %q,
+      "env_key": "OPENAI_API_KEY",
+      "wire_api": "responses"
+    }
+  }
+}`, model, baseURL)
+		agent.Env = map[string]string{
+			"OPENAI_API_KEY": key,
+			"CODEX_CONFIG":   codexConfig,
+		}
+	}
+	return agent
 }
 
 // runAgentCheck spawns the real agent, runs a minimal prompt, and verifies the

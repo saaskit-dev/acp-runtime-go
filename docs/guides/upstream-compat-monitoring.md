@@ -35,17 +35,32 @@ transient failures self-heal.
 
 ## Configuring secrets
 
-The real-agent smoke tests need API keys. Configure them as repository secrets
-under **Settings → Secrets and actions → Actions**:
+The real-agent smoke tests need credentials. There are two options; configure
+them as repository secrets under **Settings → Secrets and actions → Actions**.
+
+### Option A — unified router gateway (recommended)
+
+A single gateway URL + key covers both agents. The check injects
+`ANTHROPIC_BASE_URL`/`ANTHROPIC_API_KEY` for claude and `CODEX_CONFIG` for
+codex automatically, routing both through the gateway with domestic models.
+
+| Secret                   | Purpose                              | Required? |
+| ------------------------ | ------------------------------------ | --------- |
+| `UNIFIED_ROUTER_BASE_URL`| Gateway endpoint, e.g. `https://router/v1` | yes (for gateway mode) |
+| `UNIFIED_ROUTER_KEY`     | Gateway API key                      | yes (for gateway mode) |
+| `CLAUDE_GATEWAY_MODEL`   | Model for claude (e.g. `glm-5.2`)    | optional (defaults to claude's own) |
+| `CODEX_GATEWAY_MODEL`    | Model for codex (e.g. `deepseek-chat`)| optional (defaults to `deepseek-chat`) |
+
+### Option B — direct provider keys
 
 | Secret               | Used by          | Required? |
 | -------------------- | ---------------- | --------- |
 | `ANTHROPIC_API_KEY`  | claude-agent-acp | optional  |
 | `OPENAI_API_KEY`     | codex-acp        | optional  |
 
-Agents whose key is absent are **skipped**, not failed — so partial
-configuration is fine. `CODEX_API_KEY` is also accepted as an alias for the
-codex smoke test.
+Agents whose key is absent (and no gateway configured) are **skipped**, not
+failed — so partial configuration is fine. `CODEX_API_KEY` is also accepted as
+an alias for the codex smoke test.
 
 The keys reach the spawned wrapper via the runtime's `envSlice` (which merges
 `os.Environ()`), so no Go code change is needed — the CI step simply exports
@@ -59,8 +74,13 @@ The same check runs locally with no CI setup:
 # Without keys: reports SKIPPED for uncached versions (exit 0)
 go run ./cmd/acp-compat-check
 
-# With a key: runs the real spawn + prompt smoke test on first run,
-# then CACHED on subsequent runs until the version changes.
+# Via unified router gateway (covers both agents with one key pair):
+UNIFIED_ROUTER_BASE_URL=https://your-router/v1 \
+UNIFIED_ROUTER_KEY=cfut_... \
+CLAUDE_GATEWAY_MODEL=glm-5.2 \
+go run ./cmd/acp-compat-check
+
+# With direct provider keys:
 ANTHROPIC_API_KEY=sk-ant-... go run ./cmd/acp-compat-check
 
 # Point the cache at a custom path (default: ./.compat-versions.json)
