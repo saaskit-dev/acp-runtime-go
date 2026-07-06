@@ -13,7 +13,7 @@ func TestCreateCodexAgentUsesACPWrapper(t *testing.T) {
 	if agent.Command != "npm" {
 		t.Fatalf("Command = %q, want npm", agent.Command)
 	}
-	assertAgentArgs(t, agent.Args, []string{"exec", "--yes", "@agentclientprotocol/codex-acp@1.1.0", "--"})
+	assertAgentArgs(t, agent.Args, []string{"exec", "--yes", "@agentclientprotocol/codex-acp", "--"})
 }
 
 func TestCreateClaudeCodeAgentUsesACPWrapper(t *testing.T) {
@@ -24,7 +24,7 @@ func TestCreateClaudeCodeAgentUsesACPWrapper(t *testing.T) {
 	if agent.Command != "npm" {
 		t.Fatalf("Command = %q, want npm", agent.Command)
 	}
-	assertAgentArgs(t, agent.Args, []string{"exec", "--yes", "@agentclientprotocol/claude-agent-acp@0.55.0", "--"})
+	assertAgentArgs(t, agent.Args, []string{"exec", "--yes", "@agentclientprotocol/claude-agent-acp", "--"})
 }
 
 func assertAgentArgs(t *testing.T, got []string, want []string) {
@@ -48,7 +48,7 @@ func TestExtraArgsAppendedAfterDefaultArgs(t *testing.T) {
 	})
 	// Default preamble preserved, flag appended after "--".
 	want := []string{
-		"exec", "--yes", "@agentclientprotocol/claude-agent-acp@0.55.0", "--",
+		"exec", "--yes", "@agentclientprotocol/claude-agent-acp", "--",
 		"--disallowedTools", "WebFetch,WebSearch",
 	}
 	assertAgentArgs(t, agent.Args, want)
@@ -83,7 +83,7 @@ func TestExtraArgsFromBothBaseAndOverrides(t *testing.T) {
 // ExtraArgs is not set, Args behaves exactly as before.
 func TestNoExtraArgsLeavesArgsUnchanged(t *testing.T) {
 	agent := CreateClaudeCodeAgent(Agent{})
-	assertAgentArgs(t, agent.Args, []string{"exec", "--yes", "@agentclientprotocol/claude-agent-acp@0.55.0", "--"})
+	assertAgentArgs(t, agent.Args, []string{"exec", "--yes", "@agentclientprotocol/claude-agent-acp", "--"})
 }
 
 // TestCreateClaudeCodeOptionsShape verifies the emitted _meta.claudeCode.options

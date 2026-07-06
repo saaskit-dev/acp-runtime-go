@@ -12,12 +12,19 @@ const (
 	LocalSimulatorAgentACPRegistryID = "local-simulator-agent-acp"
 )
 
+// CreateCodexAgent builds an Agent that launches the Codex ACP wrapper via npx.
+// The package is unpinned so npm resolves the latest published version each
+// spawn, keeping the wrapper in sync with upstream without a code change.
 func CreateCodexAgent(overrides Agent) Agent {
-	return mergeAgent(Agent{Type: CodexACPRegistryID, Command: "npm", Args: []string{"exec", "--yes", "@agentclientprotocol/codex-acp@1.1.0", "--"}}, overrides)
+	return mergeAgent(Agent{Type: CodexACPRegistryID, Command: "npm", Args: []string{"exec", "--yes", "@agentclientprotocol/codex-acp", "--"}}, overrides)
 }
 
+// CreateClaudeCodeAgent builds an Agent that launches the Claude Code ACP
+// wrapper via npx. The package is unpinned so npm resolves the latest published
+// version each spawn, keeping the wrapper in sync with upstream without a code
+// change.
 func CreateClaudeCodeAgent(overrides Agent) Agent {
-	return mergeAgent(Agent{Type: ClaudeCodeACPRegistryID, Command: "npm", Args: []string{"exec", "--yes", "@agentclientprotocol/claude-agent-acp@0.55.0", "--"}}, overrides)
+	return mergeAgent(Agent{Type: ClaudeCodeACPRegistryID, Command: "npm", Args: []string{"exec", "--yes", "@agentclientprotocol/claude-agent-acp", "--"}}, overrides)
 }
 
 func CreateGeminiAgent(overrides Agent) Agent {

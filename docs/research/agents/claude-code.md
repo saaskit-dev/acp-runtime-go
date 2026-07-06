@@ -10,7 +10,7 @@ Language:
 - Runtime repo: `acp-runtime-go`
 - Agent id: `claude-acp`
 - Local Claude Code: `claude --version` -> `2.1.121 (Claude Code)`
-- ACP adapter: `npm exec --yes @agentclientprotocol/claude-agent-acp@0.55.0 --` (migrated from the deprecated `@zed-industries/claude-agent-acp@0.23.1`; the old package was renamed and stopped producing output)
+- ACP adapter: `npm exec --yes @agentclientprotocol/claude-agent-acp --` (unpinned, resolves latest; migrated from the deprecated `@zed-industries/claude-agent-acp@0.23.1` which was renamed and stopped producing output. Latest observed at time of writing: 0.55.0)
 - Adapter SDK dependency: `@agentclientprotocol/sdk@1.1.0`
 - Upstream protocol schema checked against `agent-client-protocol@schema-v1.17.0` (re-verified 2026-07-05; the `configId`/`auth` observations below were originally established against `v0.13.4` and remain accurate).
 - Status: admitted for interactive session, config/mode, file, terminal, and write scenarios; session history operations have wrapper-level limitations when run against an empty newly-created session.
