@@ -45,21 +45,19 @@ const (
 )
 
 type agentCheck struct {
-	name            string // human label
-	pkg             string // npm package name for version query + cache key
-	buildFunc       func() acp.Agent
-	apiKeyEnv       string // env var that must be present to run the real test
-	gatewayModelEnv string // env var holding the gateway model override (claude only)
+	name      string // human label
+	pkg       string // npm package name for version query + cache key
+	buildFunc func() (acp.Agent, map[string]any) // agent + optional session/new _meta
+	apiKeyEnv string // env var that must be present to run the real test
 }
 
 func main() {
 	checks := []agentCheck{
 		{
-			name:            "claude-agent-acp",
-			pkg:             "@agentclientprotocol/claude-agent-acp",
-			buildFunc:       buildClaudeAgent,
-			apiKeyEnv:       "ANTHROPIC_API_KEY",
-			gatewayModelEnv: "CLAUDE_GATEWAY_MODEL",
+			name:      "claude-agent-acp",
+			pkg:       "@agentclientprotocol/claude-agent-acp",
+			buildFunc: buildClaudeAgent,
+			apiKeyEnv: "ANTHROPIC_API_KEY",
 		},
 		{
 			name:      "codex-acp",
@@ -110,7 +108,7 @@ func main() {
 			continue
 		}
 
-		status, detail := runAgentCheck(c.buildFunc, c.name, c.gatewayModelEnv)
+		status, detail := runAgentCheck(c.buildFunc, c.name)
 		switch status {
 		case "PASS":
 			fmt.Printf("  spawn+prompt: PASS (%s)\n\n", detail)
@@ -209,38 +207,65 @@ func canRunAgent(apiKeyEnv string) bool {
 	return apiKeyPresent(apiKeyEnv) || gatewayConfigured()
 }
 
-// buildClaudeAgent constructs a claude-agent-acp Agent. When the gateway is
-// configured, it injects ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY so the agent
-// routes through the unified router instead of the default Anthropic endpoint.
-// The model override (CLAUDE_GATEWAY_MODEL) is applied separately in
-// runAgentCheck via InitialConfig.Model, since the Claude Agent SDK does not
-// read ANTHROPIC_MODEL.
-func buildClaudeAgent() acp.Agent {
+// buildClaudeAgent constructs a claude-agent-acp Agent + optional _meta for
+// gateway mode. Three issues must be solved for the Claude Agent SDK to work
+// through a non-Anthropic gateway:
+//  1. ANTHROPIC_BASE_URL must NOT include /v1 (the SDK appends /v1/messages).
+//  2. Without OAuth the SDK uses a full model name (claude-opus-4-8) the
+//     gateway doesn't have → settings.model overrides to a gateway-native model.
+//  3. The SDK appends [1m] for 1M-context variants → modelOverrides maps every
+//     variant back to the plain gateway model.
+func buildClaudeAgent() (acp.Agent, map[string]any) {
 	agent := acp.CreateClaudeCodeAgent(acp.Agent{})
-	if gatewayConfigured() {
-		agent.Env = map[string]string{
-			"ANTHROPIC_BASE_URL": os.Getenv(gatewayBaseURLEnv),
-			"ANTHROPIC_API_KEY":  os.Getenv(gatewayKeyEnv),
-		}
+	if !gatewayConfigured() {
+		return agent, nil
 	}
-	return agent
+	// Strip trailing /v1 — the SDK appends /v1/messages itself.
+	baseURL := strings.TrimSuffix(os.Getenv(gatewayBaseURLEnv), "/v1")
+	agent.Env = map[string]string{
+		"ANTHROPIC_BASE_URL": baseURL,
+		"ANTHROPIC_API_KEY":  os.Getenv(gatewayKeyEnv),
+	}
+	model := os.Getenv("CLAUDE_GATEWAY_MODEL")
+	if model == "" {
+		model = "glm-5.2"
+	}
+	// modelOverrides maps all claude model variants (+ [1m] suffix the SDK adds)
+	// to the gateway-native model so the gateway always receives a model it knows.
+	overrideTargets := []string{
+		"claude-opus-4-8", "claude-opus-4-8[1m]",
+		"claude-sonnet-4-6", "claude-sonnet-4-6[1m]",
+		"claude-haiku-4-5", "claude-haiku-4-5[1m]",
+		model + "[1m]", // the SDK may append [1m] to our chosen model too
+	}
+	modelOverrides := map[string]any{}
+	for _, m := range overrideTargets {
+		modelOverrides[m] = model
+	}
+	meta := acp.CreateClaudeCodeOptions(acp.ClaudeCodeOptions{
+		Settings: map[string]any{
+			"model":          model,
+			"modelOverrides": modelOverrides,
+		},
+	})
+	return agent, meta
 }
 
-// buildCodexAgent constructs a codex-acp Agent. When the gateway is configured,
-// it injects CODEX_CONFIG (JSON) pointing codex at the unified router with
-// wire_api=responses, and uses a gateway-native model (deepseek-chat by
-// default, overridable via CODEX_GATEWAY_MODEL). Without the gateway, it uses
-// the default codex agent (expects OPENAI_API_KEY).
-func buildCodexAgent() acp.Agent {
+// buildCodexAgent constructs a codex-acp Agent + optional _meta for gateway
+// mode. It injects CODEX_CONFIG (JSON) pointing codex at the unified router
+// with wire_api=responses, using a gateway-native model.
+func buildCodexAgent() (acp.Agent, map[string]any) {
 	agent := acp.CreateCodexAgent(acp.Agent{})
-	if gatewayConfigured() {
-		model := os.Getenv("CODEX_GATEWAY_MODEL")
-		if model == "" {
-			model = "deepseek-chat"
-		}
-		baseURL := os.Getenv(gatewayBaseURLEnv)
-		key := os.Getenv(gatewayKeyEnv)
-		codexConfig := fmt.Sprintf(`{
+	if !gatewayConfigured() {
+		return agent, nil
+	}
+	model := os.Getenv("CODEX_GATEWAY_MODEL")
+	if model == "" {
+		model = "deepseek-chat"
+	}
+	baseURL := os.Getenv(gatewayBaseURLEnv)
+	key := os.Getenv(gatewayKeyEnv)
+	codexConfig := fmt.Sprintf(`{
   "model_provider": "unified-router",
   "model": %q,
   "model_providers": {
@@ -252,22 +277,16 @@ func buildCodexAgent() acp.Agent {
     }
   }
 }`, model, baseURL)
-		agent.Env = map[string]string{
-			"OPENAI_API_KEY": key,
-			"CODEX_CONFIG":   codexConfig,
-		}
+	agent.Env = map[string]string{
+		"OPENAI_API_KEY": key,
+		"CODEX_CONFIG":   codexConfig,
 	}
-	return agent
+	return agent, nil
 }
 
 // runAgentCheck spawns the real agent, runs a minimal prompt, and verifies the
 // sentinel token appears in the output. Returns (status, detail).
-//
-// Note on gateway model selection: claude-acp's model config option only
-// accepts Claude model aliases (default/sonnet/opus/etc), so we do NOT override
-// it — we let claude use its "default" and rely on the gateway to route that to
-// a backed model. codex-acp sets its model via CODEX_CONFIG (deepseek-chat).
-func runAgentCheck(build func() acp.Agent, label, gatewayModelEnv string) (string, string) {
+func runAgentCheck(build func() (acp.Agent, map[string]any), label string) (string, string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
 	defer cancel()
 
@@ -281,8 +300,8 @@ func runAgentCheck(build func() acp.Agent, label, gatewayModelEnv string) (strin
 		Stderr: "ignore", // keep CI logs clean; errors surface via empty output
 	}), acp.RuntimeOptions{})
 
-	agent := build()
-	opts := acp.StartSessionOptions{Agent: agent, CWD: cwd}
+	agent, meta := build()
+	opts := acp.StartSessionOptions{Agent: agent, CWD: cwd, Meta: meta}
 	session, err := runtime.StartSession(ctx, opts)
 	if err != nil {
 		return "FAIL", fmt.Sprintf("StartSession error: %v", err)
