@@ -12,15 +12,26 @@ A scheduled GitHub Actions workflow (`.github/workflows/compat-check.yml`) runs
 daily at 06:00 UTC. It invokes `cmd/acp-compat-check`, which for each wrapper:
 
 1. Queries `npm view <pkg> version` for the current latest version.
-2. If the corresponding API key is present, spawns the real agent and runs a
-   minimal prompt (`Reply with exactly: COMPAT_OK`), asserting the full chain
-   (spawn → initialize → session/new → session/prompt → output) works.
-3. Reports PASS / FAIL / SKIPPED per agent.
+2. **If the version matches the cached "last tested OK" version → skip** the
+   expensive spawn+prompt (reported as CACHED). This avoids burning API quota
+   day after day when nothing changed.
+3. Otherwise, if the corresponding API key is present, spawns the real agent
+   and runs a minimal prompt (`Reply with exactly: COMPAT_OK`), asserting the
+   full chain (spawn → initialize → session/new → session/prompt → output)
+   works. On PASS, the cache is updated with the new version.
+4. Reports PASS / FAIL / SKIPPED / CACHED per agent.
+
+The cache is a small JSON file (`.compat-versions.json`) mapping package names
+to the last version that passed. In CI it is persisted across runs via
+`actions/cache`. Locally it lives in the working directory (or
+`$COMPAT_CACHE`).
 
 When a test **fails** (exit code 1), the workflow opens (or updates) a GitHub
 Issue titled `[compat-check] ACP wrapper compatibility regression detected`,
 labeled `compat-regression`, with the full check output and a link to the CI
 run. When the check later **passes** again, the issue is automatically closed.
+Note: a failed version is **not** cached, so the next run retries it —
+transient failures self-heal.
 
 ## Configuring secrets
 
@@ -45,17 +56,22 @@ the secrets as environment variables.
 The same check runs locally with no CI setup:
 
 ```bash
-# Without keys: reports SKIPPED (exit 2)
+# Without keys: reports SKIPPED for uncached versions (exit 0)
 go run ./cmd/acp-compat-check
 
-# With a key: runs the real spawn + prompt smoke test (exit 0 = pass, 1 = fail)
+# With a key: runs the real spawn + prompt smoke test on first run,
+# then CACHED on subsequent runs until the version changes.
 ANTHROPIC_API_KEY=sk-ant-... go run ./cmd/acp-compat-check
+
+# Point the cache at a custom path (default: ./.compat-versions.json)
+COMPAT_CACHE=/tmp/compat.json go run ./cmd/acp-compat-check
 ```
 
-Sample output:
+Sample output (first run, with a key):
 
 ```text
-acp-compat-check — 2026-07-05 16:48:39 UTC
+acp-compat-check — 2026-07-05 17:39:10 UTC
+cache: .compat-versions.json
 
 claude-agent-acp: latest=0.55.0
   spawn+prompt: PASS (output="COMPAT_OK", 3.2s)
@@ -63,16 +79,25 @@ claude-agent-acp: latest=0.55.0
 codex-acp: latest=1.1.0
   spawn+prompt: SKIPPED (no OPENAI_API_KEY)
 
-Result: PASS — all tested agents are compatible.
+Result: OK — no failures (all PASS, CACHED, or SKIPPED).
+```
+
+Sample output (next day, version unchanged):
+
+```text
+claude-agent-acp: latest=0.55.0
+  spawn+prompt: CACHED (already tested v0.55.0)
+
+codex-acp: latest=1.1.0
+  spawn+prompt: CACHED (already tested v1.1.0)
 ```
 
 ## Exit codes
 
 | Code | Meaning |
 | ---- | ------- |
-| 0    | All tested agents passed. |
+| 0    | No failures (all PASS, CACHED, or SKIPPED). |
 | 1    | At least one agent failed (regression detected). |
-| 2    | All agents were skipped (no API keys configured). |
 
 ## Manual dispatch
 

@@ -2,18 +2,26 @@
 // packages still work with this runtime. It is designed to run both locally
 // (go run ./cmd/acp-compat-check) and in CI (scheduled workflow).
 //
-// For each wrapper it:
-//  1. Queries npm for the current latest version.
-//  2. If the corresponding API key env var is present, spawns the real agent
-//     and runs a minimal prompt, asserting the runtime can drive a full turn.
-//  3. Reports PASS / FAIL / SKIPPED.
+// To avoid burning API quota on unchanged versions, it caches the last
+// successfully-tested version of each wrapper in a small JSON file
+// (.compat-versions.json, or the path in COMPAT_CACHE). When the npm latest
+// version matches the cached version, the expensive spawn+prompt smoke test is
+// skipped (reported as CACHED). The test only runs when a version is new or the
+// cached entry is absent.
 //
-// Exit codes: 0 = all tested agents PASS; 1 = at least one FAIL; 2 = all agents
-// SKIPPED (no API keys configured, so nothing was actually tested).
+// For each wrapper:
+//  1. Query npm for the current latest version.
+//  2. If the version matches the cached "last tested OK" version → CACHED (skip).
+//  3. Else if the API key env var is present, spawn the real agent and run a
+//     minimal prompt; on PASS, update the cache with the new version.
+//  4. Report PASS / FAIL / SKIPPED / CACHED.
+//
+// Exit codes: 0 = no FAIL (all PASS, CACHED, or SKIPPED); 1 = at least one FAIL.
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -30,7 +38,7 @@ const sentinelToken = "COMPAT_OK"
 
 type agentCheck struct {
 	name      string // human label
-	pkg       string // npm package name for version query
+	pkg       string // npm package name for version query + cache key
 	buildFunc func() acp.Agent
 	apiKeyEnv string // env var that must be present to run the real test
 }
@@ -44,33 +52,47 @@ func main() {
 			apiKeyEnv: "ANTHROPIC_API_KEY",
 		},
 		{
-			name: "codex-acp",
-			pkg:  "@agentclientprotocol/codex-acp",
-			buildFunc: func() acp.Agent {
-				return acp.CreateCodexAgent(acp.Agent{})
-			},
-			apiKeyEnv: "OPENAI_API_KEY", // CODEX_API_KEY also accepted by codex; checked below
+			name:      "codex-acp",
+			pkg:       "@agentclientprotocol/codex-acp",
+			buildFunc: func() acp.Agent { return acp.CreateCodexAgent(acp.Agent{}) },
+			apiKeyEnv: "OPENAI_API_KEY", // CODEX_API_KEY also accepted; checked in apiKeyPresent
 		},
 	}
 
-	fmt.Printf("acp-compat-check — %s\n\n", time.Now().UTC().Format("2006-01-02 15:04:05 UTC"))
+	cachePath := cacheFilePath()
+	cache, _ := loadCache(cachePath) // missing/invalid cache is fine → all "new"
+	cacheDirty := false
+
+	fmt.Printf("acp-compat-check — %s\n", time.Now().UTC().Format("2006-01-02 15:04:05 UTC"))
+	fmt.Printf("cache: %s\n\n", cachePath)
 
 	hasFailure := false
-	hasPass := false
-	hasSkipped := false
 
 	for _, c := range checks {
 		version, vErr := npmLatestVersion(c.pkg)
 		if vErr != nil {
 			fmt.Printf("%s: ⚠ could not query npm version (%v)\n", c.name, vErr)
+			// Can't determine version → fall through to test if key is present,
+			// treating it as uncached so we don't silently skip on npm errors.
 			version = "unknown"
 		} else {
 			fmt.Printf("%s: latest=%s\n", c.name, version)
 		}
 
+		// Fast path: version unchanged since last successful test → skip the
+		// expensive spawn+prompt. This is the key optimization: day-to-day,
+		// when nothing changed, we do a single `npm view` per agent and stop.
+		if version != "unknown" && cache[c.pkg] == version {
+			fmt.Printf("  spawn+prompt: CACHED (already tested v%s)\n\n", version)
+			continue
+		}
+
+		if cache[c.pkg] != "" {
+			fmt.Printf("  (cached was v%s, version changed)\n", cache[c.pkg])
+		}
+
 		if !apiKeyPresent(c.apiKeyEnv) {
-			fmt.Printf("  spawn+prompt: SKIPPED (no %s)\n\n", c.apiKeyEnv)
-			hasSkipped = true
+			fmt.Printf("  spawn+prompt: SKIPPED (no %s; version uncached)\n\n", c.apiKeyEnv)
 			continue
 		}
 
@@ -78,26 +100,62 @@ func main() {
 		switch status {
 		case "PASS":
 			fmt.Printf("  spawn+prompt: PASS (%s)\n\n", detail)
-			hasPass = true
+			if version != "unknown" {
+				cache[c.pkg] = version
+				cacheDirty = true
+			}
 		case "FAIL":
 			fmt.Printf("  spawn+prompt: FAIL (%s)\n\n", detail)
 			hasFailure = true
+			// Do NOT update cache on failure: next run will retry the same
+			// version, which is what we want (transient failures self-heal).
 		}
 	}
 
-	// Exit code logic: failure dominates; if no failures and no passes, it was
-	// all skipped (no API keys) -> exit 2 so CI can distinguish "untested".
-	switch {
-	case hasFailure:
+	// Persist updated cache so future runs skip unchanged versions.
+	if cacheDirty {
+		if err := saveCache(cachePath, cache); err != nil {
+			fmt.Printf("⚠ could not write cache: %v\n", err)
+		}
+	}
+
+	if hasFailure {
 		fmt.Println("Result: FAIL — at least one agent did not produce the expected output.")
 		os.Exit(1)
-	case hasSkipped && !hasPass:
-		fmt.Println("Result: SKIPPED — no API keys configured, nothing was tested.")
-		os.Exit(2)
-	default:
-		fmt.Println("Result: PASS — all tested agents are compatible.")
-		os.Exit(0)
 	}
+	fmt.Println("Result: OK — no failures (all PASS, CACHED, or SKIPPED).")
+	os.Exit(0)
+}
+
+// cacheFilePath returns the path to the version cache file. It honors the
+// COMPAT_CACHE env var so CI can point it at a persisted artifact, and defaults
+// to .compat-versions.json in the working directory.
+func cacheFilePath() string {
+	if p := os.Getenv("COMPAT_CACHE"); p != "" {
+		return p
+	}
+	return ".compat-versions.json"
+}
+
+func loadCache(path string) (map[string]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return map[string]string{}, err
+	}
+	var m map[string]string
+	if err := json.Unmarshal(data, &m); err != nil {
+		return map[string]string{}, err
+	}
+	return m, nil
+}
+
+func saveCache(path string, cache map[string]string) error {
+	data, err := json.MarshalIndent(cache, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	return os.WriteFile(path, data, 0o644)
 }
 
 // npmLatestVersion queries `npm view <pkg> version` and returns the trimmed

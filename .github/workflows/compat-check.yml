@@ -5,6 +5,11 @@ name: compat-check
 # manual dispatch. If a wrapper stops producing correct output (spawn + prompt
 # smoke test fails), opens or updates a tracking GitHub Issue.
 #
+# To avoid burning API quota on unchanged versions, the check caches the last
+# successfully-tested version of each wrapper (.compat-versions.json, persisted
+# across runs via actions/cache). When the npm latest version matches the
+# cached version, the expensive spawn+prompt is skipped (reported CACHED).
+#
 # Requires repository secrets (configure under Settings → Secrets → Actions):
 #   ANTHROPIC_API_KEY — for the claude-agent-acp smoke test
 #   OPENAI_API_KEY    — for the codex-acp smoke test (CODEX_API_KEY also works)
@@ -36,6 +41,16 @@ jobs:
         with:
           node-version: "lts/*"
 
+      # Persist the version cache across runs so unchanged versions are not
+      # re-tested (saves API quota). The cache key is fixed so each run
+      # read+writes the same slot; only the file content evolves.
+      - name: Restore version cache
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: .compat-versions.json
+          key: compat-versions-cache
+
       - name: Run compat check
         id: check
         run: |
@@ -48,6 +63,16 @@ jobs:
           echo "---"
           echo "exit code: $code"
           exit 0  # always succeed here; the issue step decides what to do
+
+      # Save the (possibly updated) cache. run-always so a cache miss on the
+      # first run still populates it. save always succeeds even if the restore
+      # missed, because the file is written by the check when versions change.
+      - name: Save version cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .compat-versions.json
+          key: compat-versions-cache
 
       - name: Open or update regression Issue
         if: steps.check.outputs.exit_code == '1'
