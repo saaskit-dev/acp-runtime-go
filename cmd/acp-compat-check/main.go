@@ -261,10 +261,12 @@ func buildCodexAgent() acp.Agent {
 }
 
 // runAgentCheck spawns the real agent, runs a minimal prompt, and verifies the
-// sentinel token appears in the output. When gatewayModelEnv is set and the
-// env var is present, it overrides the model via InitialConfig.Model (needed
-// for claude, whose SDK ignores ANTHROPIC_MODEL; codex sets its model via
-// CODEX_CONFIG already). Returns (status, detail).
+// sentinel token appears in the output. Returns (status, detail).
+//
+// Note on gateway model selection: claude-acp's model config option only
+// accepts Claude model aliases (default/sonnet/opus/etc), so we do NOT override
+// it — we let claude use its "default" and rely on the gateway to route that to
+// a backed model. codex-acp sets its model via CODEX_CONFIG (deepseek-chat).
 func runAgentCheck(build func() acp.Agent, label, gatewayModelEnv string) (string, string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
 	defer cancel()
@@ -281,14 +283,6 @@ func runAgentCheck(build func() acp.Agent, label, gatewayModelEnv string) (strin
 
 	agent := build()
 	opts := acp.StartSessionOptions{Agent: agent, CWD: cwd}
-	// When a gateway model override is set, pass it via InitialConfig.Model so
-	// the agent uses a model the gateway supports (e.g. glm-5.2 instead of a
-	// Claude model name the gateway doesn't have).
-	if gatewayModelEnv != "" {
-		if model := os.Getenv(gatewayModelEnv); model != "" {
-			opts.InitialConfig.Model = model
-		}
-	}
 	session, err := runtime.StartSession(ctx, opts)
 	if err != nil {
 		return "FAIL", fmt.Sprintf("StartSession error: %v", err)
