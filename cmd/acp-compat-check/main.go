@@ -210,50 +210,36 @@ func canRunAgent(apiKeyEnv string) bool {
 // buildClaudeAgent constructs a claude-agent-acp Agent + optional _meta for
 // gateway mode. Three issues must be solved for the Claude Agent SDK to work
 // through a non-Anthropic gateway:
-//  1. ANTHROPIC_BASE_URL must NOT include /v1 (the SDK appends /v1/messages).
-//  2. Without OAuth the SDK uses a full model name (claude-opus-4-8) the
-//     gateway doesn't have → settings.model overrides to a gateway-native model.
-//  3. The SDK appends [1m] for 1M-context variants → modelOverrides maps every
-//     variant back to the plain gateway model.
+//   - ANTHROPIC_BASE_URL must NOT include /v1 (the SDK appends /v1/messages).
+//   - Without OAuth the SDK uses a full model name (claude-opus-4-8) the gateway
+//     doesn't have. ANTHROPIC_CUSTOM_MODEL_OPTION (supported since claude-acp
+//     v0.45.0, PR #768) registers the gateway model in the SDK's catalog, then
+//     settings.model selects it. This avoids the [1m] suffix issue because the
+//     SDK doesn't add context markers to non-Claude models.
 func buildClaudeAgent() (acp.Agent, map[string]any) {
 	agent := acp.CreateClaudeCodeAgent(acp.Agent{})
 	if !gatewayConfigured() {
 		return agent, nil
 	}
-	// Strip trailing /v1 — the SDK appends /v1/messages itself.
-	baseURL := strings.TrimSuffix(os.Getenv(gatewayBaseURLEnv), "/v1")
-	agent.Env = map[string]string{
-		"ANTHROPIC_BASE_URL": baseURL,
-		"ANTHROPIC_API_KEY":  os.Getenv(gatewayKeyEnv),
-	}
 	model := os.Getenv("CLAUDE_GATEWAY_MODEL")
 	if model == "" {
 		model = "glm-5.2"
 	}
-	// modelOverrides maps all claude model variants (+ [1m] suffix the SDK adds)
-	// to the gateway-native model so the gateway always receives a model it knows.
-	overrideTargets := []string{
-		"claude-opus-4-8", "claude-opus-4-8[1m]",
-		"claude-sonnet-4-6", "claude-sonnet-4-6[1m]",
-		"claude-haiku-4-5", "claude-haiku-4-5[1m]",
-		model + "[1m]", // the SDK may append [1m] to our chosen model too
-	}
-	modelOverrides := map[string]any{}
-	for _, m := range overrideTargets {
-		modelOverrides[m] = model
+	agent.Env = map[string]string{
+		"ANTHROPIC_BASE_URL":            os.Getenv(gatewayBaseURLEnv), // no /v1
+		"ANTHROPIC_API_KEY":             os.Getenv(gatewayKeyEnv),
+		"ANTHROPIC_CUSTOM_MODEL_OPTION": model,
 	}
 	meta := acp.CreateClaudeCodeOptions(acp.ClaudeCodeOptions{
-		Settings: map[string]any{
-			"model":          model,
-			"modelOverrides": modelOverrides,
-		},
+		Settings: map[string]any{"model": model},
 	})
 	return agent, meta
 }
 
 // buildCodexAgent constructs a codex-acp Agent + optional _meta for gateway
-// mode. It injects CODEX_CONFIG (JSON) pointing codex at the unified router
-// with wire_api=responses, using a gateway-native model.
+// mode. Codex's CODEX_CONFIG.base_url needs /v1 (codex appends /responses
+// directly, unlike the Claude SDK which appends /v1/messages). So we append /v1
+// to the gateway base URL here.
 func buildCodexAgent() (acp.Agent, map[string]any) {
 	agent := acp.CreateCodexAgent(acp.Agent{})
 	if !gatewayConfigured() {
@@ -263,7 +249,8 @@ func buildCodexAgent() (acp.Agent, map[string]any) {
 	if model == "" {
 		model = "deepseek-chat"
 	}
-	baseURL := os.Getenv(gatewayBaseURLEnv)
+	// Codex base_url needs /v1 (it appends /responses, not /v1/responses).
+	baseURL := strings.TrimSuffix(os.Getenv(gatewayBaseURLEnv), "/") + "/v1"
 	key := os.Getenv(gatewayKeyEnv)
 	codexConfig := fmt.Sprintf(`{
   "model_provider": "unified-router",
