@@ -45,19 +45,21 @@ const (
 )
 
 type agentCheck struct {
-	name      string // human label
-	pkg       string // npm package name for version query + cache key
-	buildFunc func() acp.Agent
-	apiKeyEnv string // env var that must be present to run the real test
+	name            string // human label
+	pkg             string // npm package name for version query + cache key
+	buildFunc       func() acp.Agent
+	apiKeyEnv       string // env var that must be present to run the real test
+	gatewayModelEnv string // env var holding the gateway model override (claude only)
 }
 
 func main() {
 	checks := []agentCheck{
 		{
-			name:      "claude-agent-acp",
-			pkg:       "@agentclientprotocol/claude-agent-acp",
-			buildFunc: buildClaudeAgent,
-			apiKeyEnv: "ANTHROPIC_API_KEY",
+			name:            "claude-agent-acp",
+			pkg:             "@agentclientprotocol/claude-agent-acp",
+			buildFunc:       buildClaudeAgent,
+			apiKeyEnv:       "ANTHROPIC_API_KEY",
+			gatewayModelEnv: "CLAUDE_GATEWAY_MODEL",
 		},
 		{
 			name:      "codex-acp",
@@ -108,7 +110,7 @@ func main() {
 			continue
 		}
 
-		status, detail := runAgentCheck(c.buildFunc, c.name)
+		status, detail := runAgentCheck(c.buildFunc, c.name, c.gatewayModelEnv)
 		switch status {
 		case "PASS":
 			fmt.Printf("  spawn+prompt: PASS (%s)\n\n", detail)
@@ -210,20 +212,16 @@ func canRunAgent(apiKeyEnv string) bool {
 // buildClaudeAgent constructs a claude-agent-acp Agent. When the gateway is
 // configured, it injects ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY so the agent
 // routes through the unified router instead of the default Anthropic endpoint.
-// When CLAUDE_GATEWAY_MODEL is set (e.g. "glm-5.2" for a gateway that only has
-// domestic models), it overrides the model via ANTHROPIC_MODEL so the gateway
-// can route to a model it actually supports.
+// The model override (CLAUDE_GATEWAY_MODEL) is applied separately in
+// runAgentCheck via InitialConfig.Model, since the Claude Agent SDK does not
+// read ANTHROPIC_MODEL.
 func buildClaudeAgent() acp.Agent {
 	agent := acp.CreateClaudeCodeAgent(acp.Agent{})
 	if gatewayConfigured() {
-		env := map[string]string{
+		agent.Env = map[string]string{
 			"ANTHROPIC_BASE_URL": os.Getenv(gatewayBaseURLEnv),
 			"ANTHROPIC_API_KEY":  os.Getenv(gatewayKeyEnv),
 		}
-		if model := os.Getenv("CLAUDE_GATEWAY_MODEL"); model != "" {
-			env["ANTHROPIC_MODEL"] = model
-		}
-		agent.Env = env
 	}
 	return agent
 }
@@ -263,8 +261,11 @@ func buildCodexAgent() acp.Agent {
 }
 
 // runAgentCheck spawns the real agent, runs a minimal prompt, and verifies the
-// sentinel token appears in the output. Returns (status, detail).
-func runAgentCheck(build func() acp.Agent, label string) (string, string) {
+// sentinel token appears in the output. When gatewayModelEnv is set and the
+// env var is present, it overrides the model via InitialConfig.Model (needed
+// for claude, whose SDK ignores ANTHROPIC_MODEL; codex sets its model via
+// CODEX_CONFIG already). Returns (status, detail).
+func runAgentCheck(build func() acp.Agent, label, gatewayModelEnv string) (string, string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
 	defer cancel()
 
@@ -279,7 +280,16 @@ func runAgentCheck(build func() acp.Agent, label string) (string, string) {
 	}), acp.RuntimeOptions{})
 
 	agent := build()
-	session, err := runtime.StartSession(ctx, acp.StartSessionOptions{Agent: agent, CWD: cwd})
+	opts := acp.StartSessionOptions{Agent: agent, CWD: cwd}
+	// When a gateway model override is set, pass it via InitialConfig.Model so
+	// the agent uses a model the gateway supports (e.g. glm-5.2 instead of a
+	// Claude model name the gateway doesn't have).
+	if gatewayModelEnv != "" {
+		if model := os.Getenv(gatewayModelEnv); model != "" {
+			opts.InitialConfig.Model = model
+		}
+	}
+	session, err := runtime.StartSession(ctx, opts)
 	if err != nil {
 		return "FAIL", fmt.Sprintf("StartSession error: %v", err)
 	}
