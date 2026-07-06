@@ -21,3 +21,4 @@ packages/*/.wrangler/
 # Legacy root-level runtime artifacts kept ignored for backwards compatibility.
 .simulator-agent-acp*/
 tmp-output.txt
+/acp-compat-check

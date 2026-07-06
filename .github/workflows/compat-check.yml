@@ -1,0 +1,109 @@
+name: compat-check
+
+# Monitors upstream ACP wrapper packages (@agentclientprotocol/claude-agent-acp,
+# @agentclientprotocol/codex-acp) for breaking changes. Runs daily and on
+# manual dispatch. If a wrapper stops producing correct output (spawn + prompt
+# smoke test fails), opens or updates a tracking GitHub Issue.
+#
+# Requires repository secrets (configure under Settings → Secrets → Actions):
+#   ANTHROPIC_API_KEY — for the claude-agent-acp smoke test
+#   OPENAI_API_KEY    — for the codex-acp smoke test (CODEX_API_KEY also works)
+# Agents whose key is absent are SKIPPED (not failed), so partial configuration
+# is fine.
+
+on:
+  schedule:
+    # Daily at 06:00 UTC (14:00 Beijing time).
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
+
+      - name: Run compat check
+        id: check
+        run: |
+          # Capture output to a file so the issue-creation step can embed it.
+          set +e
+          go run ./cmd/acp-compat-check > compat-output.txt 2>&1
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          cat compat-output.txt
+          echo "---"
+          echo "exit code: $code"
+          exit 0  # always succeed here; the issue step decides what to do
+
+      - name: Open or update regression Issue
+        if: steps.check.outputs.exit_code == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          LABEL="compat-regression"
+          TITLE="[compat-check] ACP wrapper compatibility regression detected"
+          # Render the captured output as a fenced code block in the issue body.
+          BODY=$(cat <<'BODY_EOF'
+          A scheduled compatibility check detected that at least one ACP wrapper
+          stopped producing the expected output against this runtime. This usually
+          means an upstream wrapper release introduced a breaking change.
+
+          **Action required:** investigate the failing agent(s), pin or update the
+          wrapper, and re-run the check.
+
+          ---
+
+          #### Check output
+          ```text
+          BODY_EOF
+          )
+          BODY="${BODY}$(cat compat-output.txt)"
+          BODY="${BODY}"$'\n```\n\n'"CI run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          # Check for an existing open issue with the same title to avoid dupes.
+          EXISTING=$(gh issue list --state open --search "${TITLE} in:title" --limit 1 --json number --jq '.[0].number' || true)
+          if [ -n "$EXISTING" ]; then
+            echo "Updating existing issue #$EXISTING with a new failure comment."
+            gh issue comment "$EXISTING" --body "## Regression still detected (${{ github.run_id }})
+
+          ${BODY}"
+          else
+            echo "Opening new regression issue."
+            # Create the label if it does not exist (ignore error if it does).
+            gh label create "$LABEL" --description "Upstream ACP wrapper compatibility regression" --color D73A4A 2>/dev/null || true
+            gh issue create \
+              --title "${TITLE}" \
+              --body "${BODY}" \
+              --label "$LABEL"
+          fi
+
+      - name: Close stale regression Issue (check passed)
+        if: steps.check.outputs.exit_code == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TITLE="[compat-check] ACP wrapper compatibility regression detected"
+          EXISTING=$(gh issue list --state open --search "${TITLE} in:title" --limit 1 --json number --jq '.[0].number' || true)
+          if [ -n "$EXISTING" ]; then
+            echo "Check passed; closing resolved issue #$EXISTING."
+            gh issue comment "$EXISTING" --body "✅ Compatibility check passed on run ${{ github.run_id }}. Closing this issue."
+            gh issue close "$EXISTING"
+          else
+            echo "Check passed; no open regression issue to close."
+          fi
