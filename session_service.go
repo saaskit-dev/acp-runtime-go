@@ -27,9 +27,19 @@ func (s *SessionService) Create(ctx context.Context, input StartSessionOptions) 
 			sessionMeta = profile.CreateSystemPromptSessionMeta(*input.SystemPrompt)
 		}
 	}
+	// Apply unified AgentConfig: the profile layer translates it into the
+	// agent's native format (env, _meta, etc.). Applied before the explicit
+	// Meta merge so caller Meta still wins on conflict.
+	if input.AgentConfig != nil && profile.ApplyAgentConfig != nil {
+		var configMeta map[string]any
+		agent, configMeta = profile.ApplyAgentConfig(agent, *input.AgentConfig)
+		if len(configMeta) > 0 {
+			sessionMeta = mergeSessionMeta(sessionMeta, configMeta)
+		}
+	}
 	// Merge caller-supplied Meta (e.g. Claude _meta.claudeCode.options) into the
 	// session/new _meta. Caller keys take precedence over SystemPrompt-derived
-	// meta on conflict.
+	// and AgentConfig-derived meta on conflict.
 	if len(input.Meta) > 0 {
 		sessionMeta = mergeSessionMeta(sessionMeta, input.Meta)
 	}

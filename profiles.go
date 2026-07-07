@@ -10,6 +10,12 @@ type AgentProfile struct {
 	CreateInitialConfigAliases        func(key string, value any) []any
 	CreateInitialConfigOptionSelector func(key string) InitialConfigOptionSelector
 	MapOperationKind                  func(kind string) string
+	// ApplyAgentConfig translates a unified AgentConfig into the agent's native
+	// format. Returns a potentially-modified Agent (e.g. with injected env/args)
+	// and optional session/new _meta. Called during Create() before the explicit
+	// Meta merge. nil = no translation (AgentConfig fields are ignored for that
+	// agent type, except via best-effort InitialConfig).
+	ApplyAgentConfig func(Agent, AgentConfig) (Agent, map[string]any)
 }
 
 type InitialConfigOptionSelector struct {
@@ -24,6 +30,7 @@ func ResolveAgentProfile(agent Agent) AgentProfile {
 		profile.NormalizeRuntimeAuthMethods = func(agent Agent, methods []RuntimeAuthenticationMethod) []RuntimeAuthenticationMethod {
 			return methods
 		}
+		profile.ApplyAgentConfig = applyCodexAgentConfig
 	case ClaudeCodeACPRegistryID:
 		profile.CreateInitialConfigAliases = func(key string, value any) []any {
 			if key == "mode" && value == "yolo" {
@@ -47,6 +54,7 @@ func ResolveAgentProfile(agent Agent) AgentProfile {
 			agent.Args = args
 			return agent
 		}
+		profile.ApplyAgentConfig = applyClaudeAgentConfig
 	case GitHubCopilotACPRegistryID:
 		profile.NormalizeInitializeAuthMethods = func(agent Agent, methods []AuthMethod) []AuthMethod {
 			if len(methods) > 0 {
@@ -58,6 +66,8 @@ func ResolveAgentProfile(agent Agent) AgentProfile {
 		profile.NormalizeInitializeAuthMethods = func(agent Agent, methods []AuthMethod) []AuthMethod {
 			return methods
 		}
+	case OpenCodeACPRegistryID:
+		profile.ApplyAgentConfig = applyOpenCodeAgentConfig
 	}
 	return profile
 }
@@ -107,6 +117,122 @@ func defaultAgentProfile() AgentProfile {
 				return "mcp_call"
 			}
 		},
+	}
+}
+
+// applyClaudeAgentConfig translates AgentConfig into Claude Code's native format:
+// _meta.claudeCode.options (disallowedTools, allowedTools, settings.permissions).
+// Model is handled separately via InitialConfig (the standard ACP config option).
+func applyClaudeAgentConfig(agent Agent, cfg AgentConfig) (Agent, map[string]any) {
+	opts := ClaudeCodeOptions{
+		DisallowedTools: cfg.DisallowedTools,
+		AllowedTools:    cfg.AllowedTools,
+	}
+	if len(cfg.Permissions.Deny) > 0 || len(cfg.Permissions.Allow) > 0 || len(cfg.Permissions.Ask) > 0 {
+		perm := map[string]any{}
+		if len(cfg.Permissions.Allow) > 0 {
+			perm["allow"] = cfg.Permissions.Allow
+		}
+		if len(cfg.Permissions.Deny) > 0 {
+			perm["deny"] = cfg.Permissions.Deny
+		}
+		if len(cfg.Permissions.Ask) > 0 {
+			perm["ask"] = cfg.Permissions.Ask
+		}
+		opts.Settings = map[string]any{"permissions": perm}
+	}
+	meta := CreateClaudeCodeOptions(opts)
+	// Extra fields go into claudeCode.options directly.
+	if len(cfg.Extra) > 0 {
+		mergeExtraIntoClaudeOptions(meta, cfg.Extra)
+	}
+	return agent, meta
+}
+
+// applyCodexAgentConfig translates AgentConfig into Codex's native format:
+// CODEX_CONFIG env JSON (sandbox_mode, approval_policy, model). Returns a
+// modified Agent with the env injected. No _meta (codex doesn't read it).
+func applyCodexAgentConfig(agent Agent, cfg AgentConfig) (Agent, map[string]any) {
+	codexOpts := CodexConfig{}
+	if cfg.Model != "" {
+		codexOpts.Model = cfg.Model
+	}
+	if cfg.Sandbox != "" {
+		codexOpts.SandboxMode = codexSandboxName(cfg.Sandbox)
+	}
+	if cfg.Sandbox == "read-only" {
+		codexOpts.ApprovalPolicy = "on-request"
+	}
+	if len(cfg.Permissions.Deny) > 0 {
+		codexOpts.WritableRoots = filterWritableRoots(cfg.Permissions.Deny)
+	}
+	env, err := buildCodexEnv(codexOpts, agent.Env)
+	if err != nil {
+		return agent, nil // best-effort: skip on JSON error
+	}
+	agent.Env = env
+	return agent, nil
+}
+
+// applyOpenCodeAgentConfig translates AgentConfig for OpenCode. Model goes via
+// _meta (OpenCode reads it via session config options). Permissions require a
+// opencode.json file (use WriteOpenCodeConfig separately, since the profile hook
+// has no CWD context to write to).
+func applyOpenCodeAgentConfig(agent Agent, cfg AgentConfig) (Agent, map[string]any) {
+	meta := map[string]any{}
+	if cfg.Model != "" {
+		meta["model"] = cfg.Model
+	}
+	if len(cfg.Extra) > 0 {
+		for k, v := range cfg.Extra {
+			meta[k] = v
+		}
+	}
+	if len(meta) == 0 {
+		return agent, nil
+	}
+	return agent, meta
+}
+
+// codexSandboxName maps the unified sandbox names to Codex's native names.
+func codexSandboxName(unified string) string {
+	switch unified {
+	case "read-only":
+		return "read-only"
+	case "workspace-write":
+		return "workspace-write"
+	case "full-access":
+		return "danger-full-access"
+	default:
+		return unified
+	}
+}
+
+// filterWritableRoots extracts path-like entries from a deny list for Codex's
+// writable_roots (best-effort: only entries containing "/" are treated as paths).
+func filterWritableRoots(deny []string) []string {
+	var roots []string
+	for _, d := range deny {
+		if strings.Contains(d, "/") {
+			roots = append(roots, d)
+		}
+	}
+	return roots
+}
+
+// mergeExtraIntoClaudeOptions deep-merges extra fields into the
+// _meta.claudeCode.options map.
+func mergeExtraIntoClaudeOptions(meta map[string]any, extra map[string]any) {
+	cc, ok := meta["claudeCode"].(map[string]any)
+	if !ok {
+		return
+	}
+	options, ok := cc["options"].(map[string]any)
+	if !ok {
+		return
+	}
+	for k, v := range extra {
+		options[k] = v
 	}
 }
 

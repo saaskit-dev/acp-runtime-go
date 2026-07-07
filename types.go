@@ -633,6 +633,63 @@ type ClaudeCodeOptions struct {
 	Settings map[string]any
 }
 
+// AgentConfig is a cross-agent unified configuration abstraction. Only non-zero
+// fields take effect. The profile layer (ApplyAgentConfig hook) translates each
+// field into the agent's native format:
+//   - Claude Code → _meta.claudeCode.options (disallowedTools, settings, etc.)
+//   - Codex       → CODEX_CONFIG env JSON (sandbox_mode, approval_policy)
+//   - OpenCode    → InitialConfig model + opencode.json permission (via WriteOpenCodeConfig)
+//   - other/unknown → best-effort via _meta + InitialConfig
+//
+// AgentConfig is additive to InitialConfig and Meta: it does not replace them.
+// Precedence: SystemPrompt meta < AgentConfig meta < explicit Meta.
+type AgentConfig struct {
+	Model           string           // model name (claude: sonnet, codex: gpt-5.5, opencode: glm-5.2)
+	Sandbox         string           // sandbox level: read-only / workspace-write / full-access
+	DisallowedTools []string         // tools to remove from the model's context entirely
+	AllowedTools    []string         // tools that run without a permission prompt
+	Permissions     PermissionConfig // unified permission policy
+	Extra           map[string]any   // agent-specific native fields (pass-through, no translation)
+}
+
+// PermissionConfig is the cross-agent permission policy. Each agent translates
+// these into its native permission format (Claude settings.permissions,
+// OpenCode opencode.json permission, etc.).
+type PermissionConfig struct {
+	Allow []string // rules that always pass
+	Deny  []string // rules that always block
+	Ask   []string // rules that always prompt
+}
+
+// CodexConfig is the typed form of Codex's CODEX_CONFIG env var (JSON deep-merged
+// into the Codex session config). Construct with CreateCodexConfig and pass the
+// result as Agent.Env.
+type CodexConfig struct {
+	Model          string         // e.g. "deepseek-chat", "gpt-5.5"
+	SandboxMode    string         // read-only / workspace-write / danger-full-access
+	ApprovalPolicy string         // never / on-request / untrusted / unless-trusted
+	WritableRoots  []string       // additional writable paths in workspace-write mode
+	NetworkAccess  *bool          // network access in workspace-write sandbox (nil = default)
+	Extra          map[string]any // additional native fields merged into CODEX_CONFIG JSON
+}
+
+// OpenCodeConfig is the typed form of OpenCode's opencode.json config. Because
+// OpenCode does not read _meta or env for permissions, WriteOpenCodeConfig writes
+// the file to CWD before session creation.
+type OpenCodeConfig struct {
+	Model      string             // model id
+	Provider   string             // provider id
+	Permission OpenCodePermission // permission policy
+	Extra      map[string]any     // additional native fields in opencode.json
+}
+
+// OpenCodePermission maps to opencode.json's permission key.
+type OpenCodePermission struct {
+	Allow []string // allowed tool patterns
+	Deny  []string // denied tool patterns
+	Ask   []string // always-ask tool patterns
+}
+
 type StartSessionOptions struct {
 	Agent                 Agent
 	AgentID               string
@@ -650,6 +707,13 @@ type StartSessionOptions struct {
 	// on conflict. Only session/new carries _meta; load/resume/fork ignore it
 	// per the ACP schema.
 	Meta map[string]any
+	// AgentConfig is a unified, cross-agent configuration abstraction. When set,
+	// the profile layer translates it into the agent's native format (env,
+	// _meta, CLI flags) automatically. It is additive to InitialConfig and Meta:
+	// model/sandbox/tool settings from AgentConfig are applied in addition to
+	// (not instead of) InitialConfig. Precedence on _meta: SystemPrompt <
+	// AgentConfig < explicit Meta. nil = no agent config applied.
+	AgentConfig *AgentConfig
 }
 
 type LoadSessionOptions struct {
