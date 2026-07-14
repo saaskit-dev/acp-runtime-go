@@ -279,9 +279,10 @@ func (c *Connection) SetSessionMode(ctx context.Context, req SetSessionModeReque
 	return c.peer.Call(ctx, "session/set_mode", req, &resp)
 }
 
-func (c *Connection) SetSessionConfigOption(ctx context.Context, req SetSessionConfigOptionRequest) error {
+func (c *Connection) SetSessionConfigOption(ctx context.Context, req SetSessionConfigOptionRequest) (SetSessionConfigOptionResponse, error) {
 	var resp SetSessionConfigOptionResponse
-	return c.peer.Call(ctx, "session/set_config_option", req, &resp)
+	err := c.peer.Call(ctx, "session/set_config_option", req, &resp)
+	return resp, err
 }
 
 func (c *Connection) CloseSession(ctx context.Context, req CloseSessionRequest) error {

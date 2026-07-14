@@ -179,6 +179,16 @@ func runtimeConfigOptionFromACP(option SessionConfigOption) RuntimeAgentConfigOp
 	}
 }
 
+// replaceConfigOptionsLocked replaces the runtime read model with the full
+// provider snapshot. The caller must hold d.mu for writing.
+func (d *acpSessionDriver) replaceConfigOptionsLocked(options []SessionConfigOption) {
+	next := make([]RuntimeAgentConfigOption, 0, len(options))
+	for _, option := range options {
+		next = append(next, runtimeConfigOptionFromACP(option))
+	}
+	d.metadata.AgentConfigOptions = next
+}
+
 func (d *acpSessionDriver) Close(ctx context.Context) error {
 	d.mu.Lock()
 	if d.status == "closed" {
@@ -250,14 +260,21 @@ func (d *acpSessionDriver) SetAgentMode(ctx context.Context, modeID string) erro
 }
 
 func (d *acpSessionDriver) SetAgentConfigOption(ctx context.Context, id string, value any) error {
-	if err := d.connection.SetSessionConfigOption(ctx, SetSessionConfigOptionRequest{SessionID: d.sessionID, OptionID: id, Value: value}); err != nil {
+	resp, err := d.connection.SetSessionConfigOption(ctx, SetSessionConfigOptionRequest{SessionID: d.sessionID, OptionID: id, Value: value})
+	if err != nil {
 		return err
 	}
 	d.mu.Lock()
 	d.rawConfig[id] = value
-	for i := range d.metadata.AgentConfigOptions {
-		if d.metadata.AgentConfigOptions[i].ID == id {
-			d.metadata.AgentConfigOptions[i].Value = value
+	if resp.ConfigOptions != nil {
+		d.replaceConfigOptionsLocked(*resp.ConfigOptions)
+	} else {
+		// Older providers returned an empty response. Preserve their legacy
+		// behavior while waiting for a config_option_update notification.
+		for i := range d.metadata.AgentConfigOptions {
+			if d.metadata.AgentConfigOptions[i].ID == id {
+				d.metadata.AgentConfigOptions[i].Value = value
+			}
 		}
 	}
 	d.mu.Unlock()
@@ -334,20 +351,7 @@ func (d *acpSessionDriver) handleSessionUpdate(notification SessionNotification)
 			d.metadata.CurrentModeID = update.CurrentModeID
 		}
 	case "config_option_update":
-		for _, option := range update.ConfigOptions {
-			converted := runtimeConfigOptionFromACP(option)
-			replaced := false
-			for i := range d.metadata.AgentConfigOptions {
-				if d.metadata.AgentConfigOptions[i].ID == converted.ID {
-					d.metadata.AgentConfigOptions[i] = converted
-					replaced = true
-					break
-				}
-			}
-			if !replaced {
-				d.metadata.AgentConfigOptions = append(d.metadata.AgentConfigOptions, converted)
-			}
-		}
+		d.replaceConfigOptionsLocked(update.ConfigOptions)
 	case "session_info_update":
 		if update.Title != nil {
 			d.metadata.Title = *update.Title

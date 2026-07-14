@@ -343,7 +343,12 @@ func (r *SetSessionConfigOptionRequest) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-type SetSessionConfigOptionResponse struct{}
+type SetSessionConfigOptionResponse struct {
+	// ConfigOptions is a pointer so clients can distinguish an older provider
+	// that omits the field from a provider that explicitly returns an empty
+	// full snapshot.
+	ConfigOptions *[]SessionConfigOption `json:"configOptions,omitempty"`
+}
 
 type PromptRequest struct {
 	SessionID string         `json:"sessionId"`

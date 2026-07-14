@@ -279,8 +279,9 @@ func (a *Agent) handleSetConfigOption(ctx context.Context, raw json.RawMessage) 
 		if session.ConfigOptions[i].ID == req.OptionID {
 			session.ConfigOptions[i].Value = req.Value
 			a.save(session)
-			_ = a.notify(ctx, session.ID, acp.SessionUpdate{SessionUpdate: "config_option_update", ConfigOptions: []acp.SessionConfigOption{session.ConfigOptions[i]}})
-			return acp.SetSessionConfigOptionResponse{}, nil
+			options := append([]acp.SessionConfigOption(nil), session.ConfigOptions...)
+			_ = a.notify(ctx, session.ID, acp.SessionUpdate{SessionUpdate: "config_option_update", ConfigOptions: options})
+			return acp.SetSessionConfigOptionResponse{ConfigOptions: &options}, nil
 		}
 	}
 	return nil, invalidParams("unknown config option")
