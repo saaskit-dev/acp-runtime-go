@@ -36,6 +36,9 @@ test:
 test-race:
 	go test -race ./...
 
+bench:
+	go test -run '^$$' -bench='BenchmarkPeer|BenchmarkEmit|BenchmarkHandle|BenchmarkFinish|BenchmarkSnapshot|BenchmarkThread|BenchmarkSession' -benchmem -count=3 -timeout 180s .
+
 fuzz-smoke:
 	go test -run '^$$' -fuzz=FuzzParseRPCMessage -fuzztime=2s .
 

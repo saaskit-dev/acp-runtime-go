@@ -27,6 +27,7 @@ const (
 	defaultSessionTTL     = 30 * time.Minute
 	defaultCleanupPeriod  = time.Minute
 	modelDiscoveryTimeout = 30 * time.Second
+	defaultMaxSessions    = 256
 )
 
 type Config struct {
@@ -38,12 +39,29 @@ type Config struct {
 	ResolveAgent               func(context.Context, string) (acp.Agent, error)
 	CWD                        string
 	SessionTTL                 time.Duration
-	APIKey                     string
-	AllowHeaderCWD             bool
-	Models                     []string
-	Agents                     []string
-	DiscoverModels             bool
-	ModelDiscoveryTTL          time.Duration
+	// MaxSessions caps concurrent managed persistent sessions. Zero uses
+	// defaultMaxSessions; negative disables the cap.
+	MaxSessions        int
+	APIKey             string
+	AllowHeaderCWD     bool
+	Models             []string
+	Agents             []string
+	DiscoverModels     bool
+	ModelDiscoveryTTL  time.Duration
+	// AccessLog receives one line per HTTP request when non-nil.
+	AccessLog func(AccessLogEntry)
+}
+
+// AccessLogEntry is a single HTTP request summary for gateway operators.
+type AccessLogEntry struct {
+	Method     string
+	Path       string
+	Status     int
+	Duration   time.Duration
+	SessionID  string
+	AgentID    string
+	Error      string
+	RemoteAddr string
 }
 
 type Server struct {
@@ -56,6 +74,7 @@ type Server struct {
 	defaultAgentID       string
 	cwd                  string
 	sessionTTL           time.Duration
+	maxSessions          int
 	apiKey               string
 	allowHeaderCWD       bool
 	models               []string
@@ -63,6 +82,7 @@ type Server struct {
 	discoverModels       bool
 	discoveryTTL         time.Duration
 	resolveAgent         func(context.Context, string) (acp.Agent, error)
+	accessLog            func(AccessLogEntry)
 
 	mu        sync.Mutex
 	sessions  map[string]*sessionRecord
@@ -128,6 +148,10 @@ func NewServer(config Config) *Server {
 	if ttl <= 0 {
 		ttl = defaultSessionTTL
 	}
+	maxSessions := config.MaxSessions
+	if maxSessions == 0 {
+		maxSessions = defaultMaxSessions
+	}
 	cwd := config.CWD
 	if cwd == "" {
 		cwd, _ = os.Getwd()
@@ -167,6 +191,7 @@ func NewServer(config Config) *Server {
 		defaultAgentID:       defaultAgentID,
 		cwd:                  cwd,
 		sessionTTL:           ttl,
+		maxSessions:          maxSessions,
 		apiKey:               config.APIKey,
 		allowHeaderCWD:       config.AllowHeaderCWD,
 		models:               models,
@@ -174,6 +199,7 @@ func NewServer(config Config) *Server {
 		discoverModels:       config.DiscoverModels,
 		discoveryTTL:         discoveryTTL,
 		resolveAgent:         config.ResolveAgent,
+		accessLog:            config.AccessLog,
 		sessions:             map[string]*sessionRecord{},
 		responses:            map[string]string{},
 		done:                 make(chan struct{}),
@@ -216,12 +242,13 @@ func (s *Server) Close(ctx context.Context) error {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/ready", s.handleReady)
 	mux.HandleFunc("/v1/models", s.withAuth(s.handleModels))
 	mux.HandleFunc("/v1/responses", s.withAuth(s.handleResponses))
 	mux.HandleFunc("/v1/chat/completions", s.withAuth(s.handleChatCompletions))
 	mux.HandleFunc("/v1/acp/sessions", s.withAuth(s.handleSessions))
 	mux.HandleFunc("/v1/acp/sessions/", s.withAuth(s.handleSessionByID))
-	return mux
+	return s.withAccessLog(mux)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -229,7 +256,73 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", "")
 		return
 	}
+	// Liveness: process is up.
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+}
+
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", "")
+		return
+	}
+	sessions, busy := s.sessionStats()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":       "ready",
+		"sessions":     sessions,
+		"busy":         busy,
+		"max_sessions": s.maxSessions,
+		"session_ttl":  s.sessionTTL.String(),
+		"default_agent": s.defaultAgentID,
+	})
+}
+
+func (s *Server) sessionStats() (total, busy int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	total = len(s.sessions)
+	for _, record := range s.sessions {
+		if record.isBusy() {
+			busy++
+		}
+	}
+	return total, busy
+}
+
+func (s *Server) withAccessLog(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.accessLog == nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		s.accessLog(AccessLogEntry{
+			Method:     r.Method,
+			Path:       r.URL.Path,
+			Status:     rec.status,
+			Duration:   time.Since(start),
+			SessionID:  r.Header.Get(headerSessionID),
+			RemoteAddr: r.RemoteAddr,
+		})
+	})
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+// Flush preserves streaming when the underlying writer supports it.
+func (r *statusRecorder) Flush() {
+	if flusher, ok := r.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
@@ -852,6 +945,17 @@ func (s *Server) startSession(ctx context.Context, rc requestContext) (*acp.Sess
 }
 
 func (s *Server) createPersistentSession(ctx context.Context, rc requestContext) (*sessionRecord, error) {
+	s.mu.Lock()
+	if s.maxSessions > 0 && len(s.sessions) >= s.maxSessions {
+		s.mu.Unlock()
+		return nil, sessionHTTPError{
+			status:  http.StatusTooManyRequests,
+			code:    "session_limit",
+			message: fmt.Sprintf("maximum concurrent sessions reached (%d)", s.maxSessions),
+		}
+	}
+	s.mu.Unlock()
+
 	session, err := s.startSession(ctx, rc)
 	if err != nil {
 		return nil, err
@@ -874,6 +978,15 @@ func (s *Server) createPersistentSession(ctx context.Context, rc requestContext)
 		expiresAt:   now.Add(s.sessionTTL),
 	}
 	s.mu.Lock()
+	if s.maxSessions > 0 && len(s.sessions) >= s.maxSessions {
+		s.mu.Unlock()
+		_ = session.Close(context.Background())
+		return nil, sessionHTTPError{
+			status:  http.StatusTooManyRequests,
+			code:    "session_limit",
+			message: fmt.Sprintf("maximum concurrent sessions reached (%d)", s.maxSessions),
+		}
+	}
 	s.sessions[id] = record
 	s.mu.Unlock()
 	return record, nil

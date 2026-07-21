@@ -51,7 +51,7 @@ func (s *SessionService) Create(ctx context.Context, input StartSessionOptions) 
 		if cleanupErr != nil {
 			cleanupStatus = CleanupFailed
 		}
-		return nil, &RuntimeError{
+		runtimeErr := &RuntimeError{
 			Kind:          ErrorInitialConfig,
 			Op:            "session.initial_config",
 			Msg:           "failed to apply initial config",
@@ -60,6 +60,13 @@ func (s *SessionService) Create(ctx context.Context, input StartSessionOptions) 
 			CleanupStatus: cleanupStatus,
 			CleanupError:  cleanupErr,
 		}
+		if s.options.Hooks.OnSessionEvent != nil {
+			s.options.Hooks.OnSessionEvent(RuntimeSessionEvent{Type: "cleanup_failed", SessionID: resp.SessionID, AgentType: agent.Type, Err: runtimeErr})
+		}
+		return nil, runtimeErr
+	}
+	if s.options.Hooks.OnSessionEvent != nil {
+		s.options.Hooks.OnSessionEvent(RuntimeSessionEvent{Type: "created", SessionID: resp.SessionID, AgentType: agent.Type})
 	}
 	return driver, nil
 }
@@ -119,6 +126,9 @@ func (s *SessionService) Resume(ctx context.Context, input ResumeSessionOptions)
 			CleanupStatus: CleanupNotAttempted,
 			CleanupError:  cleanupErr,
 		}
+	}
+	if s.options.Hooks.OnSessionEvent != nil {
+		s.options.Hooks.OnSessionEvent(RuntimeSessionEvent{Type: "resumed", SessionID: resp.SessionID, AgentType: agent.Type})
 	}
 	return driver, nil
 }
@@ -207,7 +217,17 @@ func (s *SessionService) bootstrap(ctx context.Context, agent Agent, cwd string,
 			}
 		}
 	}
-	return sessionBootstrap{Agent: agent, CWD: cwd, MCPServers: mcp, Connection: handle.Connection, Dispose: handle.Dispose, InitializeResponse: resp, Profile: profile}, nil
+	return sessionBootstrap{
+		Agent:              agent,
+		CWD:                cwd,
+		MCPServers:         mcp,
+		Connection:         handle.Connection,
+		Dispose:            handle.Dispose,
+		InitializeResponse: resp,
+		Profile:            profile,
+		Hooks:              s.options.Hooks,
+		ReadModelLimits:    s.options.ReadModelLimits,
+	}, nil
 }
 
 func isAuthenticationNotImplemented(err error) bool {

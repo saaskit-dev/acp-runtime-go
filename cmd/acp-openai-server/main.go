@@ -25,6 +25,7 @@ func main() {
 	var cwd string
 	var apiKey string
 	var ttl time.Duration
+	var maxSessions int
 	var allowHeaderCWD bool
 	var models string
 	var agents string
@@ -36,6 +37,7 @@ func main() {
 	flag.StringVar(&cwd, "cwd", "", "session working directory; defaults to the user home directory")
 	flag.StringVar(&apiKey, "api-key", "", "optional API key required as Bearer token or X-API-Key")
 	flag.DurationVar(&ttl, "session-ttl", 30*time.Minute, "persistent ACP session TTL")
+	flag.IntVar(&maxSessions, "max-sessions", 256, "maximum concurrent managed sessions; 0 uses default, negative disables")
 	flag.BoolVar(&allowHeaderCWD, "allow-header-cwd", false, "allow X-ACP-CWD to override working directory")
 	flag.StringVar(&models, "models", "", "comma-separated OpenAI model ids returned by /v1/models, e.g. claude/sonnet,codex/gpt-5.5")
 	flag.StringVar(&agents, "agents", "claude,codex", "comma-separated ACP agent ids or aliases; first entry is the default agent")
@@ -73,12 +75,17 @@ func main() {
 		ResolveAgent:               resolveAgent,
 		CWD:                        cwd,
 		SessionTTL:                 ttl,
+		MaxSessions:                maxSessions,
 		APIKey:                     apiKey,
 		AllowHeaderCWD:             allowHeaderCWD,
 		Models:                     splitCSV(models),
 		Agents:                     agentIDs,
 		DiscoverModels:             discoverModels,
 		ModelDiscoveryTTL:          modelDiscoveryTTL,
+		AccessLog: func(entry openaiserver.AccessLogEntry) {
+			log.Printf("%s %s status=%d dur=%s session=%s remote=%s",
+				entry.Method, entry.Path, entry.Status, entry.Duration.Round(time.Millisecond), entry.SessionID, entry.RemoteAddr)
+		},
 	})
 
 	httpServer := &http.Server{Addr: listen, Handler: server.Handler()}

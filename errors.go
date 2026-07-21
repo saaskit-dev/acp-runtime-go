@@ -54,19 +54,34 @@ func (e *RuntimeError) Error() string {
 	if e == nil {
 		return "<nil>"
 	}
-	if e.Op != "" && e.Msg != "" {
-		if e.Cause != nil {
-			return fmt.Sprintf("%s: %s: %v", e.Op, e.Msg, e.Cause)
+	var base string
+	switch {
+	case e.Op != "" && e.Msg != "" && e.Cause != nil:
+		base = fmt.Sprintf("%s: %s: %v", e.Op, e.Msg, e.Cause)
+	case e.Op != "" && e.Msg != "":
+		base = fmt.Sprintf("%s: %s", e.Op, e.Msg)
+	case e.Msg != "":
+		base = e.Msg
+	case e.Cause != nil:
+		base = e.Cause.Error()
+	default:
+		base = string(e.Kind)
+	}
+	// Append structured fields that hosts often log only via Error(). SessionID
+	// and cleanup outcome are operationally critical after failed Create/Resume.
+	if e.SessionID != "" || e.CleanupStatus != "" {
+		if e.SessionID != "" && e.CleanupStatus != "" {
+			base = fmt.Sprintf("%s (session_id=%s cleanup=%s)", base, e.SessionID, e.CleanupStatus)
+		} else if e.SessionID != "" {
+			base = fmt.Sprintf("%s (session_id=%s)", base, e.SessionID)
+		} else {
+			base = fmt.Sprintf("%s (cleanup=%s)", base, e.CleanupStatus)
 		}
-		return fmt.Sprintf("%s: %s", e.Op, e.Msg)
 	}
-	if e.Msg != "" {
-		return e.Msg
+	if e.CleanupError != nil {
+		base = fmt.Sprintf("%s (cleanup_error=%v)", base, e.CleanupError)
 	}
-	if e.Cause != nil {
-		return e.Cause.Error()
-	}
-	return string(e.Kind)
+	return base
 }
 
 func (e *RuntimeError) Unwrap() error {

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -716,6 +717,62 @@ func TestCleanupExpiredSkipsBusySessions(t *testing.T) {
 	if _, ok := app.getSession(sessionID); ok {
 		t.Fatal("expired idle session still registered after cleanup")
 	}
+}
+
+
+func TestCreatePersistentSessionEnforcesMaxSessions(t *testing.T) {
+	app, server := newTestAppServer(t)
+	app.maxSessions = 1
+	first := createPersistentSession(t, server, "owner-a")
+	if first == "" {
+		t.Fatal("first session id empty")
+	}
+	rc := requestContext{
+		ownerHash:   ownerHashFromRequest(&http.Request{Header: http.Header{"Authorization": []string{"Bearer owner-b"}}}),
+		agentID:     app.defaultAgentID,
+		cwd:         app.cwd,
+		fingerprint: "fp-owner-b",
+	}
+	_, err := app.createPersistentSession(context.Background(), rc)
+	if err == nil {
+		t.Fatal("createPersistentSession error = nil, want session_limit")
+	}
+	var httpErr sessionHTTPError
+	if !errors.As(err, &httpErr) {
+		// sessionHTTPError may be returned by value; try direct assert.
+		if se, ok := err.(sessionHTTPError); ok {
+			httpErr = se
+		} else {
+			t.Fatalf("createPersistentSession error = %#v (%T), want sessionHTTPError", err, err)
+		}
+	}
+	if httpErr.status != http.StatusTooManyRequests || httpErr.code != "session_limit" {
+		t.Fatalf("error = %#v, want 429 session_limit", httpErr)
+	}
+}
+
+func TestReadyReportsSessionStats(t *testing.T) {
+	app, server := newTestAppServer(t)
+	_ = createPersistentSession(t, server, "owner-a")
+	resp, err := http.Get(server.URL + "/ready")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body["status"] != "ready" {
+		t.Fatalf("status = %#v", body["status"])
+	}
+	if body["sessions"] == nil {
+		t.Fatalf("sessions missing: %#v", body)
+	}
+	_ = app
 }
 
 func TestTryBeginRefreshesExpiry(t *testing.T) {

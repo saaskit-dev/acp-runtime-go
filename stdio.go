@@ -101,15 +101,21 @@ func NewStdioConnectionFactory(options StdioFactoryOptions) ConnectionFactory {
 							if cmd.Process != nil {
 								_ = signalProcessTree(processGroupID, cmd.Process, syscall.SIGKILL)
 							}
-							// Wait without the caller's context. The teardown goroutine is the
-							// process owner after Dispose starts, so a timed-out caller cannot
-							// orphan the process or consume the only cleanup attempt.
-							err := <-waitCh
-							_ = signalProcessTree(processGroupID, nil, syscall.SIGKILL)
-							if err != nil && !errors.Is(err, context.Canceled) {
-								teardownErr = fmt.Errorf("agent process required forced teardown: %w; stderr tail: %s", err, stderr.String())
-							} else {
-								teardownErr = fmt.Errorf("agent process required forced teardown; stderr tail: %s", stderr.String())
+							// Hard-cap the final Wait after SIGKILL so a stuck reaper
+							// cannot pin the teardown goroutine forever. Callers that
+							// timed out earlier still cannot orphan the only cleanup
+							// attempt; we just stop waiting for an unkillable tree.
+							select {
+							case err := <-waitCh:
+								_ = signalProcessTree(processGroupID, nil, syscall.SIGKILL)
+								if err != nil && !errors.Is(err, context.Canceled) {
+									teardownErr = fmt.Errorf("agent process required forced teardown: %w; stderr tail: %s", err, stderr.String())
+								} else {
+									teardownErr = fmt.Errorf("agent process required forced teardown; stderr tail: %s", stderr.String())
+								}
+							case <-time.After(3 * time.Second):
+								_ = signalProcessTree(processGroupID, nil, syscall.SIGKILL)
+								teardownErr = fmt.Errorf("agent process did not exit after SIGKILL; stderr tail: %s", stderr.String())
 							}
 						}
 					}

@@ -502,6 +502,48 @@ type RuntimeOptions struct {
 	AuthenticationHandler AuthenticationHandler
 	AuthorityHandlers     AuthorityHandlers
 	Observability         ObservabilityOptions
+	// Hooks is an optional lightweight observability surface for hosts that want
+	// session/turn/process lifecycle signals without pulling in a full metrics
+	// stack. Nil fields are ignored.
+	Hooks RuntimeHooks
+	// ReadModelLimits bounds in-memory session history. Zero fields use defaults.
+	ReadModelLimits ReadModelLimits
+}
+
+// RuntimeHooks are best-effort callbacks for operational telemetry. Implementations
+// must be non-blocking; the runtime may invoke them on RPC or process paths.
+type RuntimeHooks struct {
+	OnSessionEvent func(RuntimeSessionEvent)
+	OnTurnEvent    func(RuntimeTurnEvent)
+	OnProcessEvent func(RuntimeProcessEvent)
+	OnEventDrop    func(RuntimeEventDrop)
+}
+
+type RuntimeSessionEvent struct {
+	Type      string // created | resumed | loaded | forked | closed | deleted | cleanup_failed
+	SessionID string
+	AgentType string
+	Err       error
+}
+
+type RuntimeTurnEvent struct {
+	Type      string // started | completed | failed | cancelled | coalesced
+	SessionID string
+	TurnID    string
+	Duration  time.Duration
+	Err       error
+}
+
+type RuntimeProcessEvent struct {
+	Type    string // spawn | teardown | force_kill | wait_timeout
+	Command string
+	Err     error
+}
+
+type RuntimeEventDrop struct {
+	SessionID string
+	TurnID    string
+	EventType string
 }
 
 type AuthenticationHandler func(ctx Context, methods []RuntimeAuthenticationMethod) (RuntimeAuthenticationDecision, error)
@@ -608,6 +650,23 @@ type TerminalExitStatus struct {
 type ObservabilityOptions struct {
 	CaptureContent  string
 	OnProtocolError ProtocolErrorHandler
+}
+
+// Default read-model caps keep long-lived sessions from retaining unbounded
+// history. Zero means "use default"; negative means unlimited.
+const (
+	DefaultMaxThreadEntries      = 256
+	DefaultMaxToolCallEntries    = 128
+	DefaultMaxPermissionEntries  = 64
+)
+
+// ReadModelLimits bounds in-memory session history retained for Snapshot and
+// query APIs. Completed tool/permission entries are dropped first; thread is a
+// FIFO ring of the most recent messages.
+type ReadModelLimits struct {
+	MaxThreadEntries     int
+	MaxToolCallEntries   int
+	MaxPermissionEntries int
 }
 
 type ProtocolErrorHandler func(ctx Context, event ProtocolErrorEvent)
