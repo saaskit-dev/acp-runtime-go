@@ -65,6 +65,9 @@ type activeTurn struct {
 	// handleSessionUpdate (toolCalls/operations maps, outputText) still occurs
 	// regardless, so the read model stays consistent.
 	dropIntermediate bool
+	// finishOnce ensures Close/Delete racing with runPrompt only terminalizes
+	// the turn once, so completion/events channels are closed exactly once.
+	finishOnce sync.Once
 }
 
 type sessionBootstrap struct {
@@ -205,13 +208,8 @@ func (d *acpSessionDriver) replaceConfigOptionsLocked(options []SessionConfigOpt
 }
 
 func (d *acpSessionDriver) Close(ctx context.Context) error {
-	d.mu.Lock()
-	if d.status == "closed" {
-		d.mu.Unlock()
-		return nil
-	}
-	d.status = "closed"
-	d.mu.Unlock()
+	active := d.beginClose()
+	d.finishInFlightTurn(ctx, active, "session.close")
 	_ = d.connection.CloseSession(ctx, CloseSessionRequest{SessionID: d.sessionID})
 	if d.dispose != nil {
 		return d.dispose(ctx)
@@ -224,19 +222,40 @@ func (d *acpSessionDriver) Close(ctx context.Context) error {
 // implement session/delete will return an error, which the caller may treat as
 // non-fatal (the session is still closed locally).
 func (d *acpSessionDriver) Delete(ctx context.Context) error {
-	d.mu.Lock()
-	if d.status == "closed" {
-		d.mu.Unlock()
-		return nil
-	}
-	d.status = "closed"
-	d.mu.Unlock()
+	active := d.beginClose()
+	d.finishInFlightTurn(ctx, active, "session.delete")
 	deleteErr := d.connection.DeleteSession(ctx, DeleteSessionRequest{SessionID: d.sessionID})
 	var disposeErr error
 	if d.dispose != nil {
 		disposeErr = d.dispose(ctx)
 	}
 	return errors.Join(deleteErr, disposeErr)
+}
+
+// beginClose marks the driver closed and returns any in-flight turn. Callers
+// must terminalize that turn so consumers waiting on Completion do not hang.
+func (d *acpSessionDriver) beginClose() *activeTurn {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.status == "closed" {
+		return nil
+	}
+	d.status = "closed"
+	return d.currentTurn
+}
+
+func (d *acpSessionDriver) finishInFlightTurn(ctx context.Context, active *activeTurn, op string) {
+	if active == nil {
+		return
+	}
+	// Best-effort cooperative cancel before local terminalization. Agents may
+	// ignore session/cancel; finishTurn still unblocks host consumers.
+	_ = d.connection.Cancel(ctx, CancelRequest{SessionID: d.sessionID})
+	d.finishTurn(active, TurnCompletion{}, &RuntimeError{
+		Kind: ErrorSessionClosed,
+		Op:   op,
+		Msg:  "session closed during turn",
+	})
 }
 
 // Logout asks the agent to discard cached credentials (logout). Unlike
@@ -299,6 +318,20 @@ func (d *acpSessionDriver) SetAgentConfigOption(ctx context.Context, id string, 
 
 func (d *acpSessionDriver) StartTurn(ctx context.Context, prompt RuntimePrompt) TurnHandle {
 	d.mu.Lock()
+	if d.status == "closed" {
+		d.mu.Unlock()
+		return closedTurnHandle(&RuntimeError{Kind: ErrorSessionClosed, Op: "session.start_turn", Msg: "session is closed"})
+	}
+	// Single-flight: concurrent turns would race on currentTurn routing and the
+	// shared read model. Reject instead of silently overwriting the active turn.
+	if d.currentTurn != nil {
+		d.mu.Unlock()
+		return closedTurnHandle(&RuntimeError{
+			Kind: ErrorTurnCoalesced,
+			Op:   "session.start_turn",
+			Msg:  "a turn is already running",
+		})
+	}
 	d.turnSeq++
 	turnID := fmt.Sprintf("turn-%d", d.turnSeq)
 	active := &activeTurn{
@@ -311,7 +344,7 @@ func (d *acpSessionDriver) StartTurn(ctx context.Context, prompt RuntimePrompt) 
 	d.status = "running"
 	d.thread = append(d.thread, ThreadEntry{ID: turnID + "-user", Kind: "user_message", Status: "completed", Text: promptText(prompt), CreatedAt: time.Now(), UpdatedAt: time.Now()})
 	d.mu.Unlock()
-	active.events <- TurnEvent{Type: "started", TurnID: turnID}
+	d.emitTurnEvent(active, TurnEvent{Type: "started", TurnID: turnID})
 	go d.runPrompt(ctx, active, prompt)
 	return TurnHandle{TurnID: turnID, Events: active.events, Completion: active.completion}
 }
@@ -329,25 +362,61 @@ func (d *acpSessionDriver) runPrompt(ctx context.Context, active *activeTurn, pr
 	d.finishTurn(active, completion, nil)
 }
 
+// emitTurnEvent non-blockingly delivers an intermediate event. A full buffer
+// drops the event so session/update handling never stalls the peer read loop.
+// Read-model mutation happens before emit and is unaffected by drops.
+func (d *acpSessionDriver) emitTurnEvent(active *activeTurn, event TurnEvent) {
+	if active == nil {
+		return
+	}
+	select {
+	case active.events <- event:
+	default:
+	}
+}
+
 func (d *acpSessionDriver) finishTurn(active *activeTurn, completion TurnCompletion, err error) {
-	d.mu.Lock()
-	if d.currentTurn == active {
-		d.currentTurn = nil
-		d.status = "ready"
+	if active == nil {
+		return
 	}
-	if err == nil {
-		d.thread = append(d.thread, ThreadEntry{ID: active.id + "-assistant", Kind: "assistant_message", Status: "completed", Text: completion.OutputText, CreatedAt: time.Now(), UpdatedAt: time.Now()})
-	}
-	d.mu.Unlock()
-	if err != nil {
-		active.events <- TurnEvent{Type: "failed", TurnID: active.id, Error: err}
-		active.completion <- TurnResult{Err: err}
-	} else {
-		active.events <- TurnEvent{Type: "completed", TurnID: active.id, Completion: &completion}
-		active.completion <- TurnResult{Completion: completion}
-	}
-	close(active.events)
-	close(active.completion)
+	active.finishOnce.Do(func() {
+		d.mu.Lock()
+		if d.currentTurn == active {
+			d.currentTurn = nil
+			if d.status != "closed" {
+				d.status = "ready"
+			}
+		}
+		if err == nil {
+			d.thread = append(d.thread, ThreadEntry{ID: active.id + "-assistant", Kind: "assistant_message", Status: "completed", Text: completion.OutputText, CreatedAt: time.Now(), UpdatedAt: time.Now()})
+		}
+		d.mu.Unlock()
+
+		// Completion first: Session.Run only waits on Completion and may never
+		// drain Events. Delivering completion before the terminal event keeps
+		// Run unblocked even when the events buffer is full of intermediates.
+		if err != nil {
+			select {
+			case active.completion <- TurnResult{Err: err}:
+			default:
+			}
+			select {
+			case active.events <- TurnEvent{Type: "failed", TurnID: active.id, Error: err}:
+			default:
+			}
+		} else {
+			select {
+			case active.completion <- TurnResult{Completion: completion}:
+			default:
+			}
+			select {
+			case active.events <- TurnEvent{Type: "completed", TurnID: active.id, Completion: &completion}:
+			default:
+			}
+		}
+		close(active.events)
+		close(active.completion)
+	})
 }
 
 func (d *acpSessionDriver) handleSessionUpdate(notification SessionNotification) {
@@ -428,31 +497,30 @@ func (d *acpSessionDriver) handleSessionUpdate(notification SessionNotification)
 		}
 	}
 	d.mu.Unlock()
-	if active != nil {
-		// In "drop" delivery mode the consumer only wants the final completion;
-		// suppress intermediate events but keep mutating the read model above.
-		if active.dropIntermediate {
-			return
-		}
-		switch update.SessionUpdate {
-		case "agent_message_chunk":
-			active.events <- TurnEvent{Type: "text", TurnID: active.id, Text: sessionUpdateText(update)}
-		case "agent_thought_chunk":
-			active.events <- TurnEvent{Type: "thinking", TurnID: active.id, Thinking: sessionUpdateText(update)}
-		case "plan":
-			active.events <- TurnEvent{Type: "plan_updated", TurnID: active.id, Plan: update.Entries}
-		case "usage_update":
-			active.events <- TurnEvent{Type: "usage_updated", TurnID: active.id, Usage: update.Usage}
-		case "session_info_update", "available_commands_update":
-			active.events <- TurnEvent{Type: "metadata_updated", TurnID: active.id}
-		case "tool_call", "tool_call_update":
-			if update.ToolCallID != "" {
-				d.mu.RLock()
-				tool := d.toolCalls[update.ToolCallID]
-				op := d.operations[update.ToolCallID]
-				d.mu.RUnlock()
-				active.events <- TurnEvent{Type: "operation_updated", TurnID: active.id, ToolCall: &tool, Operation: &op}
-			}
+	if active == nil || active.dropIntermediate {
+		// "drop" delivery still mutates the read model above; only the event
+		// stream is suppressed. nil active means no in-flight turn.
+		return
+	}
+	switch update.SessionUpdate {
+	case "agent_message_chunk":
+		// Text was already folded into outputText above; recompute once for the event.
+		d.emitTurnEvent(active, TurnEvent{Type: "text", TurnID: active.id, Text: sessionUpdateText(update)})
+	case "agent_thought_chunk":
+		d.emitTurnEvent(active, TurnEvent{Type: "thinking", TurnID: active.id, Thinking: sessionUpdateText(update)})
+	case "plan":
+		d.emitTurnEvent(active, TurnEvent{Type: "plan_updated", TurnID: active.id, Plan: update.Entries})
+	case "usage_update":
+		d.emitTurnEvent(active, TurnEvent{Type: "usage_updated", TurnID: active.id, Usage: update.Usage})
+	case "session_info_update", "available_commands_update":
+		d.emitTurnEvent(active, TurnEvent{Type: "metadata_updated", TurnID: active.id})
+	case "tool_call", "tool_call_update":
+		if update.ToolCallID != "" {
+			d.mu.RLock()
+			tool := d.toolCalls[update.ToolCallID]
+			op := d.operations[update.ToolCallID]
+			d.mu.RUnlock()
+			d.emitTurnEvent(active, TurnEvent{Type: "operation_updated", TurnID: active.id, ToolCall: &tool, Operation: &op})
 		}
 	}
 }

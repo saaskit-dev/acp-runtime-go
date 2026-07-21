@@ -688,20 +688,65 @@ func TestCleanupExpiredDeletesOnlyRegisteredManagedSessions(t *testing.T) {
 	}
 }
 
+func TestCleanupExpiredSkipsBusySessions(t *testing.T) {
+	app, server := newTestAppServer(t)
+	sessionID := createPersistentSession(t, server, "owner-a")
+	record, ok := app.getSession(sessionID)
+	if !ok {
+		t.Fatalf("session not registered")
+	}
+	if !record.tryBegin(time.Minute) {
+		t.Fatal("tryBegin() = false, want true")
+	}
+	// Expire wall-clock TTL while the turn is still busy.
+	record.mu.Lock()
+	record.expiresAt = time.Now().Add(-time.Second)
+	record.mu.Unlock()
+
+	app.cleanupExpired()
+	if _, ok := app.getSession(sessionID); !ok {
+		t.Fatal("busy session was cleaned up despite active turn")
+	}
+	record.end(false, time.Minute)
+	// Force expiry again after the turn ends; cleanup should now remove it.
+	record.mu.Lock()
+	record.expiresAt = time.Now().Add(-time.Second)
+	record.mu.Unlock()
+	app.cleanupExpired()
+	if _, ok := app.getSession(sessionID); ok {
+		t.Fatal("expired idle session still registered after cleanup")
+	}
+}
+
+func TestTryBeginRefreshesExpiry(t *testing.T) {
+	record := &sessionRecord{
+		managed:   true,
+		expiresAt: time.Now().Add(time.Second),
+	}
+	before := record.expiresAt
+	if !record.tryBegin(30 * time.Minute) {
+		t.Fatal("tryBegin() = false, want true")
+	}
+	if !record.expiresAt.After(before.Add(time.Minute)) {
+		t.Fatalf("expiresAt not refreshed on tryBegin: before=%v after=%v", before, record.expiresAt)
+	}
+	record.end(false, time.Minute)
+}
+
 func TestSessionRecordBusyState(t *testing.T) {
 	record := &sessionRecord{managed: true}
-	if !record.tryBegin() {
+	if !record.tryBegin(time.Minute) {
 		t.Fatalf("first tryBegin() = false, want true")
 	}
-	if record.tryBegin() {
+	if record.tryBegin(time.Minute) {
 		t.Fatalf("second tryBegin() = true, want false while busy")
 	}
 	record.end(false, time.Minute)
-	if !record.tryBegin() {
+	if !record.tryBegin(time.Minute) {
 		t.Fatalf("tryBegin() after end = false, want true")
 	}
 	record.end(true, time.Minute)
-	if record.tryBegin() {
+	if record.tryBegin(time.Minute) {
 		t.Fatalf("tryBegin() after taint = true, want false")
 	}
 }

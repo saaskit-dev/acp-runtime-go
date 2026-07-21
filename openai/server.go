@@ -908,7 +908,7 @@ func (s *Server) validatePersistentSession(id string, rc requestContext) (*sessi
 }
 
 func (s *Server) runPersistent(ctx context.Context, record *sessionRecord, req chatCompletionRequest, incremental bool) (acp.TurnCompletion, error) {
-	if !record.tryBegin() {
+	if !record.tryBegin(s.sessionTTL) {
 		return acp.TurnCompletion{}, sessionHTTPError{status: http.StatusConflict, code: "session_busy", message: "ACP session is busy"}
 	}
 	defer record.end(false, s.sessionTTL)
@@ -917,7 +917,7 @@ func (s *Server) runPersistent(ctx context.Context, record *sessionRecord, req c
 }
 
 func (s *Server) streamPersistent(ctx context.Context, w http.ResponseWriter, record *sessionRecord, req chatCompletionRequest, incremental bool) {
-	if !record.tryBegin() {
+	if !record.tryBegin(s.sessionTTL) {
 		writeError(w, http.StatusConflict, "session_busy", "ACP session is busy", "")
 		return
 	}
@@ -932,7 +932,7 @@ func (s *Server) streamTemporary(ctx context.Context, w http.ResponseWriter, ses
 }
 
 func (s *Server) runResponsePersistent(ctx context.Context, record *sessionRecord, req responseRequest, incremental bool) (acp.TurnCompletion, error) {
-	if !record.tryBegin() {
+	if !record.tryBegin(s.sessionTTL) {
 		return acp.TurnCompletion{}, sessionHTTPError{status: http.StatusConflict, code: "session_busy", message: "ACP session is busy"}
 	}
 	defer record.end(false, s.sessionTTL)
@@ -940,7 +940,7 @@ func (s *Server) runResponsePersistent(ctx context.Context, record *sessionRecor
 }
 
 func (s *Server) streamResponsePersistent(ctx context.Context, w http.ResponseWriter, record *sessionRecord, req responseRequest, responseID string, incremental bool) {
-	if !record.tryBegin() {
+	if !record.tryBegin(s.sessionTTL) {
 		writeError(w, http.StatusConflict, "session_busy", "ACP session is busy", "")
 		return
 	}
@@ -1088,13 +1088,20 @@ func (s *Server) streamResponseTurn(ctx context.Context, w http.ResponseWriter, 
 	flusher.Flush()
 }
 
-func (r *sessionRecord) tryBegin() bool {
+func (r *sessionRecord) tryBegin(ttl time.Duration) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.busy || r.tainted {
 		return false
 	}
 	r.busy = true
+	// Refresh TTL when a turn starts so long-running turns are not cleaned up
+	// mid-flight by the expiry loop.
+	now := time.Now()
+	r.lastSeenAt = now
+	if ttl > 0 {
+		r.expiresAt = now.Add(ttl)
+	}
 	return true
 }
 
@@ -1108,6 +1115,14 @@ func (r *sessionRecord) end(tainted bool, ttl time.Duration) {
 	now := time.Now()
 	r.lastSeenAt = now
 	r.expiresAt = now.Add(ttl)
+}
+
+// isBusy reports whether a turn is in flight. Used by cleanup to skip sessions
+// that must not be closed under the host's feet.
+func (r *sessionRecord) isBusy() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.busy
 }
 
 func (s *Server) getSession(id string) (*sessionRecord, bool) {
@@ -1142,11 +1157,17 @@ func (s *Server) cleanupExpired() {
 	var expired []*sessionRecord
 	s.mu.Lock()
 	for id, record := range s.sessions {
-		if now.After(record.expiresAt) {
-			delete(s.sessions, id)
-			s.removeResponseAliasesLocked(id)
-			expired = append(expired, record)
+		if !now.After(record.expiresAt) {
+			continue
 		}
+		// Never tear down a session mid-turn. tryBegin refreshes expiresAt, so a
+		// busy session should rarely appear here; skip defensively if it does.
+		if record.isBusy() {
+			continue
+		}
+		delete(s.sessions, id)
+		s.removeResponseAliasesLocked(id)
+		expired = append(expired, record)
 	}
 	s.mu.Unlock()
 	for _, record := range expired {
