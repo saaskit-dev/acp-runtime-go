@@ -2,8 +2,15 @@ package acpruntime
 
 import "fmt"
 
-// CleanupStatus describes whether a failed session operation left a durable
-// provider-side session behind.
+// CleanupStatus describes durable provider-side session cleanup after a failed
+// session operation. It does not describe process/connection teardown.
+//
+//   - CleanupSucceeded: the runtime deleted the durable session (e.g. Create
+//     failed after session/new and session/delete completed).
+//   - CleanupFailed: durable delete was attempted and failed; SessionID may still
+//     exist on the provider.
+//   - CleanupNotAttempted: durable delete was intentionally skipped (e.g. Resume
+//     initial-config failure must not destroy an existing session).
 type CleanupStatus string
 
 const (

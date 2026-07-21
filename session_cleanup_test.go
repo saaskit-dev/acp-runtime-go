@@ -50,6 +50,64 @@ func TestRuntimeInitialConfigFailureReturnsCleanupOutcome(t *testing.T) {
 	}
 }
 
+// TestRuntimeResumeInitialConfigFailureReturnsSessionID verifies that a failed
+// initial config after a successful session/resume reports the durable SessionID
+// and marks durable cleanup as not_attempted (existing sessions must not be
+// deleted). Connection teardown errors surface in CleanupError only.
+func TestRuntimeResumeInitialConfigFailureReturnsSessionID(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	storage := t.TempDir()
+	cwd := t.TempDir()
+	agent := Agent{
+		Type:    LocalSimulatorAgentACPRegistryID,
+		Command: buildSimulatorBinary(t),
+		Args:    []string{"--auth-mode", "none", "--storage-dir", storage},
+	}
+	runtime := NewRuntime(NewStdioConnectionFactory(StdioFactoryOptions{}), RuntimeOptions{
+		StoredSessionsEnabled: true,
+	})
+	created, err := runtime.StartSession(ctx, StartSessionOptions{Agent: agent, CWD: cwd})
+	if err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+	defer created.Close(context.Background())
+	sessionID := created.Snapshot().Session.ID
+	if sessionID == "" {
+		t.Fatal("created session ID is empty")
+	}
+
+	// Resume opens a second connection against the same durable SessionID. Keep
+	// the creator process alive so the simulator still has the stored session.
+	_, err = runtime.ResumeSession(ctx, ResumeSessionOptions{
+		StartSessionOptions: StartSessionOptions{
+			Agent: agent,
+			CWD:   cwd,
+			InitialConfig: InitialConfig{
+				Mode: "mode-that-was-not-advertised",
+			},
+		},
+		SessionID: sessionID,
+	})
+	if err == nil {
+		t.Fatal("ResumeSession() error = nil, want initial config failure")
+	}
+	var runtimeErr *RuntimeError
+	if !errors.As(err, &runtimeErr) {
+		t.Fatalf("ResumeSession() error = %T, want *RuntimeError", err)
+	}
+	if runtimeErr.Kind != ErrorInitialConfig {
+		t.Fatalf("RuntimeError.Kind = %q, want %q", runtimeErr.Kind, ErrorInitialConfig)
+	}
+	if runtimeErr.SessionID != sessionID {
+		t.Fatalf("RuntimeError.SessionID = %q, want %q", runtimeErr.SessionID, sessionID)
+	}
+	if runtimeErr.CleanupStatus != CleanupNotAttempted {
+		t.Fatalf("RuntimeError.CleanupStatus = %q, want %q; cleanup error=%v", runtimeErr.CleanupStatus, CleanupNotAttempted, runtimeErr.CleanupError)
+	}
+}
+
 func TestSessionDeletePropagatesProviderCleanupFailure(t *testing.T) {
 	providerReader, runtimeWriter := io.Pipe()
 	runtimeReader, providerWriter := io.Pipe()

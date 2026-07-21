@@ -706,18 +706,19 @@ type StartSessionOptions struct {
 	InitialConfig         InitialConfig
 	Queue                 QueuePolicyInput
 	Handlers              AuthorityHandlers
-	// Meta is merged into the session/new _meta object alongside any
-	// SystemPrompt-derived meta and is forwarded unchanged by session/resume.
-	// Use this to pass agent-specific structured configuration (e.g. Claude
-	// Code's _meta.claudeCode.options to disable tools). Top-level keys from
-	// Meta take precedence over SystemPrompt meta on conflict.
+	// Meta is merged into the session _meta object sent on session/new (Create)
+	// and session/resume (Resume). SystemPrompt-derived and AgentConfig-derived
+	// meta are merged first; explicit Meta wins on conflict. Use this to pass
+	// agent-specific structured configuration (e.g. Claude Code's
+	// _meta.claudeCode.options to disable tools). Load/Fork do not send _meta.
 	Meta map[string]any
 	// AgentConfig is a unified, cross-agent configuration abstraction. When set,
 	// the profile layer translates it into the agent's native format (env,
-	// _meta, CLI flags) automatically. It is additive to InitialConfig and Meta:
-	// model/sandbox/tool settings from AgentConfig are applied in addition to
-	// (not instead of) InitialConfig. Precedence on _meta: SystemPrompt <
-	// AgentConfig < explicit Meta. nil = no agent config applied.
+	// _meta, CLI flags) automatically for Create and Resume. It is additive to
+	// InitialConfig and Meta: model/sandbox/tool settings from AgentConfig are
+	// applied in addition to (not instead of) InitialConfig. Precedence on
+	// _meta: SystemPrompt < AgentConfig < explicit Meta. nil = no agent config
+	// applied.
 	AgentConfig *AgentConfig
 }
 

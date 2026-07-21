@@ -231,10 +231,10 @@ func TestStartSessionMetaPassthrough(t *testing.T) {
 	}
 }
 
-// TestResumeSessionMetaPassthrough verifies that ResumeSessionOptions.Meta is
-// forwarded to the session/resume _meta on the wire. This is a protocol-boundary
-// regression test: checking only the in-memory options would miss a request
-// type that silently drops _meta during JSON-RPC serialization.
+// TestResumeSessionMetaPassthrough verifies that Resume uses the same Meta merge
+// path as Create: SystemPrompt-derived meta and explicit Meta both appear on the
+// session/resume wire payload. Checking only in-memory options would miss a
+// request type that silently drops _meta during JSON-RPC serialization.
 func TestResumeSessionMetaPassthrough(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -270,8 +270,9 @@ func TestResumeSessionMetaPassthrough(t *testing.T) {
 	runtime := NewRuntime(factory, RuntimeOptions{})
 	resumed, err := runtime.ResumeSession(ctx, ResumeSessionOptions{
 		StartSessionOptions: StartSessionOptions{
-			Agent: agent,
-			CWD:   cwd,
+			Agent:        agent,
+			CWD:          cwd,
+			SystemPrompt: &SystemPrompt{Text: "be brief"},
 			Meta: map[string]any{
 				"claudeCode": map[string]any{
 					"options": map[string]any{
@@ -292,6 +293,9 @@ func TestResumeSessionMetaPassthrough(t *testing.T) {
 	captureMu.Unlock()
 	if snapshot == nil {
 		t.Fatalf("no outbound session/resume captured")
+	}
+	if !bytes.Contains(snapshot, []byte(`"systemPrompt":"be brief"`)) {
+		t.Fatalf("session/resume missing SystemPrompt-derived _meta: %s", snapshot)
 	}
 	if !bytes.Contains(snapshot, []byte(`"claudeCode"`)) ||
 		!bytes.Contains(snapshot, []byte(`"options"`)) ||

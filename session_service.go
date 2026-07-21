@@ -29,32 +29,7 @@ func NewSessionService(factory ConnectionFactory, options RuntimeOptions) *Sessi
 
 func (s *SessionService) Create(ctx context.Context, input StartSessionOptions) (SessionDriver, error) {
 	profile := ResolveAgentProfile(input.Agent)
-	agent := input.Agent
-	var sessionMeta map[string]any
-	if input.SystemPrompt != nil {
-		if profile.ApplySystemPromptToAgent != nil {
-			agent = profile.ApplySystemPromptToAgent(agent, *input.SystemPrompt)
-		}
-		if profile.CreateSystemPromptSessionMeta != nil {
-			sessionMeta = profile.CreateSystemPromptSessionMeta(*input.SystemPrompt)
-		}
-	}
-	// Apply unified AgentConfig: the profile layer translates it into the
-	// agent's native format (env, _meta, etc.). Applied before the explicit
-	// Meta merge so caller Meta still wins on conflict.
-	if input.AgentConfig != nil && profile.ApplyAgentConfig != nil {
-		var configMeta map[string]any
-		agent, configMeta = profile.ApplyAgentConfig(agent, *input.AgentConfig)
-		if len(configMeta) > 0 {
-			sessionMeta = mergeSessionMeta(sessionMeta, configMeta)
-		}
-	}
-	// Merge caller-supplied Meta (e.g. Claude _meta.claudeCode.options) into the
-	// session/new _meta. Caller keys take precedence over SystemPrompt-derived
-	// and AgentConfig-derived meta on conflict.
-	if len(input.Meta) > 0 {
-		sessionMeta = mergeSessionMeta(sessionMeta, input.Meta)
-	}
+	agent, sessionMeta := prepareAgentSessionStart(profile, input)
 	bootstrap, err := s.bootstrap(ctx, agent, input.CWD, input.MCPServers, input.Handlers, profile)
 	if err != nil {
 		return nil, wrapError(ErrorCreate, "session.start", "failed to bootstrap ACP session", err)
@@ -69,6 +44,8 @@ func (s *SessionService) Create(ctx context.Context, input StartSessionOptions) 
 	bootstrap.SessionResponse = resp
 	driver := newACPSessionDriver(bootstrap)
 	if _, err := applyInitialConfig(ctx, driver, input.InitialConfig, profile); err != nil {
+		// session/new already created a durable provider session; delete it so a
+		// failed initial config does not leave an orphan behind.
 		cleanupErr := runSessionCleanup(driver.Delete)
 		cleanupStatus := CleanupSucceeded
 		if cleanupErr != nil {
@@ -102,12 +79,22 @@ func (s *SessionService) Load(ctx context.Context, input LoadSessionOptions) (Se
 }
 
 func (s *SessionService) Resume(ctx context.Context, input ResumeSessionOptions) (SessionDriver, error) {
-	bootstrap, err := s.bootstrap(ctx, input.Agent, input.CWD, input.MCPServers, input.Handlers, ResolveAgentProfile(input.Agent))
+	profile := ResolveAgentProfile(input.Agent)
+	// Resume uses the same SystemPrompt / AgentConfig / Meta merge path as Create
+	// so hosts can pass the same StartSessionOptions without re-assembling _meta.
+	agent, sessionMeta := prepareAgentSessionStart(profile, input.StartSessionOptions)
+	bootstrap, err := s.bootstrap(ctx, agent, input.CWD, input.MCPServers, input.Handlers, profile)
 	if err != nil {
 		return nil, wrapError(ErrorResume, "session.resume", "failed to bootstrap ACP session", err)
 	}
 	bootstrap.QueuePolicy = resolveQueuePolicy(input.Queue)
-	resp, err := bootstrap.Connection.ResumeSession(ctx, ResumeSessionRequest{SessionID: input.SessionID, CWD: input.CWD, MCPServers: normalizeMCPServers(input.MCPServers), AdditionalDirectories: input.AdditionalDirectories, Meta: input.Meta})
+	resp, err := bootstrap.Connection.ResumeSession(ctx, ResumeSessionRequest{
+		SessionID:             input.SessionID,
+		CWD:                   input.CWD,
+		MCPServers:            normalizeMCPServers(input.MCPServers),
+		AdditionalDirectories: input.AdditionalDirectories,
+		Meta:                  sessionMeta,
+	})
 	if err != nil {
 		_ = runSessionCleanup(bootstrap.Dispose)
 		return nil, wrapError(ErrorResume, "session.resume", "failed to resume ACP session", err)
@@ -115,8 +102,23 @@ func (s *SessionService) Resume(ctx context.Context, input ResumeSessionOptions)
 	bootstrap.SessionResponse = resp
 	driver := newACPSessionDriver(bootstrap)
 	if _, err := applyInitialConfig(ctx, driver, input.InitialConfig, bootstrap.Profile); err != nil {
-		_ = runSessionCleanup(driver.Close)
-		return nil, wrapError(ErrorInitialConfig, "session.initial_config", "failed to apply initial config", err)
+		// The durable provider session already existed before resume; only tear
+		// down this connection. Report SessionID so hosts can retry or inspect
+		// the existing session, and mark durable cleanup as not attempted.
+		sessionID := resp.SessionID
+		if sessionID == "" {
+			sessionID = input.SessionID
+		}
+		cleanupErr := runSessionCleanup(driver.Close)
+		return nil, &RuntimeError{
+			Kind:          ErrorInitialConfig,
+			Op:            "session.initial_config",
+			Msg:           "failed to apply initial config",
+			Cause:         err,
+			SessionID:     sessionID,
+			CleanupStatus: CleanupNotAttempted,
+			CleanupError:  cleanupErr,
+		}
 	}
 	return driver, nil
 }
@@ -239,11 +241,43 @@ func normalizeMCPServers(servers []MCPServer) []MCPServer {
 	return servers
 }
 
-// mergeSessionMeta deep-merges two session/new _meta maps. Values from extra
-// (the caller-supplied Meta) take precedence over base (SystemPrompt-derived
-// meta) at every level: for conflicting map keys, if both values are maps they
-// are merged recursively, otherwise extra's value wins. A nil base is treated
-// as empty. The returned map is newly allocated; neither input is mutated.
+// prepareAgentSessionStart applies profile hooks for SystemPrompt and
+// AgentConfig, then merges caller Meta. The resulting agent and _meta are used
+// by both session/new (Create) and session/resume (Resume).
+//
+// Precedence on _meta keys: SystemPrompt-derived < AgentConfig-derived <
+// explicit Meta. ApplySystemPromptToAgent / ApplyAgentConfig may also mutate
+// the agent (env, CLI flags) before bootstrap.
+func prepareAgentSessionStart(profile AgentProfile, input StartSessionOptions) (Agent, map[string]any) {
+	agent := input.Agent
+	var sessionMeta map[string]any
+	if input.SystemPrompt != nil {
+		if profile.ApplySystemPromptToAgent != nil {
+			agent = profile.ApplySystemPromptToAgent(agent, *input.SystemPrompt)
+		}
+		if profile.CreateSystemPromptSessionMeta != nil {
+			sessionMeta = profile.CreateSystemPromptSessionMeta(*input.SystemPrompt)
+		}
+	}
+	// Apply unified AgentConfig before explicit Meta so caller keys still win.
+	if input.AgentConfig != nil && profile.ApplyAgentConfig != nil {
+		var configMeta map[string]any
+		agent, configMeta = profile.ApplyAgentConfig(agent, *input.AgentConfig)
+		if len(configMeta) > 0 {
+			sessionMeta = mergeSessionMeta(sessionMeta, configMeta)
+		}
+	}
+	if len(input.Meta) > 0 {
+		sessionMeta = mergeSessionMeta(sessionMeta, input.Meta)
+	}
+	return agent, sessionMeta
+}
+
+// mergeSessionMeta deep-merges two session _meta maps (session/new and
+// session/resume). Values from extra take precedence over base at every level:
+// for conflicting map keys, if both values are maps they are merged
+// recursively, otherwise extra's value wins. A nil base is treated as empty.
+// The returned map is newly allocated; neither input is mutated.
 func mergeSessionMeta(base, extra map[string]any) map[string]any {
 	out := make(map[string]any, len(base)+len(extra))
 	for k, v := range base {
