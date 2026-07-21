@@ -71,51 +71,64 @@ func NewStdioConnectionFactory(options StdioFactoryOptions) ConnectionFactory {
 		go func() {
 			done <- peer.Start(startCtx)
 		}()
-		var disposeOnce sync.Once
-		dispose := func(ctx context.Context) error {
-			var disposeErr error
-			disposeOnce.Do(func() {
-				cancelStart()
-				_ = stdin.Close()
-				waitCh := make(chan error, 1)
-				go func() { waitCh <- cmd.Wait() }()
-				select {
-				case err := <-waitCh:
-					if err != nil && !errors.Is(err, context.Canceled) {
-						disposeErr = err
-					}
-				case <-time.After(1500 * time.Millisecond):
-					forcedTeardown := false
-					if cmd.Process != nil {
-						forcedTeardown = true
-						_ = signalProcessTree(processGroupID, cmd.Process, syscall.SIGTERM)
-					}
+		var teardownOnce sync.Once
+		teardownDone := make(chan struct{})
+		var teardownErr error
+		startTeardown := func() {
+			teardownOnce.Do(func() {
+				go func() {
+					defer close(teardownDone)
+					cancelStart()
+					_ = stdin.Close()
+					waitCh := make(chan error, 1)
+					go func() { waitCh <- cmd.Wait() }()
 					select {
 					case err := <-waitCh:
-						if forcedTeardown {
-							_ = signalProcessTree(processGroupID, nil, syscall.SIGTERM)
-						}
 						if err != nil && !errors.Is(err, context.Canceled) {
-							disposeErr = err
+							teardownErr = err
 						}
-					case <-time.After(time.Second):
+					case <-time.After(1500 * time.Millisecond):
 						if cmd.Process != nil {
-							_ = signalProcessTree(processGroupID, cmd.Process, syscall.SIGKILL)
+							_ = signalProcessTree(processGroupID, cmd.Process, syscall.SIGTERM)
 						}
-						disposeErr = fmt.Errorf("agent process did not exit cleanly; stderr tail: %s", stderr.String())
-					case <-ctx.Done():
-						disposeErr = ctx.Err()
+						select {
+						case err := <-waitCh:
+							_ = signalProcessTree(processGroupID, nil, syscall.SIGTERM)
+							if err != nil && !errors.Is(err, context.Canceled) {
+								teardownErr = err
+							}
+						case <-time.After(time.Second):
+							if cmd.Process != nil {
+								_ = signalProcessTree(processGroupID, cmd.Process, syscall.SIGKILL)
+							}
+							// Wait without the caller's context. The teardown goroutine is the
+							// process owner after Dispose starts, so a timed-out caller cannot
+							// orphan the process or consume the only cleanup attempt.
+							err := <-waitCh
+							_ = signalProcessTree(processGroupID, nil, syscall.SIGKILL)
+							if err != nil && !errors.Is(err, context.Canceled) {
+								teardownErr = fmt.Errorf("agent process required forced teardown: %w; stderr tail: %s", err, stderr.String())
+							} else {
+								teardownErr = fmt.Errorf("agent process required forced teardown; stderr tail: %s", stderr.String())
+							}
+						}
 					}
-				case <-ctx.Done():
-					disposeErr = ctx.Err()
-				}
-				peer.Close()
-				select {
-				case <-done:
-				default:
-				}
+					peer.Close()
+					select {
+					case <-done:
+					default:
+					}
+				}()
 			})
-			return disposeErr
+		}
+		dispose := func(ctx context.Context) error {
+			startTeardown()
+			select {
+			case <-teardownDone:
+				return teardownErr
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
 		return ConnectionHandle{Connection: conn, Dispose: dispose}, nil
 	}

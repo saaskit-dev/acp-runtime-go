@@ -8,6 +8,7 @@ package acpruntime
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -94,6 +95,46 @@ func TestStdioProcessOutlivesStartContextUntilDispose(t *testing.T) {
 	}
 }
 
+func TestStdioDisposeContinuesAfterCallerCancellation(t *testing.T) {
+	pidFile, err := os.CreateTemp(t.TempDir(), "cancelled-dispose-pid-*")
+	if err != nil {
+		t.Fatalf("CreateTemp() error = %v", err)
+	}
+	_ = pidFile.Close()
+	script := "echo $$ > \"$ACP_RUNTIME_CHILD_PID_FILE\"; trap '' TERM; while true; do sleep 1; done"
+	factory := NewStdioConnectionFactory(StdioFactoryOptions{})
+	handle, err := factory(context.Background(), ConnectionFactoryInput{
+		Agent: Agent{
+			Command: "sh",
+			Args:    []string{"-c", script},
+			Env: map[string]string{
+				"ACP_RUNTIME_CHILD_PID_FILE": pidFile.Name(),
+			},
+		},
+		CWD: ".",
+	})
+	if err != nil {
+		t.Fatalf("factory() error = %v", err)
+	}
+	pid := waitForPIDFile(t, pidFile.Name())
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := handle.Dispose(cancelled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Dispose(cancelled) error = %v, want context.Canceled", err)
+	}
+
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer waitCancel()
+	_ = handle.Dispose(waitCtx)
+	deadline := time.Now().Add(time.Second)
+	for processAlive(pid) && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if processAlive(pid) {
+		t.Fatalf("process %d remained alive after background teardown", pid)
+	}
+}
+
 func TestStdioDisposeSignalsProcessGroup(t *testing.T) {
 	pidFile, err := os.CreateTemp(t.TempDir(), "child-pid-*")
 	if err != nil {
@@ -145,6 +186,23 @@ type testProcessInfo struct {
 	childPID   int
 	parentPGID int
 	childPGID  int
+}
+
+func waitForPIDFile(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
+			if parseErr == nil && pid > 0 {
+				return pid
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("pid file %s was not written", path)
+	return 0
 }
 
 func waitForProcessInfoFile(t *testing.T, path string) testProcessInfo {

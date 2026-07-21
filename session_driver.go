@@ -3,6 +3,7 @@ package acpruntime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -93,7 +94,7 @@ func newACPSessionDriver(bootstrap sessionBootstrap) *acpSessionDriver {
 		toolCalls:    map[string]ToolCallSnapshot{},
 		operations:   map[string]Operation{},
 		permissions:  map[string]PermissionRequestSnapshot{},
-		rawConfig:    map[string]any{},
+		rawConfig:    rawConfigFromMetadata(metadataFromSessionResponse(bootstrap.SessionResponse)),
 		queuePolicy:  bootstrap.QueuePolicy,
 	}
 	driver.metadata.SessionID = bootstrap.SessionResponse.SessionID
@@ -179,6 +180,19 @@ func runtimeConfigOptionFromACP(option SessionConfigOption) RuntimeAgentConfigOp
 	}
 }
 
+func rawConfigFromMetadata(metadata RuntimeSessionMetadata) map[string]any {
+	rawConfig := make(map[string]any, len(metadata.AgentConfigOptions)+1)
+	if metadata.CurrentModeID != "" {
+		rawConfig["mode"] = metadata.CurrentModeID
+	}
+	for _, option := range metadata.AgentConfigOptions {
+		if option.ID != "" && option.Value != nil {
+			rawConfig[option.ID] = option.Value
+		}
+	}
+	return rawConfig
+}
+
 // replaceConfigOptionsLocked replaces the runtime read model with the full
 // provider snapshot. The caller must hold d.mu for writing.
 func (d *acpSessionDriver) replaceConfigOptionsLocked(options []SessionConfigOption) {
@@ -187,6 +201,7 @@ func (d *acpSessionDriver) replaceConfigOptionsLocked(options []SessionConfigOpt
 		next = append(next, runtimeConfigOptionFromACP(option))
 	}
 	d.metadata.AgentConfigOptions = next
+	d.rawConfig = rawConfigFromMetadata(d.metadata)
 }
 
 func (d *acpSessionDriver) Close(ctx context.Context) error {
@@ -216,11 +231,12 @@ func (d *acpSessionDriver) Delete(ctx context.Context) error {
 	}
 	d.status = "closed"
 	d.mu.Unlock()
-	_ = d.connection.DeleteSession(ctx, DeleteSessionRequest{SessionID: d.sessionID})
+	deleteErr := d.connection.DeleteSession(ctx, DeleteSessionRequest{SessionID: d.sessionID})
+	var disposeErr error
 	if d.dispose != nil {
-		return d.dispose(ctx)
+		disposeErr = d.dispose(ctx)
 	}
-	return nil
+	return errors.Join(deleteErr, disposeErr)
 }
 
 // Logout asks the agent to discard cached credentials (logout). Unlike
@@ -349,6 +365,7 @@ func (d *acpSessionDriver) handleSessionUpdate(notification SessionNotification)
 	case "current_mode_update":
 		if update.CurrentModeID != "" {
 			d.metadata.CurrentModeID = update.CurrentModeID
+			d.rawConfig["mode"] = update.CurrentModeID
 		}
 	case "config_option_update":
 		d.replaceConfigOptionsLocked(update.ConfigOptions)

@@ -4,7 +4,19 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"time"
 )
+
+const sessionCleanupTimeout = 5 * time.Second
+
+func runSessionCleanup(cleanup func(context.Context) error) error {
+	if cleanup == nil {
+		return nil
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), sessionCleanupTimeout)
+	defer cancel()
+	return cleanup(cleanupCtx)
+}
 
 type SessionService struct {
 	factory ConnectionFactory
@@ -51,14 +63,26 @@ func (s *SessionService) Create(ctx context.Context, input StartSessionOptions) 
 	req := NewSessionRequest{CWD: input.CWD, MCPServers: normalizeMCPServers(input.MCPServers), AdditionalDirectories: input.AdditionalDirectories, Meta: sessionMeta}
 	resp, err := bootstrap.Connection.NewSession(ctx, req)
 	if err != nil {
-		_ = bootstrap.Dispose(ctx)
+		_ = runSessionCleanup(bootstrap.Dispose)
 		return nil, wrapError(ErrorCreate, "session.new", "failed to create ACP session", err)
 	}
 	bootstrap.SessionResponse = resp
 	driver := newACPSessionDriver(bootstrap)
 	if _, err := applyInitialConfig(ctx, driver, input.InitialConfig, profile); err != nil {
-		_ = driver.Close(ctx)
-		return nil, wrapError(ErrorInitialConfig, "session.initial_config", "failed to apply initial config", err)
+		cleanupErr := runSessionCleanup(driver.Delete)
+		cleanupStatus := CleanupSucceeded
+		if cleanupErr != nil {
+			cleanupStatus = CleanupFailed
+		}
+		return nil, &RuntimeError{
+			Kind:          ErrorInitialConfig,
+			Op:            "session.initial_config",
+			Msg:           "failed to apply initial config",
+			Cause:         err,
+			SessionID:     resp.SessionID,
+			CleanupStatus: cleanupStatus,
+			CleanupError:  cleanupErr,
+		}
 	}
 	return driver, nil
 }
@@ -70,7 +94,7 @@ func (s *SessionService) Load(ctx context.Context, input LoadSessionOptions) (Se
 	}
 	resp, err := bootstrap.Connection.LoadSession(ctx, LoadSessionRequest{SessionID: input.SessionID, CWD: input.CWD, MCPServers: normalizeMCPServers(input.MCPServers), AdditionalDirectories: input.AdditionalDirectories})
 	if err != nil {
-		_ = bootstrap.Dispose(ctx)
+		_ = runSessionCleanup(bootstrap.Dispose)
 		return nil, wrapError(ErrorLoad, "session.load", "failed to load ACP session", err)
 	}
 	bootstrap.SessionResponse = resp
@@ -83,15 +107,15 @@ func (s *SessionService) Resume(ctx context.Context, input ResumeSessionOptions)
 		return nil, wrapError(ErrorResume, "session.resume", "failed to bootstrap ACP session", err)
 	}
 	bootstrap.QueuePolicy = resolveQueuePolicy(input.Queue)
-	resp, err := bootstrap.Connection.ResumeSession(ctx, ResumeSessionRequest{SessionID: input.SessionID, CWD: input.CWD, MCPServers: normalizeMCPServers(input.MCPServers), AdditionalDirectories: input.AdditionalDirectories})
+	resp, err := bootstrap.Connection.ResumeSession(ctx, ResumeSessionRequest{SessionID: input.SessionID, CWD: input.CWD, MCPServers: normalizeMCPServers(input.MCPServers), AdditionalDirectories: input.AdditionalDirectories, Meta: input.Meta})
 	if err != nil {
-		_ = bootstrap.Dispose(ctx)
+		_ = runSessionCleanup(bootstrap.Dispose)
 		return nil, wrapError(ErrorResume, "session.resume", "failed to resume ACP session", err)
 	}
 	bootstrap.SessionResponse = resp
 	driver := newACPSessionDriver(bootstrap)
 	if _, err := applyInitialConfig(ctx, driver, input.InitialConfig, bootstrap.Profile); err != nil {
-		_ = driver.Close(ctx)
+		_ = runSessionCleanup(driver.Close)
 		return nil, wrapError(ErrorInitialConfig, "session.initial_config", "failed to apply initial config", err)
 	}
 	return driver, nil
@@ -104,7 +128,7 @@ func (s *SessionService) Fork(ctx context.Context, input ForkSessionOptions) (Se
 	}
 	resp, err := bootstrap.Connection.ForkSession(ctx, ForkSessionRequest{SessionID: input.SessionID, CWD: input.CWD, MCPServers: normalizeMCPServers(input.MCPServers), AdditionalDirectories: input.AdditionalDirectories})
 	if err != nil {
-		_ = bootstrap.Dispose(ctx)
+		_ = runSessionCleanup(bootstrap.Dispose)
 		return nil, wrapError(ErrorFork, "session.fork", "failed to fork ACP session", err)
 	}
 	bootstrap.SessionResponse = resp
@@ -117,7 +141,7 @@ func (s *SessionService) ListAgentSessions(ctx context.Context, input ListSessio
 	if err != nil {
 		return RuntimeSessionList{}, wrapError(ErrorList, "session.list", "failed to bootstrap ACP session", err)
 	}
-	defer bootstrap.Dispose(ctx)
+	defer func() { _ = runSessionCleanup(bootstrap.Dispose) }()
 	resp, err := bootstrap.Connection.ListSessions(ctx, ListSessionsRequest{CWD: input.CWD, Cursor: input.Cursor, AdditionalDirectories: input.AdditionalDirectories})
 	if err != nil {
 		return RuntimeSessionList{}, wrapError(ErrorList, "session.list", "failed to list ACP sessions", err)
@@ -153,7 +177,7 @@ func (s *SessionService) bootstrap(ctx context.Context, agent Agent, cwd string,
 	}
 	resp, err := handle.Connection.Initialize(ctx, InitializeRequest{ProtocolVersion: ProtocolVersion, ClientInfo: &client.Info, ClientCapabilities: client.Capabilities})
 	if err != nil {
-		_ = handle.Dispose(ctx)
+		_ = runSessionCleanup(handle.Dispose)
 		return sessionBootstrap{}, err
 	}
 	methods := profile.NormalizeInitializeAuthMethods(agent, resp.AuthMethods)
@@ -163,19 +187,19 @@ func (s *SessionService) bootstrap(ctx context.Context, agent Agent, cwd string,
 		if ok && (method.Type == "agent" || method.Type == "") && s.options.AuthenticationHandler == nil {
 			_, err := handle.Connection.Authenticate(ctx, AuthenticateRequest{MethodID: method.ID})
 			if err != nil && !isAuthenticationNotImplemented(err) {
-				_ = handle.Dispose(ctx)
+				_ = runSessionCleanup(handle.Dispose)
 				return sessionBootstrap{}, wrapError(ErrorAuthentication, "authenticate", "agent authentication failed", err)
 			}
 		} else if s.options.AuthenticationHandler != nil {
 			decision, err := s.options.AuthenticationHandler(ctx, runtimeMethods)
 			if err != nil {
-				_ = handle.Dispose(ctx)
+				_ = runSessionCleanup(handle.Dispose)
 				return sessionBootstrap{}, err
 			}
 			if decision.MethodID != "" {
 				_, err = handle.Connection.Authenticate(ctx, AuthenticateRequest{MethodID: decision.MethodID})
 				if err != nil && !isAuthenticationNotImplemented(err) {
-					_ = handle.Dispose(ctx)
+					_ = runSessionCleanup(handle.Dispose)
 					return sessionBootstrap{}, wrapError(ErrorAuthentication, "authenticate", "agent authentication failed", err)
 				}
 			}

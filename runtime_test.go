@@ -231,6 +231,75 @@ func TestStartSessionMetaPassthrough(t *testing.T) {
 	}
 }
 
+// TestResumeSessionMetaPassthrough verifies that ResumeSessionOptions.Meta is
+// forwarded to the session/resume _meta on the wire. This is a protocol-boundary
+// regression test: checking only the in-memory options would miss a request
+// type that silently drops _meta during JSON-RPC serialization.
+func TestResumeSessionMetaPassthrough(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cwd := t.TempDir()
+	storage := t.TempDir()
+	simulatorBin := buildSimulatorBinary(t)
+	agent := Agent{
+		Type:    LocalSimulatorAgentACPRegistryID,
+		Command: simulatorBin,
+		Args:    []string{"--auth-mode", "none", "--storage-dir", storage},
+	}
+
+	creator := NewRuntime(NewStdioConnectionFactory(StdioFactoryOptions{}), RuntimeOptions{})
+	created, err := creator.StartSession(ctx, StartSessionOptions{Agent: agent, CWD: cwd})
+	if err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+	defer created.Close(context.Background())
+	sessionID := created.Snapshot().Session.ID
+
+	var capturedResumeSession []byte
+	var captureMu sync.Mutex
+	factory := NewStdioConnectionFactory(StdioFactoryOptions{
+		OnACPMessage: func(direction string, message []byte) {
+			if direction != "outbound" || !bytes.Contains(message, []byte(`"session/resume"`)) {
+				return
+			}
+			captureMu.Lock()
+			capturedResumeSession = append(capturedResumeSession[:0], message...)
+			captureMu.Unlock()
+		},
+	})
+	runtime := NewRuntime(factory, RuntimeOptions{})
+	resumed, err := runtime.ResumeSession(ctx, ResumeSessionOptions{
+		StartSessionOptions: StartSessionOptions{
+			Agent: agent,
+			CWD:   cwd,
+			Meta: map[string]any{
+				"claudeCode": map[string]any{
+					"options": map[string]any{
+						"settingSources": []string{},
+					},
+				},
+			},
+		},
+		SessionID: sessionID,
+	})
+	if err != nil {
+		t.Fatalf("ResumeSession() error = %v", err)
+	}
+	defer resumed.Close(context.Background())
+
+	captureMu.Lock()
+	snapshot := append([]byte(nil), capturedResumeSession...)
+	captureMu.Unlock()
+	if snapshot == nil {
+		t.Fatalf("no outbound session/resume captured")
+	}
+	if !bytes.Contains(snapshot, []byte(`"claudeCode"`)) ||
+		!bytes.Contains(snapshot, []byte(`"options"`)) ||
+		!bytes.Contains(snapshot, []byte(`"settingSources":[]`)) {
+		t.Fatalf("session/resume missing managed Claude _meta: %s", snapshot)
+	}
+}
+
 // TestMetaMergesWithSystemPromptMeta verifies that caller Meta and
 // SystemPrompt-derived meta coexist in the same _meta object, and that a
 // conflicting nested map key from the caller takes precedence.

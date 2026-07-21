@@ -202,6 +202,72 @@ func TestSetSessionConfigOptionResponseDistinguishesMissingAndEmptySnapshot(t *t
 	}
 }
 
+func TestSessionConfigOptionUsesACPCurrentValueWireField(t *testing.T) {
+	var selectOption SessionConfigOption
+	if err := json.Unmarshal([]byte(`{"type":"select","id":"model","name":"Model","currentValue":"haiku","options":[]}`), &selectOption); err != nil {
+		t.Fatalf("Unmarshal(select) error = %v", err)
+	}
+	if selectOption.Value != "haiku" {
+		t.Fatalf("select Value = %#v, want haiku", selectOption.Value)
+	}
+
+	var booleanOption SessionConfigOption
+	if err := json.Unmarshal([]byte(`{"type":"boolean","id":"fast","name":"Fast mode","currentValue":false}`), &booleanOption); err != nil {
+		t.Fatalf("Unmarshal(boolean) error = %v", err)
+	}
+	if value, ok := booleanOption.Value.(bool); !ok || value {
+		t.Fatalf("boolean Value = %#v, want false", booleanOption.Value)
+	}
+
+	wire, err := json.Marshal(booleanOption)
+	if err != nil {
+		t.Fatalf("Marshal(boolean) error = %v", err)
+	}
+	var encoded map[string]any
+	if err := json.Unmarshal(wire, &encoded); err != nil {
+		t.Fatalf("Unmarshal(encoded) error = %v", err)
+	}
+	if value, ok := encoded["currentValue"].(bool); !ok || value {
+		t.Fatalf("encoded currentValue = %#v, want false", encoded["currentValue"])
+	}
+	if _, exists := encoded["value"]; exists {
+		t.Fatalf("encoded legacy value field = %#v, want absent", encoded["value"])
+	}
+}
+
+func TestSessionDriverHydratesAndRefreshesRawConfigFromProviderSnapshots(t *testing.T) {
+	response := NewSessionResponse{
+		SessionID: "session-1",
+		Modes:     &SessionModeState{CurrentModeID: "bypassPermissions"},
+		ConfigOptions: []SessionConfigOption{
+			configOption("model", "Model", "haiku"),
+			{Type: "boolean", ID: "fast", Name: "Fast mode", Value: false},
+		},
+	}
+	metadata := metadataFromSessionResponse(response)
+	driver := &acpSessionDriver{
+		sessionID: "session-1",
+		metadata:  metadata,
+		rawConfig: rawConfigFromMetadata(metadata),
+	}
+
+	want := map[string]any{"mode": "bypassPermissions", "model": "haiku", "fast": false}
+	if got := driver.Snapshot().RawConfig; !reflect.DeepEqual(got, want) {
+		t.Fatalf("initial RawConfig = %#v, want %#v", got, want)
+	}
+
+	driver.handleSessionUpdate(SessionNotification{SessionID: "session-1", Update: SessionUpdate{
+		SessionUpdate: "config_option_update",
+		ConfigOptions: []SessionConfigOption{
+			configOption("model", "Model", "sonnet"),
+		},
+	}})
+	want = map[string]any{"mode": "bypassPermissions", "model": "sonnet"}
+	if got := driver.Snapshot().RawConfig; !reflect.DeepEqual(got, want) {
+		t.Fatalf("updated RawConfig = %#v, want %#v", got, want)
+	}
+}
+
 func configOption(id, name string, value any) SessionConfigOption {
 	return SessionConfigOption{
 		Type:  "select",

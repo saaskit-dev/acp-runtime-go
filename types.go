@@ -246,10 +246,11 @@ type LoadSessionRequest struct {
 type LoadSessionResponse = NewSessionResponse
 
 type ResumeSessionRequest struct {
-	SessionID             string      `json:"sessionId"`
-	CWD                   string      `json:"cwd"`
-	MCPServers            []MCPServer `json:"mcpServers"`
-	AdditionalDirectories []string    `json:"additionalDirectories,omitempty"`
+	SessionID             string         `json:"sessionId"`
+	CWD                   string         `json:"cwd"`
+	MCPServers            []MCPServer    `json:"mcpServers"`
+	AdditionalDirectories []string       `json:"additionalDirectories,omitempty"`
+	Meta                  map[string]any `json:"_meta,omitempty"`
 }
 
 type ResumeSessionResponse = NewSessionResponse
@@ -422,7 +423,7 @@ type SessionConfigOption struct {
 	Name        string                `json:"name"`
 	Description *string               `json:"description,omitempty"`
 	Category    *string               `json:"category,omitempty"`
-	Value       any                   `json:"value,omitempty"`
+	Value       any                   `json:"currentValue"`
 	Options     []SessionConfigChoice `json:"options,omitempty"`
 	Groups      []SessionConfigGroup  `json:"groups,omitempty"`
 	Meta        map[string]any        `json:"_meta,omitempty"`
@@ -706,11 +707,10 @@ type StartSessionOptions struct {
 	Queue                 QueuePolicyInput
 	Handlers              AuthorityHandlers
 	// Meta is merged into the session/new _meta object alongside any
-	// SystemPrompt-derived meta. Use this to pass agent-specific structured
-	// configuration (e.g. Claude Code's _meta.claudeCode.options to disable
-	// tools). Top-level keys from Meta take precedence over SystemPrompt meta
-	// on conflict. Only session/new carries _meta; load/resume/fork ignore it
-	// per the ACP schema.
+	// SystemPrompt-derived meta and is forwarded unchanged by session/resume.
+	// Use this to pass agent-specific structured configuration (e.g. Claude
+	// Code's _meta.claudeCode.options to disable tools). Top-level keys from
+	// Meta take precedence over SystemPrompt meta on conflict.
 	Meta map[string]any
 	// AgentConfig is a unified, cross-agent configuration abstraction. When set,
 	// the profile layer translates it into the agent's native format (env,

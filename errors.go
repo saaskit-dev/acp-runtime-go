@@ -2,6 +2,16 @@ package acpruntime
 
 import "fmt"
 
+// CleanupStatus describes whether a failed session operation left a durable
+// provider-side session behind.
+type CleanupStatus string
+
+const (
+	CleanupNotAttempted CleanupStatus = "not_attempted"
+	CleanupSucceeded    CleanupStatus = "succeeded"
+	CleanupFailed       CleanupStatus = "failed"
+)
+
 type ErrorKind string
 
 const (
@@ -24,10 +34,13 @@ const (
 )
 
 type RuntimeError struct {
-	Kind  ErrorKind
-	Op    string
-	Msg   string
-	Cause error
+	Kind          ErrorKind
+	Op            string
+	Msg           string
+	Cause         error
+	SessionID     string
+	CleanupStatus CleanupStatus
+	CleanupError  error
 }
 
 func (e *RuntimeError) Error() string {
