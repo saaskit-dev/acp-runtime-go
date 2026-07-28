@@ -495,8 +495,11 @@ type Usage struct {
 }
 
 type RuntimeOptions struct {
-	ClientInfo            Implementation
-	HomeDir               string
+	ClientInfo Implementation
+	// HomeDir is the authoritative HOME for provider child processes. Hosts
+	// should place it on storage whose lifecycle matches stored sessions.
+	HomeDir string
+	// CacheDir is the disposable cache root exposed to provider child processes.
 	CacheDir              string
 	StoredSessionsEnabled bool
 	AuthenticationHandler AuthenticationHandler

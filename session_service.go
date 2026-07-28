@@ -182,6 +182,7 @@ func (s *SessionService) ListAgentSessions(ctx context.Context, input ListSessio
 }
 
 func (s *SessionService) bootstrap(ctx context.Context, agent Agent, cwd string, mcp []MCPServer, handlers AuthorityHandlers, profile AgentProfile) (sessionBootstrap, error) {
+	agent = applyRuntimeEnvironment(agent, s.options)
 	client := defaultClient(s.options, handlers)
 	handle, err := s.factory(ctx, ConnectionFactoryInput{Agent: agent, Client: client, CWD: cwd, Observability: s.options.Observability, Authority: client.Authority})
 	if err != nil {
@@ -228,6 +229,25 @@ func (s *SessionService) bootstrap(ctx context.Context, agent Agent, cwd string,
 		Hooks:              s.options.Hooks,
 		ReadModelLimits:    s.options.ReadModelLimits,
 	}, nil
+}
+
+func applyRuntimeEnvironment(agent Agent, options RuntimeOptions) Agent {
+	if options.HomeDir == "" && options.CacheDir == "" {
+		return agent
+	}
+	env := make(map[string]string, len(agent.Env)+3)
+	for key, value := range agent.Env {
+		env[key] = value
+	}
+	if options.HomeDir != "" {
+		env["HOME"] = options.HomeDir
+		env[RuntimeHomeDirEnvVar] = options.HomeDir
+	}
+	if options.CacheDir != "" {
+		env[RuntimeCacheDirEnvVar] = options.CacheDir
+	}
+	agent.Env = env
+	return agent
 }
 
 func isAuthenticationNotImplemented(err error) bool {
