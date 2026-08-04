@@ -122,11 +122,9 @@ func configOptionValue(options []RuntimeAgentConfigOption, id string) any {
 	return nil
 }
 
-// TestRuntimeForwardsSystemPromptToSessionMeta verifies that setting
-// StartSessionOptions.SystemPrompt causes the runtime to emit
-// _meta.systemPrompt on the session/new request (the community convention used
-// by the Zed ACP adapters). It captures outbound ACP messages via the
-// OnACPMessage hook and asserts the systemPrompt reaches the wire.
+// TestRuntimeForwardsSystemPromptToSessionMeta verifies the public logical
+// _meta.systemPrompt contract reaches a provider that uses the default ACP
+// projection.
 func TestRuntimeForwardsSystemPromptToSessionMeta(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -155,9 +153,9 @@ func TestRuntimeForwardsSystemPromptToSessionMeta(t *testing.T) {
 	})
 	runtime := NewRuntime(factory, RuntimeOptions{})
 	session, err := runtime.StartSession(ctx, StartSessionOptions{
-		Agent:        agent,
-		CWD:          cwd,
-		SystemPrompt: &SystemPrompt{Text: "Reply tersely."},
+		Agent: agent,
+		CWD:   cwd,
+		Meta:  map[string]any{SystemPromptMetaKey: "Reply tersely."},
 	})
 	if err != nil {
 		t.Fatalf("StartSession() error = %v", err)
@@ -172,6 +170,51 @@ func TestRuntimeForwardsSystemPromptToSessionMeta(t *testing.T) {
 	}
 	if !bytes.Contains(snapshot, []byte(`"systemPrompt":"Reply tersely."`)) {
 		t.Fatalf("session/new payload missing _meta.systemPrompt: %s", snapshot)
+	}
+}
+
+func TestRuntimeForwardsAppendSystemPromptToSessionMeta(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cwd := t.TempDir()
+	storage := t.TempDir()
+	simulatorBin := buildSimulatorBinary(t)
+	agent := Agent{
+		Type:    LocalSimulatorAgentACPRegistryID,
+		Command: simulatorBin,
+		Args:    []string{"--auth-mode", "none", "--storage-dir", storage},
+	}
+
+	var capturedNewSession []byte
+	var captureMu sync.Mutex
+	factory := NewStdioConnectionFactory(StdioFactoryOptions{
+		OnACPMessage: func(direction string, message []byte) {
+			if direction == "outbound" && bytes.Contains(message, []byte(`"session/new"`)) {
+				captureMu.Lock()
+				capturedNewSession = append(capturedNewSession[:0], message...)
+				captureMu.Unlock()
+			}
+		},
+	})
+	runtime := NewRuntime(factory, RuntimeOptions{})
+	session, err := runtime.StartSession(ctx, StartSessionOptions{
+		Agent: agent,
+		CWD:   cwd,
+		Meta:  map[string]any{AppendSystemPromptMetaKey: "Preserve provider defaults."},
+	})
+	if err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+	defer session.Close(context.Background())
+
+	captureMu.Lock()
+	snapshot := append([]byte(nil), capturedNewSession...)
+	captureMu.Unlock()
+	if !bytes.Contains(snapshot, []byte(`"appendSystemPrompt":"Preserve provider defaults."`)) {
+		t.Fatalf("session/new payload missing _meta.appendSystemPrompt: %s", snapshot)
+	}
+	if bytes.Contains(snapshot, []byte(`"systemPrompt"`)) {
+		t.Fatalf("append prompt also emitted replace key: %s", snapshot)
 	}
 }
 
@@ -231,10 +274,10 @@ func TestStartSessionMetaPassthrough(t *testing.T) {
 	}
 }
 
-// TestResumeSessionMetaPassthrough verifies that Resume uses the same Meta merge
-// path as Create: SystemPrompt-derived meta and explicit Meta both appear on the
-// session/resume wire payload. Checking only in-memory options would miss a
-// request type that silently drops _meta during JSON-RPC serialization.
+// TestResumeSessionMetaPassthrough verifies that Resume uses the same logical
+// prompt projection and Meta merge path as Create. Checking only in-memory
+// options would miss a request type that silently drops _meta during JSON-RPC
+// serialization.
 func TestResumeSessionMetaPassthrough(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -270,10 +313,10 @@ func TestResumeSessionMetaPassthrough(t *testing.T) {
 	runtime := NewRuntime(factory, RuntimeOptions{})
 	resumed, err := runtime.ResumeSession(ctx, ResumeSessionOptions{
 		StartSessionOptions: StartSessionOptions{
-			Agent:        agent,
-			CWD:          cwd,
-			SystemPrompt: &SystemPrompt{Text: "be brief"},
+			Agent: agent,
+			CWD:   cwd,
 			Meta: map[string]any{
+				SystemPromptMetaKey: "be brief",
 				"claudeCode": map[string]any{
 					"options": map[string]any{
 						"settingSources": []string{},
@@ -295,7 +338,7 @@ func TestResumeSessionMetaPassthrough(t *testing.T) {
 		t.Fatalf("no outbound session/resume captured")
 	}
 	if !bytes.Contains(snapshot, []byte(`"systemPrompt":"be brief"`)) {
-		t.Fatalf("session/resume missing SystemPrompt-derived _meta: %s", snapshot)
+		t.Fatalf("session/resume missing logical _meta.systemPrompt: %s", snapshot)
 	}
 	if !bytes.Contains(snapshot, []byte(`"claudeCode"`)) ||
 		!bytes.Contains(snapshot, []byte(`"options"`)) ||
@@ -304,9 +347,8 @@ func TestResumeSessionMetaPassthrough(t *testing.T) {
 	}
 }
 
-// TestMetaMergesWithSystemPromptMeta verifies that caller Meta and
-// SystemPrompt-derived meta coexist in the same _meta object, and that a
-// conflicting nested map key from the caller takes precedence.
+// TestMetaMergesWithSystemPromptMeta verifies the reserved prompt key and
+// ordinary caller metadata coexist in the same logical _meta object.
 func TestMetaMergesWithSystemPromptMeta(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -335,10 +377,12 @@ func TestMetaMergesWithSystemPromptMeta(t *testing.T) {
 	})
 	runtime := NewRuntime(factory, RuntimeOptions{})
 	session, err := runtime.StartSession(ctx, StartSessionOptions{
-		Agent:        agent,
-		CWD:          cwd,
-		SystemPrompt: &SystemPrompt{Text: "be brief"},   // produces _meta.systemPrompt
-		Meta:         map[string]any{"claudeCode": "opts"}, // plus a caller key
+		Agent: agent,
+		CWD:   cwd,
+		Meta: map[string]any{
+			SystemPromptMetaKey: "be brief",
+			"claudeCode":        "opts",
+		},
 	})
 	if err != nil {
 		t.Fatalf("StartSession() error = %v", err)
@@ -350,7 +394,7 @@ func TestMetaMergesWithSystemPromptMeta(t *testing.T) {
 	captureMu.Unlock()
 	// Both keys must coexist in _meta.
 	if !bytes.Contains(snapshot, []byte(`"systemPrompt":"be brief"`)) {
-		t.Fatalf("SystemPrompt meta lost after merge: %s", snapshot)
+		t.Fatalf("systemPrompt meta lost after merge: %s", snapshot)
 	}
 	if !bytes.Contains(snapshot, []byte(`"claudeCode":"opts"`)) {
 		t.Fatalf("caller Meta lost after merge: %s", snapshot)
@@ -456,26 +500,64 @@ func TestClaudeOptionsViaMetaReachesSessionNew(t *testing.T) {
 	}
 }
 
-// TestRuntimeClaudeSystemPromptInjectsCLIFlag verifies that a Claude-typed
-// agent gets --append-system-prompt injected into its args when a system prompt
-// is supplied. This uses a fake agent command so no real Claude process spawns.
-func TestRuntimeClaudeSystemPromptInjectsCLIFlag(t *testing.T) {
-	// We only need to verify the args rewrite happens before spawn; use a
-	// nonexistent command so spawn fails fast, but the resolveStartOptions path
-	// still runs the profile. We check the error path doesn't mutate agent.
-	profile := ResolveAgentProfile(Agent{Type: ClaudeCodeACPRegistryID})
-	base := Agent{Type: ClaudeCodeACPRegistryID, Command: "npm", Args: []string{"exec", "--yes", "claude-agent-acp"}}
-	out := profile.ApplySystemPromptToAgent(base, SystemPrompt{Text: "Be brief."})
-	want := "--append-system-prompt"
-	found := false
-	for _, arg := range out.Args {
-		if arg == want {
-			found = true
-			break
-		}
+func TestSystemPromptConflictFailsBeforeBootstrap(t *testing.T) {
+	bootstrapCalls := 0
+	factory := ConnectionFactory(func(context.Context, ConnectionFactoryInput) (ConnectionHandle, error) {
+		bootstrapCalls++
+		return ConnectionHandle{}, fmt.Errorf("unexpected bootstrap")
+	})
+	runtime := NewRuntime(factory, RuntimeOptions{})
+	_, err := runtime.StartSession(context.Background(), StartSessionOptions{
+		Agent: Agent{Type: "test", Command: "test"},
+		CWD:   t.TempDir(),
+		Meta: map[string]any{
+			SystemPromptMetaKey:       "replace",
+			AppendSystemPromptMetaKey: "append",
+		},
+	})
+	if err == nil {
+		t.Fatal("StartSession() error = nil, want system-prompt conflict")
 	}
-	if !found {
-		t.Fatalf("Claude agent args %v missing %q", out.Args, want)
+	runtimeErr, ok := err.(*RuntimeError)
+	if !ok || runtimeErr.Kind != ErrorSystemPrompt {
+		t.Fatalf("error = %#v, want RuntimeError kind %q", err, ErrorSystemPrompt)
+	}
+	if bootstrapCalls != 0 {
+		t.Fatalf("bootstrap calls = %d, want 0", bootstrapCalls)
+	}
+}
+
+func TestSystemPromptMetaRequiresString(t *testing.T) {
+	_, _, err := prepareAgentSessionStart(defaultAgentProfile(), StartSessionOptions{
+		Agent: Agent{Type: "test", Command: "test"},
+		Meta:  map[string]any{SystemPromptMetaKey: []string{"invalid"}},
+	})
+	if err == nil {
+		t.Fatal("prepareAgentSessionStart() error = nil, want type error")
+	}
+	runtimeErr, ok := err.(*RuntimeError)
+	if !ok || runtimeErr.Kind != ErrorSystemPrompt {
+		t.Fatalf("error = %#v, want RuntimeError kind %q", err, ErrorSystemPrompt)
+	}
+}
+
+func TestBlankSystemPromptKeysAreConsumedWithoutProjection(t *testing.T) {
+	agent, meta, err := prepareAgentSessionStart(defaultAgentProfile(), StartSessionOptions{
+		Agent: Agent{Type: "test", Command: "test"},
+		Meta: map[string]any{
+			SystemPromptMetaKey:       "  \n",
+			AppendSystemPromptMetaKey: "\t",
+			"custom":                  "kept",
+		},
+	})
+	if err != nil {
+		t.Fatalf("prepareAgentSessionStart() error = %v", err)
+	}
+	if agent.Command != "test" {
+		t.Fatalf("agent changed: %#v", agent)
+	}
+	if len(meta) != 1 || meta["custom"] != "kept" {
+		t.Fatalf("meta = %#v, want only custom", meta)
 	}
 }
 

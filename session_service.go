@@ -29,7 +29,10 @@ func NewSessionService(factory ConnectionFactory, options RuntimeOptions) *Sessi
 
 func (s *SessionService) Create(ctx context.Context, input StartSessionOptions) (SessionDriver, error) {
 	profile := ResolveAgentProfile(input.Agent)
-	agent, sessionMeta := prepareAgentSessionStart(profile, input)
+	agent, sessionMeta, err := prepareAgentSessionStart(profile, input)
+	if err != nil {
+		return nil, err
+	}
 	bootstrap, err := s.bootstrap(ctx, agent, input.CWD, input.MCPServers, input.Handlers, profile)
 	if err != nil {
 		return nil, wrapError(ErrorCreate, "session.start", "failed to bootstrap ACP session", err)
@@ -87,9 +90,12 @@ func (s *SessionService) Load(ctx context.Context, input LoadSessionOptions) (Se
 
 func (s *SessionService) Resume(ctx context.Context, input ResumeSessionOptions) (SessionDriver, error) {
 	profile := ResolveAgentProfile(input.Agent)
-	// Resume uses the same SystemPrompt / AgentConfig / Meta merge path as Create
-	// so hosts can pass the same StartSessionOptions without re-assembling _meta.
-	agent, sessionMeta := prepareAgentSessionStart(profile, input.StartSessionOptions)
+	// Resume uses the same logical prompt / AgentConfig / Meta projection path
+	// as Create so hosts can reuse the same StartSessionOptions.
+	agent, sessionMeta, err := prepareAgentSessionStart(profile, input.StartSessionOptions)
+	if err != nil {
+		return nil, err
+	}
 	bootstrap, err := s.bootstrap(ctx, agent, input.CWD, input.MCPServers, input.Handlers, profile)
 	if err != nil {
 		return nil, wrapError(ErrorResume, "session.resume", "failed to bootstrap ACP session", err)
@@ -281,36 +287,92 @@ func normalizeMCPServers(servers []MCPServer) []MCPServer {
 	return servers
 }
 
-// prepareAgentSessionStart applies profile hooks for SystemPrompt and
-// AgentConfig, then merges caller Meta. The resulting agent and _meta are used
-// by both session/new (Create) and session/resume (Resume).
-//
-// Precedence on _meta keys: SystemPrompt-derived < AgentConfig-derived <
-// explicit Meta. ApplySystemPromptToAgent / ApplyAgentConfig may also mutate
-// the agent (env, CLI flags) before bootstrap.
-func prepareAgentSessionStart(profile AgentProfile, input StartSessionOptions) (Agent, map[string]any) {
+// prepareAgentSessionStart extracts the public logical system-prompt keys,
+// lets the provider profile project them exactly once, applies AgentConfig,
+// then merges all remaining caller metadata. Create and Resume share this path.
+func prepareAgentSessionStart(profile AgentProfile, input StartSessionOptions) (Agent, map[string]any, error) {
 	agent := input.Agent
-	var sessionMeta map[string]any
-	if input.SystemPrompt != nil {
-		if profile.ApplySystemPromptToAgent != nil {
-			agent = profile.ApplySystemPromptToAgent(agent, *input.SystemPrompt)
-		}
-		if profile.CreateSystemPromptSessionMeta != nil {
-			sessionMeta = profile.CreateSystemPromptSessionMeta(*input.SystemPrompt)
-		}
+	prompt, callerMeta, err := extractSystemPrompt(input.Meta)
+	if err != nil {
+		return agent, nil, err
 	}
-	// Apply unified AgentConfig before explicit Meta so caller keys still win.
+	var sessionMeta map[string]any
+	if prompt != nil {
+		if profile.ProjectSystemPrompt == nil {
+			return agent, nil, systemPromptError("agent profile does not support system prompt projection")
+		}
+		var promptMeta map[string]any
+		agent, promptMeta = profile.ProjectSystemPrompt(agent, *prompt)
+		sessionMeta = mergeSessionMeta(sessionMeta, promptMeta)
+	}
+	// Apply unified AgentConfig before remaining explicit Meta so caller keys
+	// still win, except for the reserved prompt keys extracted above.
 	if input.AgentConfig != nil && profile.ApplyAgentConfig != nil {
 		var configMeta map[string]any
 		agent, configMeta = profile.ApplyAgentConfig(agent, *input.AgentConfig)
+		if hasSystemPromptKey(configMeta) {
+			return agent, nil, systemPromptError("AgentConfig metadata contains a reserved system prompt key")
+		}
 		if len(configMeta) > 0 {
 			sessionMeta = mergeSessionMeta(sessionMeta, configMeta)
 		}
 	}
-	if len(input.Meta) > 0 {
-		sessionMeta = mergeSessionMeta(sessionMeta, input.Meta)
+	if len(callerMeta) > 0 {
+		sessionMeta = mergeSessionMeta(sessionMeta, callerMeta)
 	}
-	return agent, sessionMeta
+	return agent, sessionMeta, nil
+}
+
+func extractSystemPrompt(meta map[string]any) (*SystemPromptProjection, map[string]any, error) {
+	remaining := make(map[string]any, len(meta))
+	for key, value := range meta {
+		if key != SystemPromptMetaKey && key != AppendSystemPromptMetaKey {
+			remaining[key] = value
+		}
+	}
+	replace, err := systemPromptText(meta, SystemPromptMetaKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	appendText, err := systemPromptText(meta, AppendSystemPromptMetaKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	if replace != "" && appendText != "" {
+		return nil, nil, systemPromptError("_meta.systemPrompt and _meta.appendSystemPrompt are mutually exclusive")
+	}
+	if replace != "" {
+		return &SystemPromptProjection{Mode: SystemPromptModeReplace, Text: replace}, remaining, nil
+	}
+	if appendText != "" {
+		return &SystemPromptProjection{Mode: SystemPromptModeAppend, Text: appendText}, remaining, nil
+	}
+	return nil, remaining, nil
+}
+
+func systemPromptText(meta map[string]any, key string) (string, error) {
+	value, ok := meta[key]
+	if !ok {
+		return "", nil
+	}
+	text, ok := value.(string)
+	if !ok {
+		return "", systemPromptError("_meta." + key + " must be a string")
+	}
+	if strings.TrimSpace(text) == "" {
+		return "", nil
+	}
+	return text, nil
+}
+
+func hasSystemPromptKey(meta map[string]any) bool {
+	_, replace := meta[SystemPromptMetaKey]
+	_, appendPrompt := meta[AppendSystemPromptMetaKey]
+	return replace || appendPrompt
+}
+
+func systemPromptError(message string) error {
+	return &RuntimeError{Kind: ErrorSystemPrompt, Op: "session.system_prompt", Msg: message}
 }
 
 // mergeSessionMeta deep-merges two session _meta maps (session/new and

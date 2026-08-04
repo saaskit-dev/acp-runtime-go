@@ -710,7 +710,8 @@ type ClaudeCodeOptions struct {
 //   - other/unknown → best-effort via _meta + InitialConfig
 //
 // AgentConfig is additive to InitialConfig and Meta: it does not replace them.
-// Precedence: SystemPrompt meta < AgentConfig meta < explicit Meta.
+// SystemPromptMetaKey and AppendSystemPromptMetaKey are reserved in Meta and
+// are projected before AgentConfig-derived metadata.
 type AgentConfig struct {
 	Model           string           // model name (claude: sonnet, codex: gpt-5.5, opencode: glm-5.2)
 	Sandbox         string           // sandbox level: read-only / workspace-write / full-access
@@ -764,23 +765,24 @@ type StartSessionOptions struct {
 	CWD                   string
 	MCPServers            []MCPServer
 	AdditionalDirectories []string
-	SystemPrompt          *SystemPrompt
 	InitialConfig         InitialConfig
 	Queue                 QueuePolicyInput
 	Handlers              AuthorityHandlers
-	// Meta is merged into the session _meta object sent on session/new (Create)
-	// and session/resume (Resume). SystemPrompt-derived and AgentConfig-derived
-	// meta are merged first; explicit Meta wins on conflict. Use this to pass
-	// agent-specific structured configuration (e.g. Claude Code's
-	// _meta.claudeCode.options to disable tools). Load/Fork do not send _meta.
+	// Meta is the logical session _meta object for session/new (Create) and
+	// session/resume (Resume). Use SystemPromptMetaKey for replace semantics and
+	// AppendSystemPromptMetaKey for append semantics. The profile layer consumes
+	// these reserved keys and chooses exactly one provider-native projection;
+	// callers must not set both to non-empty values. Other keys are merged with
+	// AgentConfig-derived metadata. Load/Fork do not send _meta.
 	Meta map[string]any
 	// AgentConfig is a unified, cross-agent configuration abstraction. When set,
 	// the profile layer translates it into the agent's native format (env,
 	// _meta, CLI flags) automatically for Create and Resume. It is additive to
 	// InitialConfig and Meta: model/sandbox/tool settings from AgentConfig are
 	// applied in addition to (not instead of) InitialConfig. Precedence on
-	// _meta: SystemPrompt < AgentConfig < explicit Meta. nil = no agent config
-	// applied.
+	// _meta: projected system prompt < AgentConfig < remaining explicit Meta.
+	// AgentConfig-derived metadata must not contain the reserved system-prompt
+	// keys. nil = no agent config applied.
 	AgentConfig *AgentConfig
 }
 
@@ -802,7 +804,23 @@ type ListSessionsOptions struct {
 	Handlers              AuthorityHandlers
 }
 
-type SystemPrompt struct {
+const (
+	SystemPromptMetaKey       = "systemPrompt"
+	AppendSystemPromptMetaKey = "appendSystemPrompt"
+)
+
+type SystemPromptMode string
+
+const (
+	SystemPromptModeReplace SystemPromptMode = "replace"
+	SystemPromptModeAppend  SystemPromptMode = "append"
+)
+
+// SystemPromptProjection is the normalized logical prompt passed to an agent
+// profile. Callers declare it through StartSessionOptions.Meta; provider
+// profiles decide whether it remains ACP _meta or becomes a native transport.
+type SystemPromptProjection struct {
+	Mode SystemPromptMode
 	Text string
 }
 

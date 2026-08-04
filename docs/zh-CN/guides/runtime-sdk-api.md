@@ -30,6 +30,26 @@ runtime := acp.NewRuntime(
 - `ListSessions(ctx, ListSessionsOptions)`
 - `Close(ctx)`
 
+## System Prompt 契约
+
+宿主在 Create 和 Resume 中统一通过 `StartSessionOptions.Meta` 声明 system
+prompt 意图：
+
+```go
+options.Meta = map[string]any{
+	acp.SystemPromptMetaKey: "你是当前工作区的编码 Agent。",
+}
+```
+
+- `SystemPromptMetaKey`（`_meta.systemPrompt`）表示替换 Provider system prompt。
+- `AppendSystemPromptMetaKey`（`_meta.appendSystemPrompt`）表示追加到 Provider system prompt。
+- 两个键的非空值互斥；值必须是字符串，空白字符串按未设置处理。
+- runtime profile 层只选择一种 Provider 原生投影。Claude Code 的 replace
+  转换为 `--system-prompt`，append 转换为 `--append-system-prompt`，消费后的
+  prompt 键不会再通过 ACP `_meta` 重复发送。
+
+调用方不得在 `Agent.Args` 中另外维护 Provider 专属 prompt 参数。
+
 ## Session Surface
 
 - `Run(ctx, text)`

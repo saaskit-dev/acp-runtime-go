@@ -3,8 +3,7 @@ package acpruntime
 import "strings"
 
 type AgentProfile struct {
-	ApplySystemPromptToAgent          func(Agent, SystemPrompt) Agent
-	CreateSystemPromptSessionMeta     func(SystemPrompt) map[string]any
+	ProjectSystemPrompt               func(Agent, SystemPromptProjection) (Agent, map[string]any)
 	NormalizeInitializeAuthMethods    func(Agent, []AuthMethod) []AuthMethod
 	NormalizeRuntimeAuthMethods       func(Agent, []RuntimeAuthenticationMethod) []RuntimeAuthenticationMethod
 	CreateInitialConfigAliases        func(key string, value any) []any
@@ -38,21 +37,18 @@ func ResolveAgentProfile(agent Agent) AgentProfile {
 			}
 			return []any{value}
 		}
-		// Claude Code's ACP adapter accepts --append-system-prompt, which
-		// appends to (rather than replaces) its built-in system prompt. We
-		// inject the flag into the agent's CLI args so the host's system prompt
-		// reaches Claude Code without clobbering its defaults. Combined with
-		// the default CreateSystemPromptSessionMeta this also covers agents
-		// that read _meta.systemPrompt directly.
-		profile.ApplySystemPromptToAgent = func(agent Agent, prompt SystemPrompt) Agent {
-			if strings.TrimSpace(prompt.Text) == "" {
-				return agent
+		// Claude Code exposes system-prompt semantics as process flags rather
+		// than ACP session metadata. Consume the logical _meta contract here so
+		// the provider receives the prompt exactly once.
+		profile.ProjectSystemPrompt = func(agent Agent, prompt SystemPromptProjection) (Agent, map[string]any) {
+			flag := "--system-prompt"
+			if prompt.Mode == SystemPromptModeAppend {
+				flag = "--append-system-prompt"
 			}
-			args := make([]string, 0, len(agent.Args)+2)
-			args = append(args, agent.Args...)
-			args = append(args, "--append-system-prompt", prompt.Text)
+			args := removeClaudeSystemPromptArgs(agent.Args)
+			args = append(args, flag, prompt.Text)
 			agent.Args = args
-			return agent
+			return agent, nil
 		}
 		profile.ApplyAgentConfig = applyClaudeAgentConfig
 	case GitHubCopilotACPRegistryID:
@@ -76,17 +72,15 @@ func defaultAgentProfile() AgentProfile {
 	return AgentProfile{
 		NormalizeInitializeAuthMethods: func(agent Agent, methods []AuthMethod) []AuthMethod { return methods },
 		NormalizeRuntimeAuthMethods:    func(agent Agent, methods []RuntimeAuthenticationMethod) []RuntimeAuthenticationMethod { return methods },
-		// CreateSystemPromptSessionMeta forwards the host's system prompt to the
-		// agent via session/new _meta.systemPrompt. This is a community
-		// convention (used by the Zed claude/codex ACP adapters) rather than a
-		// formal ACP v1 field; agents that read _meta.systemPrompt will pick it
-		// up, others ignore it. An empty prompt yields no meta so we never
-		// clobber an agent's own system prompt with an empty string.
-		CreateSystemPromptSessionMeta: func(prompt SystemPrompt) map[string]any {
-			if strings.TrimSpace(prompt.Text) == "" {
-				return nil
+		// The default projection preserves the public logical _meta contract on
+		// the ACP wire. Provider profiles may consume it and choose a different
+		// native transport, but must project it exactly once.
+		ProjectSystemPrompt: func(agent Agent, prompt SystemPromptProjection) (Agent, map[string]any) {
+			key := SystemPromptMetaKey
+			if prompt.Mode == SystemPromptModeAppend {
+				key = AppendSystemPromptMetaKey
 			}
-			return map[string]any{"systemPrompt": prompt.Text}
+			return agent, map[string]any{key: prompt.Text}
 		},
 		CreateInitialConfigAliases: func(key string, value any) []any { return []any{value} },
 		CreateInitialConfigOptionSelector: func(key string) InitialConfigOptionSelector {
@@ -118,6 +112,24 @@ func defaultAgentProfile() AgentProfile {
 			}
 		},
 	}
+}
+
+func removeClaudeSystemPromptArgs(args []string) []string {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--system-prompt" || arg == "--append-system-prompt" {
+			if i+1 < len(args) {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "--system-prompt=") || strings.HasPrefix(arg, "--append-system-prompt=") {
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out
 }
 
 // applyClaudeAgentConfig translates AgentConfig into Claude Code's native format:

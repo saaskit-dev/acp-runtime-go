@@ -32,6 +32,29 @@ Core methods:
 - `ListSessions(ctx, ListSessionsOptions)`
 - `Close(ctx)`
 
+## System Prompt Contract
+
+Hosts declare system-prompt intent through `StartSessionOptions.Meta` for both
+Create and Resume:
+
+```go
+options.Meta = map[string]any{
+	acp.SystemPromptMetaKey: "You are the workspace coding agent.",
+}
+```
+
+- `SystemPromptMetaKey` (`_meta.systemPrompt`) replaces the provider system
+  prompt.
+- `AppendSystemPromptMetaKey` (`_meta.appendSystemPrompt`) appends to the
+  provider system prompt.
+- The two keys are mutually exclusive when both values are non-empty. Values
+  must be strings; blank values are treated as unset.
+- The runtime profile layer chooses one provider-native projection. For Claude
+  Code, replace becomes `--system-prompt` and append becomes
+  `--append-system-prompt`; the consumed key is not also sent over ACP `_meta`.
+
+Callers should never add provider-specific prompt flags to `Agent.Args`.
+
 ## Session Surface
 
 - `Run(ctx, text)`
