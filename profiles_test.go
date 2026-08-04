@@ -1,6 +1,7 @@
 package acpruntime
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -32,7 +33,7 @@ func TestDefaultProfileProjectsReplaceAndAppendToMeta(t *testing.T) {
 	}
 }
 
-func TestClaudeProfileProjectsEachPromptModeToOneCLIFlag(t *testing.T) {
+func TestClaudeProfileProjectsPromptModesToSessionMeta(t *testing.T) {
 	profile := ResolveAgentProfile(Agent{Type: ClaudeCodeACPRegistryID})
 	if profile.ProjectSystemPrompt == nil {
 		t.Fatal("Claude ProjectSystemPrompt is nil")
@@ -41,35 +42,145 @@ func TestClaudeProfileProjectsEachPromptModeToOneCLIFlag(t *testing.T) {
 		Type:    ClaudeCodeACPRegistryID,
 		Command: "npm",
 		Args: []string{
-			"exec", "claude",
+			"exec", "--yes", "@agentclientprotocol/claude-agent-acp", "--",
 			"--append-system-prompt", "stale append",
 			"--system-prompt=stale replace",
 		},
 	}
 
-	for _, test := range []struct {
-		name string
-		mode SystemPromptMode
-		flag string
-	}{
-		{name: "replace", mode: SystemPromptModeReplace, flag: "--system-prompt"},
-		{name: "append", mode: SystemPromptModeAppend, flag: "--append-system-prompt"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			out, meta := profile.ProjectSystemPrompt(base, SystemPromptProjection{Mode: test.mode, Text: "Always reply in haiku."})
-			if meta != nil {
-				t.Fatalf("Claude prompt leaked to ACP meta: %#v", meta)
-			}
-			if got := countPromptFlags(out.Args); got != 1 {
-				t.Fatalf("prompt flag count = %d, args = %#v", got, out.Args)
-			}
-			if len(out.Args) < 2 || out.Args[len(out.Args)-2] != test.flag || out.Args[len(out.Args)-1] != "Always reply in haiku." {
-				t.Fatalf("args = %#v, want trailing %s <text>", out.Args, test.flag)
-			}
-			if len(base.Args) != 5 {
-				t.Fatalf("original args mutated: %#v", base.Args)
-			}
+	t.Run("replace", func(t *testing.T) {
+		out, meta := profile.ProjectSystemPrompt(base, SystemPromptProjection{
+			Mode: SystemPromptModeReplace,
+			Text: "Always reply in haiku.",
 		})
+		if countPromptFlags(out.Args) != 0 {
+			t.Fatalf("stale CLI prompt flags not stripped: %#v", out.Args)
+		}
+		if len(meta) != 1 || meta[SystemPromptMetaKey] != "Always reply in haiku." {
+			t.Fatalf("meta = %#v, want systemPrompt string", meta)
+		}
+		if len(base.Args) != 7 {
+			t.Fatalf("original args mutated: %#v", base.Args)
+		}
+	})
+
+	t.Run("append", func(t *testing.T) {
+		out, meta := profile.ProjectSystemPrompt(base, SystemPromptProjection{
+			Mode: SystemPromptModeAppend,
+			Text: "Always reply in haiku.",
+		})
+		if countPromptFlags(out.Args) != 0 {
+			t.Fatalf("stale CLI prompt flags not stripped: %#v", out.Args)
+		}
+		raw, ok := meta[SystemPromptMetaKey].(map[string]any)
+		if !ok {
+			t.Fatalf("meta = %#v, want systemPrompt object", meta)
+		}
+		if raw["type"] != "preset" || raw["preset"] != "claude_code" || raw["append"] != "Always reply in haiku." {
+			t.Fatalf("systemPrompt object = %#v", raw)
+		}
+	})
+}
+
+func TestCodexProfileProjectsPromptToCodexConfigEnv(t *testing.T) {
+	profile := ResolveAgentProfile(Agent{Type: CodexACPRegistryID})
+	if profile.ProjectSystemPrompt == nil {
+		t.Fatal("Codex ProjectSystemPrompt is nil")
+	}
+
+	t.Run("replace writes developer_instructions", func(t *testing.T) {
+		base := Agent{
+			Type: CodexACPRegistryID,
+			Env: map[string]string{
+				"CODEX_CONFIG": `{"model":"gpt-5.5","developer_instructions":"stale"}`,
+				"OTHER":        "keep",
+			},
+		}
+		out, meta := profile.ProjectSystemPrompt(base, SystemPromptProjection{
+			Mode: SystemPromptModeReplace,
+			Text: "Be terse.",
+		})
+		if meta != nil {
+			t.Fatalf("Codex should not project prompt meta, got %#v", meta)
+		}
+		if out.Env["OTHER"] != "keep" {
+			t.Fatalf("non-CODEX env lost: %#v", out.Env)
+		}
+		cfg := decodeCodexConfig(t, out.Env["CODEX_CONFIG"])
+		if cfg["model"] != "gpt-5.5" {
+			t.Fatalf("existing CODEX_CONFIG fields lost: %#v", cfg)
+		}
+		if cfg["developer_instructions"] != "Be terse." {
+			t.Fatalf("developer_instructions = %#v, want replace text", cfg["developer_instructions"])
+		}
+		// Original env map must not be mutated.
+		if base.Env["CODEX_CONFIG"] != `{"model":"gpt-5.5","developer_instructions":"stale"}` {
+			t.Fatalf("base env mutated: %#v", base.Env)
+		}
+	})
+
+	t.Run("append concatenates developer_instructions", func(t *testing.T) {
+		base := Agent{
+			Type: CodexACPRegistryID,
+			Env: map[string]string{
+				"CODEX_CONFIG": `{"developer_instructions":"base block"}`,
+			},
+		}
+		out, meta := profile.ProjectSystemPrompt(base, SystemPromptProjection{
+			Mode: SystemPromptModeAppend,
+			Text: "extra block",
+		})
+		if meta != nil {
+			t.Fatalf("meta = %#v, want nil", meta)
+		}
+		cfg := decodeCodexConfig(t, out.Env["CODEX_CONFIG"])
+		if cfg["developer_instructions"] != "base block\n\nextra block" {
+			t.Fatalf("developer_instructions = %#v", cfg["developer_instructions"])
+		}
+	})
+
+	t.Run("empty env creates CODEX_CONFIG", func(t *testing.T) {
+		base := Agent{Type: CodexACPRegistryID}
+		out, _ := profile.ProjectSystemPrompt(base, SystemPromptProjection{
+			Mode: SystemPromptModeReplace,
+			Text: "from empty",
+		})
+		cfg := decodeCodexConfig(t, out.Env["CODEX_CONFIG"])
+		if cfg["developer_instructions"] != "from empty" {
+			t.Fatalf("cfg = %#v", cfg)
+		}
+	})
+}
+
+func TestPrepareAgentSessionStartCodexSystemPromptToEnv(t *testing.T) {
+	profile := ResolveAgentProfile(Agent{Type: CodexACPRegistryID})
+	agent, meta, err := prepareAgentSessionStart(profile, StartSessionOptions{
+		Agent: Agent{
+			Type:    CodexACPRegistryID,
+			Command: "npm",
+			Args:    []string{"exec", "--yes", "@agentclientprotocol/codex-acp", "--"},
+			Env:     map[string]string{"CODEX_CONFIG": `{"sandbox_mode":"read-only"}`},
+		},
+		Meta: map[string]any{
+			SystemPromptMetaKey: "Host prompt.",
+			"custom":            "kept",
+		},
+	})
+	if err != nil {
+		t.Fatalf("prepareAgentSessionStart() error = %v", err)
+	}
+	if meta["custom"] != "kept" {
+		t.Fatalf("caller meta lost: %#v", meta)
+	}
+	if _, ok := meta[SystemPromptMetaKey]; ok {
+		t.Fatalf("reserved systemPrompt should be consumed, meta=%#v", meta)
+	}
+	cfg := decodeCodexConfig(t, agent.Env["CODEX_CONFIG"])
+	if cfg["sandbox_mode"] != "read-only" {
+		t.Fatalf("sandbox_mode lost: %#v", cfg)
+	}
+	if cfg["developer_instructions"] != "Host prompt." {
+		t.Fatalf("developer_instructions = %#v", cfg["developer_instructions"])
 	}
 }
 
@@ -116,4 +227,16 @@ func countPromptFlags(args []string) int {
 		}
 	}
 	return count
+}
+
+func decodeCodexConfig(t *testing.T, raw string) map[string]any {
+	t.Helper()
+	if raw == "" {
+		t.Fatal("CODEX_CONFIG empty")
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		t.Fatalf("CODEX_CONFIG json: %v (%s)", err, raw)
+	}
+	return cfg
 }

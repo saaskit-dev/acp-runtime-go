@@ -34,26 +34,31 @@ Core methods:
 
 ## System Prompt Contract
 
-Hosts declare system-prompt intent through `StartSessionOptions.Meta` for both
-Create and Resume:
+One host API for every agent. Declare intent on Create and Resume via Meta
+helpers; the runtime projects onto each provider internally.
 
 ```go
-options.Meta = map[string]any{
-	acp.SystemPromptMetaKey: "You are the workspace coding agent.",
-}
+// Replace provider system prompt
+options.Meta = acp.WithSystemPrompt("You are the workspace coding agent.")
+
+// Or append
+options.Meta = acp.WithAppendSystemPrompt("Prefer small diffs.")
+
+// Combine with other session metadata
+options.Meta = acp.MergeMeta(
+	acp.WithSystemPrompt("You are the workspace coding agent."),
+	map[string]any{"customKey": "value"},
+)
 ```
 
-- `SystemPromptMetaKey` (`_meta.systemPrompt`) replaces the provider system
-  prompt.
-- `AppendSystemPromptMetaKey` (`_meta.appendSystemPrompt`) appends to the
-  provider system prompt.
-- The two keys are mutually exclusive when both values are non-empty. Values
-  must be strings; blank values are treated as unset.
-- The runtime profile layer chooses one provider-native projection. For Claude
-  Code, replace becomes `--system-prompt` and append becomes
-  `--append-system-prompt`; the consumed key is not also sent over ACP `_meta`.
+Rules:
 
-Callers should never add provider-specific prompt flags to `Agent.Args`.
+- Replace: `WithSystemPrompt` (key `SystemPromptMetaKey`)
+- Append: `WithAppendSystemPrompt` (key `AppendSystemPromptMetaKey`)
+- The two are mutually exclusive when both values are non-empty
+- Values must be strings; blank strings are treated as unset
+- Do **not** inject system prompts via `Agent.Args`, `Agent.Env`,
+  `CreateCodexConfig` / `CODEX_CONFIG`, Claude CLI flags, or `AgentConfig`
 
 ## Session Surface
 

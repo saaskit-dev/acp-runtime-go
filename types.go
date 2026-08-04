@@ -21,9 +21,9 @@ const (
 )
 
 type Agent struct {
-	Type    string            `json:"type"`
-	Command string            `json:"command"`
-	Args    []string          `json:"args,omitempty"`
+	Type    string   `json:"type"`
+	Command string   `json:"command"`
+	Args    []string `json:"args,omitempty"`
 	// ExtraArgs are appended after Args without replacing the default launch
 	// sequence. This is the safe way to add CLI flags (e.g. --disallowedTools)
 	// to an agent built by CreateClaudeCodeAgent/CreateCodexAgent: setting Args
@@ -658,9 +658,9 @@ type ObservabilityOptions struct {
 // Default read-model caps keep long-lived sessions from retaining unbounded
 // history. Zero means "use default"; negative means unlimited.
 const (
-	DefaultMaxThreadEntries      = 256
-	DefaultMaxToolCallEntries    = 128
-	DefaultMaxPermissionEntries  = 64
+	DefaultMaxThreadEntries     = 256
+	DefaultMaxToolCallEntries   = 128
+	DefaultMaxPermissionEntries = 64
 )
 
 // ReadModelLimits bounds in-memory session history retained for Snapshot and
@@ -710,8 +710,8 @@ type ClaudeCodeOptions struct {
 //   - other/unknown → best-effort via _meta + InitialConfig
 //
 // AgentConfig is additive to InitialConfig and Meta: it does not replace them.
-// SystemPromptMetaKey and AppendSystemPromptMetaKey are reserved in Meta and
-// are projected before AgentConfig-derived metadata.
+// System prompts are not part of AgentConfig — use WithSystemPrompt /
+// WithAppendSystemPrompt (StartSessionOptions.Meta) instead.
 type AgentConfig struct {
 	Model           string           // model name (claude: sonnet, codex: gpt-5.5, opencode: glm-5.2)
 	Sandbox         string           // sandbox level: read-only / workspace-write / full-access
@@ -732,7 +732,8 @@ type PermissionConfig struct {
 
 // CodexConfig is the typed form of Codex's CODEX_CONFIG env var (JSON deep-merged
 // into the Codex session config). Construct with CreateCodexConfig and pass the
-// result as Agent.Env.
+// result as Agent.Env. Do not put system prompts here — use WithSystemPrompt /
+// WithAppendSystemPrompt on StartSessionOptions.Meta.
 type CodexConfig struct {
 	Model          string         // e.g. "deepseek-chat", "gpt-5.5"
 	SandboxMode    string         // read-only / workspace-write / danger-full-access
@@ -768,12 +769,14 @@ type StartSessionOptions struct {
 	InitialConfig         InitialConfig
 	Queue                 QueuePolicyInput
 	Handlers              AuthorityHandlers
-	// Meta is the logical session _meta object for session/new (Create) and
-	// session/resume (Resume). Use SystemPromptMetaKey for replace semantics and
-	// AppendSystemPromptMetaKey for append semantics. The profile layer consumes
-	// these reserved keys and chooses exactly one provider-native projection;
-	// callers must not set both to non-empty values. Other keys are merged with
-	// AgentConfig-derived metadata. Load/Fork do not send _meta.
+	// Meta is the logical session metadata for Create and Resume.
+	//
+	// System prompts: use WithSystemPrompt / WithAppendSystemPrompt (or the
+	// reserved SystemPromptMetaKey / AppendSystemPromptMetaKey). The runtime
+	// applies them for every supported agent; callers must not set both to
+	// non-empty values, and must not inject prompts via Agent.Args, Agent.Env,
+	// or provider-specific config. Other Meta keys are merged with
+	// AgentConfig-derived metadata. Load/Fork do not send session _meta.
 	Meta map[string]any
 	// AgentConfig is a unified, cross-agent configuration abstraction. When set,
 	// the profile layer translates it into the agent's native format (env,
@@ -781,8 +784,7 @@ type StartSessionOptions struct {
 	// InitialConfig and Meta: model/sandbox/tool settings from AgentConfig are
 	// applied in addition to (not instead of) InitialConfig. Precedence on
 	// _meta: projected system prompt < AgentConfig < remaining explicit Meta.
-	// AgentConfig-derived metadata must not contain the reserved system-prompt
-	// keys. nil = no agent config applied.
+	// AgentConfig must not be used for system prompts. nil = no agent config.
 	AgentConfig *AgentConfig
 }
 
@@ -804,11 +806,15 @@ type ListSessionsOptions struct {
 	Handlers              AuthorityHandlers
 }
 
+// Reserved Meta keys for the unified system-prompt contract. Prefer
+// WithSystemPrompt / WithAppendSystemPrompt over writing these keys by hand.
 const (
 	SystemPromptMetaKey       = "systemPrompt"
 	AppendSystemPromptMetaKey = "appendSystemPrompt"
 )
 
+// SystemPromptMode is used by agent profiles when projecting host intent.
+// Hosts should not set this type; use WithSystemPrompt / WithAppendSystemPrompt.
 type SystemPromptMode string
 
 const (
@@ -816,9 +822,9 @@ const (
 	SystemPromptModeAppend  SystemPromptMode = "append"
 )
 
-// SystemPromptProjection is the normalized logical prompt passed to an agent
-// profile. Callers declare it through StartSessionOptions.Meta; provider
-// profiles decide whether it remains ACP _meta or becomes a native transport.
+// SystemPromptProjection is the normalized prompt passed to an agent profile
+// after extractSystemPrompt. Hosts declare intent via Meta helpers; profiles
+// project once onto the provider-native transport.
 type SystemPromptProjection struct {
 	Mode SystemPromptMode
 	Text string

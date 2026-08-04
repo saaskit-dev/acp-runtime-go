@@ -119,6 +119,9 @@ func CreateClaudeCodeOptions(opts ClaudeCodeOptions) map[string]any {
 // CodexConfig. Returns a map suitable for Agent.Env. If agentEnv already has a
 // CODEX_CONFIG, the values are deep-merged (new values win).
 //
+// System prompts are not configured here — use WithSystemPrompt /
+// WithAppendSystemPrompt on StartSessionOptions.Meta.
+//
 // Example:
 //
 //	env, _ := acp.CreateCodexConfig(acp.CodexConfig{SandboxMode: "read-only"})

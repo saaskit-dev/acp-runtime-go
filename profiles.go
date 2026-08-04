@@ -1,6 +1,9 @@
 package acpruntime
 
-import "strings"
+import (
+	"encoding/json"
+	"strings"
+)
 
 type AgentProfile struct {
 	ProjectSystemPrompt               func(Agent, SystemPromptProjection) (Agent, map[string]any)
@@ -29,6 +32,12 @@ func ResolveAgentProfile(agent Agent) AgentProfile {
 		profile.NormalizeRuntimeAuthMethods = func(agent Agent, methods []RuntimeAuthenticationMethod) []RuntimeAuthenticationMethod {
 			return methods
 		}
+		// codex-acp ignores session/new _meta.systemPrompt. The working host
+		// channel is CODEX_CONFIG.developer_instructions (merged into
+		// thread/start config). Codex treats this as a developer-layer
+		// extension (append semantics relative to built-in base instructions);
+		// true baseInstructions replace is not exposed by the npm adapter.
+		profile.ProjectSystemPrompt = projectCodexSystemPrompt
 		profile.ApplyAgentConfig = applyCodexAgentConfig
 	case ClaudeCodeACPRegistryID:
 		profile.CreateInitialConfigAliases = func(key string, value any) []any {
@@ -37,18 +46,23 @@ func ResolveAgentProfile(agent Agent) AgentProfile {
 			}
 			return []any{value}
 		}
-		// Claude Code exposes system-prompt semantics as process flags rather
-		// than ACP session metadata. Consume the logical _meta contract here so
-		// the provider receives the prompt exactly once.
+		// claude-agent-acp (Agent SDK wrapper) reads system prompt from
+		// session/new _meta.systemPrompt, not from process CLI flags.
+		// String value = replace; object with preset+append = append to the
+		// built-in claude_code prompt. Strip any stale --system-prompt*
+		// args so callers cannot double-apply via Agent.Args.
 		profile.ProjectSystemPrompt = func(agent Agent, prompt SystemPromptProjection) (Agent, map[string]any) {
-			flag := "--system-prompt"
+			agent.Args = removeClaudeSystemPromptArgs(agent.Args)
 			if prompt.Mode == SystemPromptModeAppend {
-				flag = "--append-system-prompt"
+				return agent, map[string]any{
+					SystemPromptMetaKey: map[string]any{
+						"type":   "preset",
+						"preset": "claude_code",
+						"append": prompt.Text,
+					},
+				}
 			}
-			args := removeClaudeSystemPromptArgs(agent.Args)
-			args = append(args, flag, prompt.Text)
-			agent.Args = args
-			return agent, nil
+			return agent, map[string]any{SystemPromptMetaKey: prompt.Text}
 		}
 		profile.ApplyAgentConfig = applyClaudeAgentConfig
 	case GitHubCopilotACPRegistryID:
@@ -130,6 +144,54 @@ func removeClaudeSystemPromptArgs(args []string) []string {
 		out = append(out, arg)
 	}
 	return out
+}
+
+// projectCodexSystemPrompt projects host system-prompt intent into
+// Agent.Env["CODEX_CONFIG"].developer_instructions. Returns nil session meta
+// because codex-acp does not consume ACP _meta prompt keys.
+func projectCodexSystemPrompt(agent Agent, prompt SystemPromptProjection) (Agent, map[string]any) {
+	env, err := injectCodexDeveloperInstructions(agent.Env, prompt)
+	if err != nil {
+		return agent, nil
+	}
+	agent.Env = env
+	return agent, nil
+}
+
+// injectCodexDeveloperInstructions deep-merges developer_instructions into the
+// existing CODEX_CONFIG JSON env value. Append mode concatenates onto any
+// existing developer_instructions; replace mode overwrites that field only.
+func injectCodexDeveloperInstructions(existingEnv map[string]string, prompt SystemPromptProjection) (map[string]string, error) {
+	env := map[string]string{}
+	for k, v := range existingEnv {
+		env[k] = v
+	}
+	config := map[string]any{}
+	if existing := env["CODEX_CONFIG"]; existing != "" {
+		if err := json.Unmarshal([]byte(existing), &config); err != nil {
+			// Corrupt prior JSON: start a fresh object rather than fail session start.
+			config = map[string]any{}
+		}
+	}
+	text := strings.TrimSpace(prompt.Text)
+	if text == "" {
+		return env, nil
+	}
+	if prompt.Mode == SystemPromptModeAppend {
+		if prev, ok := config["developer_instructions"].(string); ok {
+			prev = strings.TrimSpace(prev)
+			if prev != "" {
+				text = prev + "\n\n" + text
+			}
+		}
+	}
+	config["developer_instructions"] = text
+	data, err := json.Marshal(config)
+	if err != nil {
+		return nil, err
+	}
+	env["CODEX_CONFIG"] = string(data)
+	return env, nil
 }
 
 // applyClaudeAgentConfig translates AgentConfig into Claude Code's native format:

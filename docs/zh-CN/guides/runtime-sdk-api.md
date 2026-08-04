@@ -32,23 +32,31 @@ runtime := acp.NewRuntime(
 
 ## System Prompt 契约
 
-宿主在 Create 和 Resume 中统一通过 `StartSessionOptions.Meta` 声明 system
-prompt 意图：
+所有 Agent 共用一套宿主 API。在 Create / Resume 上用 Meta 辅助函数声明意图；
+runtime 在内部完成各 Provider 的投影，宿主无需关心实现细节。
 
 ```go
-options.Meta = map[string]any{
-	acp.SystemPromptMetaKey: "你是当前工作区的编码 Agent。",
-}
+// 替换 Provider system prompt
+options.Meta = acp.WithSystemPrompt("你是当前工作区的编码 Agent。")
+
+// 或追加
+options.Meta = acp.WithAppendSystemPrompt("优先小范围改动。")
+
+// 与其它 session metadata 合并
+options.Meta = acp.MergeMeta(
+	acp.WithSystemPrompt("你是当前工作区的编码 Agent。"),
+	map[string]any{"customKey": "value"},
+)
 ```
 
-- `SystemPromptMetaKey`（`_meta.systemPrompt`）表示替换 Provider system prompt。
-- `AppendSystemPromptMetaKey`（`_meta.appendSystemPrompt`）表示追加到 Provider system prompt。
-- 两个键的非空值互斥；值必须是字符串，空白字符串按未设置处理。
-- runtime profile 层只选择一种 Provider 原生投影。Claude Code 的 replace
-  转换为 `--system-prompt`，append 转换为 `--append-system-prompt`，消费后的
-  prompt 键不会再通过 ACP `_meta` 重复发送。
+规则：
 
-调用方不得在 `Agent.Args` 中另外维护 Provider 专属 prompt 参数。
+- 替换：`WithSystemPrompt`（键 `SystemPromptMetaKey`）
+- 追加：`WithAppendSystemPrompt`（键 `AppendSystemPromptMetaKey`）
+- 两个非空值互斥
+- 值必须是字符串；空白字符串按未设置处理
+- **不要**通过 `Agent.Args`、`Agent.Env`、`CreateCodexConfig` / `CODEX_CONFIG`、
+  Claude CLI flag 或 `AgentConfig` 注入 system prompt
 
 ## Session Surface
 
