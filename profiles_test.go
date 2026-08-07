@@ -88,11 +88,11 @@ func TestCodexProfileProjectsPromptToCodexConfigEnv(t *testing.T) {
 		t.Fatal("Codex ProjectSystemPrompt is nil")
 	}
 
-	t.Run("replace writes developer_instructions", func(t *testing.T) {
+	t.Run("replace writes instructions", func(t *testing.T) {
 		base := Agent{
 			Type: CodexACPRegistryID,
 			Env: map[string]string{
-				"CODEX_CONFIG": `{"model":"gpt-5.5","developer_instructions":"stale"}`,
+				"CODEX_CONFIG": `{"model":"gpt-5.5","developer_instructions":"keep-dev","instructions":"stale"}`,
 				"OTHER":        "keep",
 			},
 		}
@@ -110,11 +110,15 @@ func TestCodexProfileProjectsPromptToCodexConfigEnv(t *testing.T) {
 		if cfg["model"] != "gpt-5.5" {
 			t.Fatalf("existing CODEX_CONFIG fields lost: %#v", cfg)
 		}
-		if cfg["developer_instructions"] != "Be terse." {
-			t.Fatalf("developer_instructions = %#v, want replace text", cfg["developer_instructions"])
+		if cfg["instructions"] != "Be terse." {
+			t.Fatalf("instructions = %#v, want replace text", cfg["instructions"])
+		}
+		// Replace must not clobber an independent developer layer.
+		if cfg["developer_instructions"] != "keep-dev" {
+			t.Fatalf("developer_instructions should be preserved: %#v", cfg["developer_instructions"])
 		}
 		// Original env map must not be mutated.
-		if base.Env["CODEX_CONFIG"] != `{"model":"gpt-5.5","developer_instructions":"stale"}` {
+		if base.Env["CODEX_CONFIG"] != `{"model":"gpt-5.5","developer_instructions":"keep-dev","instructions":"stale"}` {
 			t.Fatalf("base env mutated: %#v", base.Env)
 		}
 	})
@@ -123,7 +127,7 @@ func TestCodexProfileProjectsPromptToCodexConfigEnv(t *testing.T) {
 		base := Agent{
 			Type: CodexACPRegistryID,
 			Env: map[string]string{
-				"CODEX_CONFIG": `{"developer_instructions":"base block"}`,
+				"CODEX_CONFIG": `{"developer_instructions":"base block","instructions":"leave me"}`,
 			},
 		}
 		out, meta := profile.ProjectSystemPrompt(base, SystemPromptProjection{
@@ -137,17 +141,23 @@ func TestCodexProfileProjectsPromptToCodexConfigEnv(t *testing.T) {
 		if cfg["developer_instructions"] != "base block\n\nextra block" {
 			t.Fatalf("developer_instructions = %#v", cfg["developer_instructions"])
 		}
+		if cfg["instructions"] != "leave me" {
+			t.Fatalf("append must not touch instructions: %#v", cfg["instructions"])
+		}
 	})
 
-	t.Run("empty env creates CODEX_CONFIG", func(t *testing.T) {
+	t.Run("empty env creates CODEX_CONFIG instructions", func(t *testing.T) {
 		base := Agent{Type: CodexACPRegistryID}
 		out, _ := profile.ProjectSystemPrompt(base, SystemPromptProjection{
 			Mode: SystemPromptModeReplace,
 			Text: "from empty",
 		})
 		cfg := decodeCodexConfig(t, out.Env["CODEX_CONFIG"])
-		if cfg["developer_instructions"] != "from empty" {
+		if cfg["instructions"] != "from empty" {
 			t.Fatalf("cfg = %#v", cfg)
+		}
+		if _, ok := cfg["developer_instructions"]; ok {
+			t.Fatalf("replace should not set developer_instructions: %#v", cfg)
 		}
 	})
 }
@@ -179,8 +189,8 @@ func TestPrepareAgentSessionStartCodexSystemPromptToEnv(t *testing.T) {
 	if cfg["sandbox_mode"] != "read-only" {
 		t.Fatalf("sandbox_mode lost: %#v", cfg)
 	}
-	if cfg["developer_instructions"] != "Host prompt." {
-		t.Fatalf("developer_instructions = %#v", cfg["developer_instructions"])
+	if cfg["instructions"] != "Host prompt." {
+		t.Fatalf("instructions = %#v", cfg["instructions"])
 	}
 }
 

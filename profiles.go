@@ -32,11 +32,10 @@ func ResolveAgentProfile(agent Agent) AgentProfile {
 		profile.NormalizeRuntimeAuthMethods = func(agent Agent, methods []RuntimeAuthenticationMethod) []RuntimeAuthenticationMethod {
 			return methods
 		}
-		// codex-acp ignores session/new _meta.systemPrompt. The working host
-		// channel is CODEX_CONFIG.developer_instructions (merged into
-		// thread/start config). Codex treats this as a developer-layer
-		// extension (append semantics relative to built-in base instructions);
-		// true baseInstructions replace is not exposed by the npm adapter.
+		// codex-acp ignores session/new _meta.systemPrompt. Host intent is
+		// projected through CODEX_CONFIG (ConfigToml keys merged into session
+		// config): replace → instructions (system/base override), append →
+		// developer_instructions.
 		profile.ProjectSystemPrompt = projectCodexSystemPrompt
 		profile.ApplyAgentConfig = applyCodexAgentConfig
 	case ClaudeCodeACPRegistryID:
@@ -147,10 +146,15 @@ func removeClaudeSystemPromptArgs(args []string) []string {
 }
 
 // projectCodexSystemPrompt projects host system-prompt intent into
-// Agent.Env["CODEX_CONFIG"].developer_instructions. Returns nil session meta
-// because codex-acp does not consume ACP _meta prompt keys.
+// Agent.Env["CODEX_CONFIG"]. Returns nil session meta because codex-acp does
+// not consume ACP _meta prompt keys.
+//
+// ConfigToml keys (what CODEX_CONFIG must use):
+//
+//	replace → instructions            (system/base override; becomes Config.base_instructions)
+//	append  → developer_instructions  (separate developer-layer message)
 func projectCodexSystemPrompt(agent Agent, prompt SystemPromptProjection) (Agent, map[string]any) {
-	env, err := injectCodexDeveloperInstructions(agent.Env, prompt)
+	env, err := injectCodexSystemPromptConfig(agent.Env, prompt)
 	if err != nil {
 		return agent, nil
 	}
@@ -158,10 +162,17 @@ func projectCodexSystemPrompt(agent Agent, prompt SystemPromptProjection) (Agent
 	return agent, nil
 }
 
-// injectCodexDeveloperInstructions deep-merges developer_instructions into the
-// existing CODEX_CONFIG JSON env value. Append mode concatenates onto any
-// existing developer_instructions; replace mode overwrites that field only.
-func injectCodexDeveloperInstructions(existingEnv map[string]string, prompt SystemPromptProjection) (map[string]string, error) {
+// CODEX_CONFIG / ConfigToml keys. Base override is "instructions", not
+// "base_instructions" — the latter is only the resolved Config field name.
+const (
+	codexConfigInstructionsKey          = "instructions"
+	codexConfigDeveloperInstructionsKey = "developer_instructions"
+)
+
+// injectCodexSystemPromptConfig deep-merges the host prompt into CODEX_CONFIG.
+// Replace overwrites instructions; append concatenates onto any existing
+// developer_instructions. The two config fields are independent layers.
+func injectCodexSystemPromptConfig(existingEnv map[string]string, prompt SystemPromptProjection) (map[string]string, error) {
 	env := map[string]string{}
 	for k, v := range existingEnv {
 		env[k] = v
@@ -178,14 +189,16 @@ func injectCodexDeveloperInstructions(existingEnv map[string]string, prompt Syst
 		return env, nil
 	}
 	if prompt.Mode == SystemPromptModeAppend {
-		if prev, ok := config["developer_instructions"].(string); ok {
+		if prev, ok := config[codexConfigDeveloperInstructionsKey].(string); ok {
 			prev = strings.TrimSpace(prev)
 			if prev != "" {
 				text = prev + "\n\n" + text
 			}
 		}
+		config[codexConfigDeveloperInstructionsKey] = text
+	} else {
+		config[codexConfigInstructionsKey] = text
 	}
-	config["developer_instructions"] = text
 	data, err := json.Marshal(config)
 	if err != nil {
 		return nil, err

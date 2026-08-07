@@ -51,7 +51,31 @@ func TestPrepareAgentSessionStartAcceptsWithSystemPromptHelper(t *testing.T) {
 		t.Fatalf("reserved key should be consumed: %#v", meta)
 	}
 	cfg := decodeCodexConfig(t, agent.Env["CODEX_CONFIG"])
-	if cfg["developer_instructions"] != "via helper" {
+	if cfg["instructions"] != "via helper" {
 		t.Fatalf("cfg = %#v", cfg)
+	}
+}
+
+func TestPrepareAgentSessionStartCodexAppendUsesDeveloperInstructions(t *testing.T) {
+	profile := ResolveAgentProfile(Agent{Type: CodexACPRegistryID})
+	agent, _, err := prepareAgentSessionStart(profile, StartSessionOptions{
+		Agent: Agent{
+			Type:    CodexACPRegistryID,
+			Command: "npm",
+			Env: map[string]string{
+				"CODEX_CONFIG": `{"developer_instructions":"existing"}`,
+			},
+		},
+		Meta: WithAppendSystemPrompt("more"),
+	})
+	if err != nil {
+		t.Fatalf("prepareAgentSessionStart() error = %v", err)
+	}
+	cfg := decodeCodexConfig(t, agent.Env["CODEX_CONFIG"])
+	if cfg["developer_instructions"] != "existing\n\nmore" {
+		t.Fatalf("cfg = %#v", cfg)
+	}
+	if _, ok := cfg["instructions"]; ok {
+		t.Fatalf("append should not set instructions: %#v", cfg)
 	}
 }
