@@ -11,4 +11,4 @@ Go runtime 通过 `Session` 暴露只读快照：
 - `Metadata()` 返回 session 标题、mode、config 和 available command metadata。
 - `Snapshot()` 返回最小恢复模型。
 
-当前 Go port 暂不把 watcher API 放入第一版公开 surface。宿主可通过 `StartTurn` 的事件消费 live update，并在需要当前状态时读取 snapshot。
+当前 Go port 暂不把 watcher API 放入第一版公开 surface。宿主可通过 `StartTurn` 的事件消费 live update，并在需要当前状态时读取 snapshot。turn 结束后，从 `Session.Updates()` 消费没有 in-flight turn 时到达的 `session/update`。

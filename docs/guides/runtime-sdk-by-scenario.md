@@ -28,6 +28,30 @@ for event := range turn.Events {
 result := <-turn.Completion
 ```
 
+## Background Session Updates
+
+`session/prompt` clears the in-flight turn when it returns. Follow-up
+`session/update` notifications after that, such as Claude background bash
+completion text, are not turn events. Drain `Session.Updates()` for those
+orphans; a full buffer drops the notification and fires `OnEventDrop`.
+
+```go
+updates := session.Updates()
+go func() {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case notification, ok := <-updates:
+			if !ok {
+				return
+			}
+			_ = notification
+		}
+	}
+}()
+```
+
 ## Agent Control
 
 ```go

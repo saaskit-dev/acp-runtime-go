@@ -26,6 +26,30 @@ for event := range turn.Events {
 result := <-turn.Completion
 ```
 
+## 后台 Session Updates
+
+`session/prompt` 返回后会清掉 in-flight turn。之后到达的 `session/update`
+（例如 Claude 后台 bash 完成后的 follow-up 文本）不再进入 turn events。
+需要从 `Session.Updates()` 消费这些 orphan 通知；缓冲区满时会丢弃并触发
+`OnEventDrop`。
+
+```go
+updates := session.Updates()
+go func() {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case notification, ok := <-updates:
+			if !ok {
+				return
+			}
+			_ = notification
+		}
+	}
+}()
+```
+
 ## Agent Control
 
 ```go

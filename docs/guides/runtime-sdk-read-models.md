@@ -15,4 +15,6 @@ The Go runtime exposes read models as immutable snapshots from `Session`.
 
 The current Go port keeps watcher APIs out of the first public surface. Hosts can
 consume turn events from `StartTurn` for live updates and read snapshots after
-each event when they need current state.
+each event when they need current state. After a turn settles, drain
+`Session.Updates()` for `session/update` notifications that arrive with no
+in-flight turn.

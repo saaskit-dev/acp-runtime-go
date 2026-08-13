@@ -960,6 +960,10 @@ type TurnResult struct {
 	Err        error
 }
 
+type SessionUpdateStream interface {
+	Updates() <-chan SessionNotification
+}
+
 type TurnCompletion struct {
 	TurnID     string
 	OutputText string

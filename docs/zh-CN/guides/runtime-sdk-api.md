@@ -62,6 +62,7 @@ options.Meta = acp.MergeMeta(
 
 - `Run(ctx, text)`
 - `StartTurn(ctx, RuntimePrompt)`
+- `Updates()`
 - `CancelTurn(ctx, turnID)`
 - `SetAgentMode(ctx, modeID)`
 - `SetAgentConfigOption(ctx, id, value)`

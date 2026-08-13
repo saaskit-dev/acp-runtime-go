@@ -8,6 +8,7 @@ import (
 type Session struct {
 	runtime *Runtime
 	driver  SessionDriver
+	updates <-chan SessionNotification
 
 	mu     sync.RWMutex
 	closed bool
@@ -15,6 +16,24 @@ type Session struct {
 
 func (s *Session) Capabilities() RuntimeCapabilities {
 	return s.driver.Capabilities()
+}
+
+// Updates emits session/update notifications that arrived with no in-flight
+// turn. Hosts that bind events to session/prompt must drain this channel for
+// background follow-up text.
+func (s *Session) Updates() <-chan SessionNotification {
+	if s == nil {
+		return nil
+	}
+	if s.updates != nil {
+		return s.updates
+	}
+	if source, ok := s.driver.(interface {
+		SessionUpdates() <-chan SessionNotification
+	}); ok {
+		return source.SessionUpdates()
+	}
+	return nil
 }
 
 func (s *Session) Diagnostics() RuntimeDiagnostics {

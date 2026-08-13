@@ -53,6 +53,7 @@ type acpSessionDriver struct {
 	turnSeq      int
 	rawConfig    map[string]any
 	queuePolicy  QueuePolicy
+	updates      chan SessionNotification
 	// read-model caps (resolved defaults; 0 should not appear after construction)
 	maxThread      int
 	maxToolCalls   int
@@ -111,6 +112,7 @@ func newACPSessionDriver(bootstrap sessionBootstrap) *acpSessionDriver {
 		permissions:    map[string]PermissionRequestSnapshot{},
 		rawConfig:      rawConfigFromMetadata(metadataFromSessionResponse(bootstrap.SessionResponse)),
 		queuePolicy:    bootstrap.QueuePolicy,
+		updates:        make(chan SessionNotification, 64),
 		maxThread:      maxThread,
 		maxToolCalls:   maxToolCalls,
 		maxPermissions: maxPermissions,
@@ -660,7 +662,11 @@ func (d *acpSessionDriver) handleSessionUpdate(notification SessionNotification)
 	d.mu.Unlock()
 	if active == nil || active.dropIntermediate {
 		// "drop" delivery still mutates the read model above; only the event
-		// stream is suppressed. nil active means no in-flight turn.
+		// stream is suppressed. nil active means no in-flight turn, so emit
+		// the notification on the session-level Updates channel.
+		if active == nil {
+			d.emitOrphanSessionUpdate(notification)
+		}
 		return
 	}
 	switch update.SessionUpdate {
@@ -684,6 +690,29 @@ func (d *acpSessionDriver) handleSessionUpdate(notification SessionNotification)
 			d.emitTurnEvent(active, TurnEvent{Type: "operation_updated", TurnID: active.id, ToolCall: &tool, Operation: &op})
 		}
 	}
+}
+
+func (d *acpSessionDriver) emitOrphanSessionUpdate(notification SessionNotification) {
+	if d == nil || d.updates == nil {
+		return
+	}
+	select {
+	case d.updates <- notification:
+	default:
+		if d.hooks.OnEventDrop != nil {
+			d.hooks.OnEventDrop(RuntimeEventDrop{
+				SessionID: d.sessionID,
+				EventType: notification.Update.SessionUpdate,
+			})
+		}
+	}
+}
+
+func (d *acpSessionDriver) SessionUpdates() <-chan SessionNotification {
+	if d == nil {
+		return nil
+	}
+	return d.updates
 }
 
 func sessionUpdateText(update SessionUpdate) string {

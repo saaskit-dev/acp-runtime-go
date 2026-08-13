@@ -207,6 +207,151 @@ func TestSessionUpdateAcceptsSingleContentBlock(t *testing.T) {
 	}
 }
 
+func TestHandleSessionUpdateEmitsOrphanWhenNoTurn(t *testing.T) {
+	driver := &acpSessionDriver{
+		sessionID:   "session-1",
+		status:      "ready",
+		toolCalls:   map[string]ToolCallSnapshot{},
+		operations:  map[string]Operation{},
+		permissions: map[string]PermissionRequestSnapshot{},
+		rawConfig:   map[string]any{},
+		updates:     make(chan SessionNotification, 64),
+	}
+	driver.handleSessionUpdate(SessionNotification{
+		SessionID: "session-1",
+		Update: SessionUpdate{
+			SessionUpdate: "agent_message_chunk",
+			Type:          "text",
+			Text:          "follow-up",
+		},
+	})
+	select {
+	case got := <-driver.SessionUpdates():
+		if got.Update.Text != "follow-up" {
+			t.Fatalf("orphan update text = %q, want follow-up", got.Update.Text)
+		}
+	default:
+		t.Fatal("expected orphan session update")
+	}
+}
+
+func TestHandleSessionUpdateDoesNotEmitOrphanDuringTurn(t *testing.T) {
+	active := &activeTurn{
+		id:         "turn-1",
+		events:     make(chan TurnEvent, 8),
+		completion: make(chan TurnResult, 1),
+	}
+	driver := &acpSessionDriver{
+		sessionID:   "session-1",
+		currentTurn: active,
+		status:      "running",
+		toolCalls:   map[string]ToolCallSnapshot{},
+		operations:  map[string]Operation{},
+		permissions: map[string]PermissionRequestSnapshot{},
+		rawConfig:   map[string]any{},
+		updates:     make(chan SessionNotification, 64),
+	}
+	driver.handleSessionUpdate(SessionNotification{
+		SessionID: "session-1",
+		Update: SessionUpdate{
+			SessionUpdate: "agent_message_chunk",
+			Text:          "in-turn",
+		},
+	})
+	select {
+	case <-driver.SessionUpdates():
+		t.Fatal("in-turn update must not go to SessionUpdates")
+	default:
+	}
+	select {
+	case event := <-active.events:
+		if event.Text != "in-turn" {
+			t.Fatalf("turn event text = %q, want in-turn", event.Text)
+		}
+	default:
+		t.Fatal("expected turn event")
+	}
+}
+
+func TestHandleSessionUpdateDoesNotEmitOrphanWhenDropDelivery(t *testing.T) {
+	active := &activeTurn{
+		id:               "turn-1",
+		events:           make(chan TurnEvent, 1),
+		completion:       make(chan TurnResult, 1),
+		dropIntermediate: true,
+	}
+	driver := &acpSessionDriver{
+		sessionID:   "session-1",
+		currentTurn: active,
+		updates:     make(chan SessionNotification, 8),
+		toolCalls:   map[string]ToolCallSnapshot{},
+		operations:  map[string]Operation{},
+		permissions: map[string]PermissionRequestSnapshot{},
+		rawConfig:   map[string]any{},
+	}
+	driver.handleSessionUpdate(SessionNotification{
+		SessionID: "session-1",
+		Update: SessionUpdate{
+			SessionUpdate: "agent_message_chunk",
+			Text:          "suppressed",
+		},
+	})
+	select {
+	case <-driver.SessionUpdates():
+		t.Fatal("drop delivery must not emit orphan updates")
+	default:
+	}
+	if got := active.outputText.String(); got != "suppressed" {
+		t.Fatalf("outputText = %q, want suppressed", got)
+	}
+}
+
+func TestEmitOrphanSessionUpdateDropsWhenBufferFull(t *testing.T) {
+	var dropped []RuntimeEventDrop
+	driver := &acpSessionDriver{
+		sessionID: "session-1",
+		updates:   make(chan SessionNotification, 1),
+		hooks: RuntimeHooks{
+			OnEventDrop: func(drop RuntimeEventDrop) {
+				dropped = append(dropped, drop)
+			},
+		},
+	}
+	driver.emitOrphanSessionUpdate(SessionNotification{
+		SessionID: "session-1",
+		Update:    SessionUpdate{SessionUpdate: "agent_message_chunk", Text: "keep"},
+	})
+	driver.emitOrphanSessionUpdate(SessionNotification{
+		SessionID: "session-1",
+		Update:    SessionUpdate{SessionUpdate: "agent_message_chunk", Text: "drop"},
+	})
+	if len(dropped) != 1 {
+		t.Fatalf("OnEventDrop count = %d, want 1", len(dropped))
+	}
+	if dropped[0].SessionID != "session-1" || dropped[0].EventType != "agent_message_chunk" {
+		t.Fatalf("drop = %#v", dropped[0])
+	}
+	if got := <-driver.SessionUpdates(); got.Update.Text != "keep" {
+		t.Fatalf("buffered update = %q, want keep", got.Update.Text)
+	}
+}
+
+func TestSessionUpdatesWiresDriverChannel(t *testing.T) {
+	updates := make(chan SessionNotification, 1)
+	session := newSession(nil, &acpSessionDriver{updates: updates})
+	if session.Updates() != updates {
+		t.Fatal("Session.Updates() is not wired to the driver channel")
+	}
+}
+
+func TestSessionUpdatesFallsBackToDriver(t *testing.T) {
+	updates := make(chan SessionNotification, 1)
+	session := &Session{driver: &acpSessionDriver{updates: updates}}
+	if session.Updates() != updates {
+		t.Fatal("Session.Updates() should fall back to driver.SessionUpdates()")
+	}
+}
+
 func TestSessionUpdateAcceptsContentBlockArray(t *testing.T) {
 	var notification SessionNotification
 	raw := []byte(`{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":[{"type":"text","text":"OK"}]}}`)

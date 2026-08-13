@@ -118,7 +118,17 @@ func (r *Runtime) register(driver SessionDriver) *Session {
 	r.mu.Lock()
 	r.sessions[snapshot.Session.ID] = &managedSession{driver: driver, refs: 1}
 	r.mu.Unlock()
-	return &Session{runtime: r, driver: driver}
+	return newSession(r, driver)
+}
+
+func newSession(runtime *Runtime, driver SessionDriver) *Session {
+	session := &Session{runtime: runtime, driver: driver}
+	if source, ok := driver.(interface {
+		SessionUpdates() <-chan SessionNotification
+	}); ok {
+		session.updates = source.SessionUpdates()
+	}
+	return session
 }
 
 func (r *Runtime) unregister(driver SessionDriver) {

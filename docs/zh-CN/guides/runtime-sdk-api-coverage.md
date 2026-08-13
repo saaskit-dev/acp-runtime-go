@@ -11,6 +11,7 @@
 | simulator prompt flow | `runtime_test.go` |
 | simulator write/tool operation projection | `runtime_test.go` |
 | command builds | `runtime_test.go` |
+| orphan `session/update` export | `session_test.go` |
 | harness admission path | `make harness-admission` |
 
 较大改动交付前运行：
