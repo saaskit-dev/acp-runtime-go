@@ -34,6 +34,9 @@ result := <-turn.Completion
 `session/update` notifications after that, such as Claude background bash
 completion text, are not turn events. Drain `Session.Updates()` for those
 orphans; a full buffer drops the notification and fires `OnEventDrop`.
+Group orphans by `UpdateID` (protocol `messageId`, or `orphan:{session}:{n}`).
+`Terminal` is true when that generation closes: `available_commands_update`,
+a new `messageId`, or the next `StartTurn`.
 
 ```go
 updates := session.Updates()

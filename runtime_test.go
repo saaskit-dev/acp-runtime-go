@@ -894,6 +894,93 @@ func TestSimulatorInvokesHostTerminal(t *testing.T) {
 	}
 }
 
+func TestRuntimeExportsOrphanFollowUpWithStableUpdateID(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cwd := t.TempDir()
+	storage := t.TempDir()
+	simulatorBin := buildSimulatorBinary(t)
+	agent := Agent{
+		Type:    LocalSimulatorAgentACPRegistryID,
+		Command: simulatorBin,
+		Args:    []string{"--auth-mode", "none", "--storage-dir", storage},
+	}
+	runtime := NewRuntime(NewStdioConnectionFactory(StdioFactoryOptions{}), RuntimeOptions{})
+	session, err := runtime.StartSession(ctx, StartSessionOptions{Agent: agent, CWD: cwd})
+	if err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+	defer session.Close(context.Background())
+
+	updates := session.Updates()
+	if updates == nil {
+		t.Fatal("Session.Updates() is nil")
+	}
+	type collected struct {
+		events []SessionNotification
+		err    error
+	}
+	got := make(chan collected, 1)
+	go func() {
+		var events []SessionNotification
+		for {
+			select {
+			case <-ctx.Done():
+				got <- collected{events: events, err: ctx.Err()}
+				return
+			case notification, ok := <-updates:
+				if !ok {
+					got <- collected{events: events}
+					return
+				}
+				if notification.UpdateID == "" {
+					continue
+				}
+				events = append(events, notification)
+				if notification.Terminal {
+					got <- collected{events: events}
+					return
+				}
+			}
+		}
+	}()
+
+	completion, err := session.Run(ctx, "/followup")
+	if err != nil {
+		t.Fatalf("Run(/followup) error = %v", err)
+	}
+	if !strings.Contains(completion.OutputText, "STARTED") {
+		t.Fatalf("OutputText = %q, want STARTED during the prompt turn", completion.OutputText)
+	}
+
+	select {
+	case result := <-got:
+		if result.err != nil {
+			t.Fatalf("collect orphan updates: %v events=%d", result.err, len(result.events))
+		}
+		if len(result.events) < 2 {
+			t.Fatalf("orphan events = %d, want tool/text body plus closer", len(result.events))
+		}
+		id := result.events[0].UpdateID
+		var text strings.Builder
+		for i, event := range result.events {
+			if event.UpdateID != id {
+				t.Fatalf("event[%d] UpdateID = %q, want %q", i, event.UpdateID, id)
+			}
+			text.WriteString(event.Update.Text)
+		}
+		last := result.events[len(result.events)-1]
+		if !last.Terminal {
+			t.Fatalf("last orphan event was not Terminal: %#v", last)
+		}
+		if !strings.Contains(text.String(), "ORPHAN-BG-DONE") {
+			t.Fatalf("follow-up text = %q, want ORPHAN-BG-DONE", text.String())
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for orphan follow-up")
+	}
+}
+
 func buildSimulatorBinary(t *testing.T) string {
 	t.Helper()
 	bin := filepath.Join(t.TempDir(), "acp-simulator-agent")

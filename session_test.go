@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestSessionRejectsOperationsAfterClose(t *testing.T) {
@@ -230,9 +233,303 @@ func TestHandleSessionUpdateEmitsOrphanWhenNoTurn(t *testing.T) {
 		if got.Update.Text != "follow-up" {
 			t.Fatalf("orphan update text = %q, want follow-up", got.Update.Text)
 		}
+		if got.UpdateID == "" {
+			t.Fatal("orphan update must carry UpdateID")
+		}
+		if got.Terminal {
+			t.Fatal("body chunk must not close the generation")
+		}
 	default:
 		t.Fatal("expected orphan session update")
 	}
+}
+
+func TestOrphanUpdatesShareGenerationWithoutMessageID(t *testing.T) {
+	driver := newOrphanTestDriver()
+	driver.handleSessionUpdate(SessionNotification{
+		SessionID: "session-1",
+		Update:    SessionUpdate{SessionUpdate: "agent_thought_chunk", Text: "想"},
+	})
+	driver.handleSessionUpdate(SessionNotification{
+		SessionID: "session-1",
+		Update:    SessionUpdate{SessionUpdate: "agent_message_chunk", Text: "按时"},
+	})
+	first := recvOrphan(t, driver)
+	second := recvOrphan(t, driver)
+	if first.UpdateID == "" || first.UpdateID != second.UpdateID {
+		t.Fatalf("generation ids = %q %q", first.UpdateID, second.UpdateID)
+	}
+	if !strings.HasPrefix(first.UpdateID, "orphan:session-1:") {
+		t.Fatalf("UpdateID = %q, want SDK generation", first.UpdateID)
+	}
+}
+
+func TestOrphanUpdateUsesProtocolMessageID(t *testing.T) {
+	driver := newOrphanTestDriver()
+	driver.handleSessionUpdate(SessionNotification{
+		SessionID: "session-1",
+		Update: SessionUpdate{
+			SessionUpdate: "agent_message_chunk",
+			MessageID:     "msg_agent_c42b9",
+			Text:          "吃药",
+		},
+	})
+	got := recvOrphan(t, driver)
+	if got.UpdateID != "msg_agent_c42b9" {
+		t.Fatalf("UpdateID = %q, want protocol messageId", got.UpdateID)
+	}
+}
+
+func TestOrphanAvailableCommandsClosesGeneration(t *testing.T) {
+	driver := newOrphanTestDriver()
+	driver.handleSessionUpdate(SessionNotification{
+		SessionID: "session-1",
+		Update:    SessionUpdate{SessionUpdate: "agent_message_chunk", Text: "完成"},
+	})
+	body := recvOrphan(t, driver)
+	driver.handleSessionUpdate(SessionNotification{
+		SessionID: "session-1",
+		Update:    SessionUpdate{SessionUpdate: "available_commands_update"},
+	})
+	idle := recvOrphan(t, driver)
+	if !idle.Terminal || idle.UpdateID != body.UpdateID {
+		t.Fatalf("idle close = %#v body=%q", idle, body.UpdateID)
+	}
+	driver.handleSessionUpdate(SessionNotification{
+		SessionID: "session-1",
+		Update:    SessionUpdate{SessionUpdate: "agent_message_chunk", Text: "下一轮"},
+	})
+	next := recvOrphan(t, driver)
+	if next.UpdateID == "" || next.UpdateID == body.UpdateID {
+		t.Fatalf("next generation = %q, previous = %q", next.UpdateID, body.UpdateID)
+	}
+}
+
+func TestOrphanMessageIDChangeClosesPrevious(t *testing.T) {
+	driver := newOrphanTestDriver()
+	driver.handleSessionUpdate(SessionNotification{
+		SessionID: "session-1",
+		Update:    SessionUpdate{SessionUpdate: "agent_message_chunk", MessageID: "msg-1", Text: "一"},
+	})
+	driver.handleSessionUpdate(SessionNotification{
+		SessionID: "session-1",
+		Update:    SessionUpdate{SessionUpdate: "agent_message_chunk", MessageID: "msg-2", Text: "二"},
+	})
+	first := recvOrphan(t, driver)
+	closed := recvOrphan(t, driver)
+	second := recvOrphan(t, driver)
+	if first.UpdateID != "msg-1" || second.UpdateID != "msg-2" {
+		t.Fatalf("ids = %q %q", first.UpdateID, second.UpdateID)
+	}
+	if !closed.Terminal || closed.UpdateID != "msg-1" {
+		t.Fatalf("close = %#v", closed)
+	}
+}
+
+func TestStartTurnClosesOpenOrphanGeneration(t *testing.T) {
+	driver := newOrphanTestDriver()
+	connectPromptProvider(t, driver)
+	driver.handleSessionUpdate(SessionNotification{
+		SessionID: "session-1",
+		Update:    SessionUpdate{SessionUpdate: "agent_message_chunk", Text: "后台"},
+	})
+	body := recvOrphan(t, driver)
+	handle := driver.StartTurn(context.Background(), RuntimePrompt{Text: "next"})
+	closed := recvOrphanWait(t, driver, time.Second)
+	if !closed.Terminal || closed.UpdateID != body.UpdateID {
+		t.Fatalf("start turn close = %#v body=%q", closed, body.UpdateID)
+	}
+	result := <-handle.Completion
+	if result.Err != nil {
+		t.Fatalf("StartTurn completion err = %v", result.Err)
+	}
+}
+
+func TestCloseClosesOpenOrphanGeneration(t *testing.T) {
+	driver := newOrphanTestDriver()
+	peer := NewPeer(neverEOFReader{}, discardWriter{}, PeerOptions{})
+	driver.connection = NewConnection(peer, Client{})
+	driver.handleSessionUpdate(SessionNotification{
+		SessionID: "session-1",
+		Update:    SessionUpdate{SessionUpdate: "agent_message_chunk", Text: "后台"},
+	})
+	body := recvOrphan(t, driver)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- driver.Close(ctx) }()
+	closed := recvOrphanWait(t, driver, time.Second)
+	if !closed.Terminal || closed.UpdateID != body.UpdateID {
+		t.Fatalf("close terminal = %#v body=%q", closed, body.UpdateID)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not return")
+	}
+}
+
+func TestOrphanBackgroundFollowUpSharesGenerationThenCloses(t *testing.T) {
+	driver := newOrphanTestDriver()
+	status := "completed"
+	title := "sleep 60 && echo ORPHAN-BG-DONE-42"
+	kind := "execute"
+	driver.handleSessionUpdate(SessionNotification{
+		SessionID: "session-1",
+		Update:    SessionUpdate{SessionUpdate: "tool_call_update", ToolCallID: "bg-sleep", Title: &title, Kind: &kind, Status: &status},
+	})
+	for _, text := range []string{"OR", "PHAN", "-BG-DONE"} {
+		driver.handleSessionUpdate(SessionNotification{
+			SessionID: "session-1",
+			Update:    SessionUpdate{SessionUpdate: "agent_message_chunk", Text: text},
+		})
+	}
+	driver.handleSessionUpdate(SessionNotification{
+		SessionID: "session-1",
+		Update:    SessionUpdate{SessionUpdate: "available_commands_update"},
+	})
+	var events []SessionNotification
+	for i := 0; i < 5; i++ {
+		events = append(events, recvOrphan(t, driver))
+	}
+	id := events[0].UpdateID
+	if id == "" {
+		t.Fatal("follow-up generation id is empty")
+	}
+	var text strings.Builder
+	for i, event := range events {
+		if event.UpdateID != id {
+			t.Fatalf("event[%d] UpdateID = %q, want %q", i, event.UpdateID, id)
+		}
+		if i < 4 && event.Terminal {
+			t.Fatalf("event[%d] closed generation early: %#v", i, event)
+		}
+		text.WriteString(event.Update.Text)
+	}
+	if !events[4].Terminal || events[4].Update.SessionUpdate != "available_commands_update" {
+		t.Fatalf("closer = %#v", events[4])
+	}
+	if text.String() != "ORPHAN-BG-DONE" {
+		t.Fatalf("concatenated body text = %q", text.String())
+	}
+}
+
+func TestOrphanConfigUpdateDoesNotCloseGeneration(t *testing.T) {
+	driver := newOrphanTestDriver()
+	driver.handleSessionUpdate(SessionNotification{
+		SessionID: "session-1",
+		Update:    SessionUpdate{SessionUpdate: "agent_message_chunk", Text: "进行中"},
+	})
+	body := recvOrphan(t, driver)
+	driver.handleSessionUpdate(SessionNotification{
+		SessionID: "session-1",
+		Update:    SessionUpdate{SessionUpdate: "config_option_update"},
+	})
+	meta := recvOrphan(t, driver)
+	if meta.Terminal || meta.UpdateID != body.UpdateID {
+		t.Fatalf("config update = %#v", meta)
+	}
+	driver.handleSessionUpdate(SessionNotification{
+		SessionID: "session-1",
+		Update:    SessionUpdate{SessionUpdate: "agent_message_chunk", Text: "续"},
+	})
+	cont := recvOrphan(t, driver)
+	if cont.UpdateID != body.UpdateID || cont.Terminal {
+		t.Fatalf("continuation = %#v", cont)
+	}
+}
+
+func TestOrphanLateMessageIDKeepsGeneration(t *testing.T) {
+	driver := newOrphanTestDriver()
+	driver.handleSessionUpdate(SessionNotification{
+		SessionID: "session-1",
+		Update:    SessionUpdate{SessionUpdate: "agent_message_chunk", Text: "先"},
+	})
+	first := recvOrphan(t, driver)
+	driver.handleSessionUpdate(SessionNotification{
+		SessionID: "session-1",
+		Update: SessionUpdate{
+			SessionUpdate: "agent_message_chunk",
+			MessageID:     "msg_late",
+			Text:          "后",
+		},
+	})
+	second := recvOrphan(t, driver)
+	if first.UpdateID != second.UpdateID {
+		t.Fatalf("late messageId rewrote UpdateID %q -> %q", first.UpdateID, second.UpdateID)
+	}
+	if !strings.HasPrefix(first.UpdateID, "orphan:session-1:") {
+		t.Fatalf("UpdateID = %q, want stable SDK generation", first.UpdateID)
+	}
+}
+
+func TestSessionUpdateUnmarshalsMessageID(t *testing.T) {
+	var notification SessionNotification
+	raw := []byte(`{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","messageId":"msg_1","content":{"type":"text","text":"OK"}}}`)
+	if err := json.Unmarshal(raw, &notification); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if notification.Update.MessageID != "msg_1" {
+		t.Fatalf("MessageID = %q", notification.Update.MessageID)
+	}
+}
+
+func newOrphanTestDriver() *acpSessionDriver {
+	return &acpSessionDriver{
+		sessionID:   "session-1",
+		status:      "ready",
+		toolCalls:   map[string]ToolCallSnapshot{},
+		operations:  map[string]Operation{},
+		permissions: map[string]PermissionRequestSnapshot{},
+		rawConfig:   map[string]any{},
+		updates:     make(chan SessionNotification, 64),
+	}
+}
+
+func recvOrphan(t *testing.T, driver *acpSessionDriver) SessionNotification {
+	t.Helper()
+	select {
+	case got := <-driver.SessionUpdates():
+		return got
+	default:
+		t.Fatal("expected orphan session update")
+		return SessionNotification{}
+	}
+}
+
+func recvOrphanWait(t *testing.T, driver *acpSessionDriver, wait time.Duration) SessionNotification {
+	t.Helper()
+	select {
+	case got := <-driver.SessionUpdates():
+		return got
+	case <-time.After(wait):
+		t.Fatal("timed out waiting for orphan session update")
+		return SessionNotification{}
+	}
+}
+
+func connectPromptProvider(t *testing.T, driver *acpSessionDriver) {
+	t.Helper()
+	providerReader, runtimeWriter := io.Pipe()
+	runtimeReader, providerWriter := io.Pipe()
+	runtimePeer := NewPeer(runtimeReader, runtimeWriter, PeerOptions{})
+	providerPeer := NewPeer(providerReader, providerWriter, PeerOptions{})
+	providerPeer.RegisterRequest("session/prompt", func(context.Context, json.RawMessage) (any, error) {
+		return PromptResponse{StopReason: "end_turn"}, nil
+	})
+	driver.connection = NewConnection(runtimePeer, Client{})
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = runtimePeer.Start(ctx) }()
+	go func() { _ = providerPeer.Start(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		runtimePeer.Close()
+		providerPeer.Close()
+		_ = providerReader.Close()
+		_ = runtimeWriter.Close()
+		_ = runtimeReader.Close()
+		_ = providerWriter.Close()
+	})
 }
 
 func TestHandleSessionUpdateDoesNotEmitOrphanDuringTurn(t *testing.T) {

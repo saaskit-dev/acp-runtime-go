@@ -478,6 +478,8 @@ func parseAction(text string) action {
 	trimmed := strings.TrimSpace(text)
 	lower := strings.ToLower(trimmed)
 	switch {
+	case trimmed == "/followup":
+		return action{kind: "followup"}
 	case strings.HasPrefix(trimmed, "/rename "):
 		return action{kind: "rename", title: strings.TrimSpace(trimmed[len("/rename "):])}
 	case strings.HasPrefix(trimmed, "/scenario "):
@@ -536,6 +538,13 @@ func parseAction(text string) action {
 
 func (a *Agent) executeAction(ctx context.Context, session *Session, action action) error {
 	switch action.kind {
+	case "followup":
+		if err := a.streamText(ctx, session.ID, "STARTED"); err != nil {
+			return err
+		}
+		sessionID := session.ID
+		go a.emitBackgroundFollowUp(sessionID)
+		return nil
 	case "plan":
 		entries := []acp.PlanEntry{{Content: action.content, Status: "in_progress", Priority: "medium"}}
 		_ = a.notify(ctx, session.ID, acp.SessionUpdate{SessionUpdate: "plan", Entries: entries})
@@ -625,6 +634,30 @@ func (a *Agent) executeAction(ctx context.Context, session *Session, action acti
 	default:
 		return a.streamText(ctx, session.ID, "OK")
 	}
+}
+
+func (a *Agent) emitBackgroundFollowUp(sessionID string) {
+	time.Sleep(80 * time.Millisecond)
+	ctx := context.Background()
+	status := "completed"
+	title := "sleep 60 && echo ORPHAN-BG-DONE-42"
+	kind := "execute"
+	_ = a.notify(ctx, sessionID, acp.SessionUpdate{
+		SessionUpdate: "tool_call_update",
+		ToolCallID:    "bg-sleep",
+		Title:         &title,
+		Kind:          &kind,
+		Status:        &status,
+	})
+	for _, chunk := range []string{"ORPHAN", "-BG-", "DONE"} {
+		_ = a.notify(ctx, sessionID, acp.SessionUpdate{
+			SessionUpdate: "agent_message_chunk",
+			Type:          "text",
+			Text:          chunk,
+			MessageID:     "msg_followup_1",
+		})
+	}
+	_ = a.notify(ctx, sessionID, acp.SessionUpdate{SessionUpdate: "available_commands_update"})
 }
 
 func (a *Agent) streamText(ctx context.Context, sessionID string, text string) error {

@@ -37,5 +37,6 @@ The simulator supports deterministic prompts for:
 - write
 - run
 - rename
+- followup (`/followup` returns STARTED, then emits orphan tool/text updates)
 
 Use `make harness-admission` for the first-pass simulator gate.

@@ -444,10 +444,19 @@ type SessionConfigGroup struct {
 type SessionNotification struct {
 	SessionID string        `json:"sessionId"`
 	Update    SessionUpdate `json:"update"`
+	// UpdateID groups orphan session/update notifications (no in-flight
+	// session/prompt). It is the protocol messageId when the opening chunk
+	// carries one, otherwise an SDK-assigned generation id. Empty when the
+	// update belongs to the in-flight prompt turn.
+	UpdateID string `json:"updateId,omitempty"`
+	// Terminal is true when this notification closes UpdateID. The next
+	// orphan body starts a new UpdateID.
+	Terminal bool `json:"terminal,omitempty"`
 }
 
 type SessionUpdate struct {
 	SessionUpdate     string                `json:"sessionUpdate"`
+	MessageID         string                `json:"messageId,omitempty"`
 	Type              string                `json:"type,omitempty"`
 	Text              string                `json:"text,omitempty"`
 	ToolCallID        string                `json:"toolCallId,omitempty"`

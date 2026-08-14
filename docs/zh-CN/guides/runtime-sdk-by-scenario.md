@@ -31,7 +31,9 @@ result := <-turn.Completion
 `session/prompt` 返回后会清掉 in-flight turn。之后到达的 `session/update`
 （例如 Claude 后台 bash 完成后的 follow-up 文本）不再进入 turn events。
 需要从 `Session.Updates()` 消费这些 orphan 通知；缓冲区满时会丢弃并触发
-`OnEventDrop`。
+`OnEventDrop`。按 `UpdateID` 分组（协议 `messageId`，否则 `orphan:{session}:{n}`）。
+`Terminal` 为 true 表示该 generation 结束：`available_commands_update`、新的
+`messageId`，或下一次 `StartTurn`。
 
 ```go
 updates := session.Updates()

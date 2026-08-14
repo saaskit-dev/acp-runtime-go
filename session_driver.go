@@ -40,25 +40,32 @@ type acpSessionDriver struct {
 
 	sessionID string
 
-	mu           sync.RWMutex
-	status       string
-	capabilities RuntimeCapabilities
-	diagnostics  RuntimeDiagnostics
-	metadata     RuntimeSessionMetadata
-	thread       []ThreadEntry
-	toolCalls    map[string]ToolCallSnapshot
-	operations   map[string]Operation
-	permissions  map[string]PermissionRequestSnapshot
-	currentTurn  *activeTurn
-	turnSeq      int
-	rawConfig    map[string]any
-	queuePolicy  QueuePolicy
-	updates      chan SessionNotification
+	mu            sync.RWMutex
+	status        string
+	capabilities  RuntimeCapabilities
+	diagnostics   RuntimeDiagnostics
+	metadata      RuntimeSessionMetadata
+	thread        []ThreadEntry
+	toolCalls     map[string]ToolCallSnapshot
+	operations    map[string]Operation
+	permissions   map[string]PermissionRequestSnapshot
+	currentTurn   *activeTurn
+	turnSeq       int
+	orphanGen     uint64
+	orphanID      string
+	orphanMessage string
+	rawConfig     map[string]any
+	queuePolicy   QueuePolicy
+	updates       chan SessionNotification
 	// read-model caps (resolved defaults; 0 should not appear after construction)
 	maxThread      int
 	maxToolCalls   int
 	maxPermissions int
 }
+
+// orphanUpdatesBuffer holds session-level updates after prompt settle.
+// Claude background follow-up streams many small agent_message_chunk deltas.
+const orphanUpdatesBuffer = 256
 
 type activeTurn struct {
 	id         string
@@ -112,7 +119,7 @@ func newACPSessionDriver(bootstrap sessionBootstrap) *acpSessionDriver {
 		permissions:    map[string]PermissionRequestSnapshot{},
 		rawConfig:      rawConfigFromMetadata(metadataFromSessionResponse(bootstrap.SessionResponse)),
 		queuePolicy:    bootstrap.QueuePolicy,
-		updates:        make(chan SessionNotification, 64),
+		updates:        make(chan SessionNotification, orphanUpdatesBuffer),
 		maxThread:      maxThread,
 		maxToolCalls:   maxToolCalls,
 		maxPermissions: maxPermissions,
@@ -242,7 +249,10 @@ func (d *acpSessionDriver) replaceConfigOptionsLocked(options []SessionConfigOpt
 }
 
 func (d *acpSessionDriver) Close(ctx context.Context) error {
-	active := d.beginClose()
+	active, orphan := d.beginClose()
+	if orphan != nil {
+		d.sendOrphanUpdate(*orphan)
+	}
 	d.finishInFlightTurn(ctx, active, "session.close")
 	_ = d.connection.CloseSession(ctx, CloseSessionRequest{SessionID: d.sessionID})
 	var disposeErr error
@@ -258,7 +268,10 @@ func (d *acpSessionDriver) Close(ctx context.Context) error {
 // implement session/delete will return an error, which the caller may treat as
 // non-fatal (the session is still closed locally).
 func (d *acpSessionDriver) Delete(ctx context.Context) error {
-	active := d.beginClose()
+	active, orphan := d.beginClose()
+	if orphan != nil {
+		d.sendOrphanUpdate(*orphan)
+	}
 	d.finishInFlightTurn(ctx, active, "session.delete")
 	deleteErr := d.connection.DeleteSession(ctx, DeleteSessionRequest{SessionID: d.sessionID})
 	var disposeErr error
@@ -272,14 +285,14 @@ func (d *acpSessionDriver) Delete(ctx context.Context) error {
 
 // beginClose marks the driver closed and returns any in-flight turn. Callers
 // must terminalize that turn so consumers waiting on Completion do not hang.
-func (d *acpSessionDriver) beginClose() *activeTurn {
+func (d *acpSessionDriver) beginClose() (*activeTurn, *SessionNotification) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.status == "closed" {
-		return nil
+		return nil, nil
 	}
 	d.status = "closed"
-	return d.currentTurn
+	return d.currentTurn, d.takeOrphanTerminalLocked()
 }
 
 func (d *acpSessionDriver) finishInFlightTurn(ctx context.Context, active *activeTurn, op string) {
@@ -399,11 +412,15 @@ func (d *acpSessionDriver) StartTurn(ctx context.Context, prompt RuntimePrompt) 
 		dropIntermediate: d.queuePolicy.Delivery == "drop",
 		startedAt:        now,
 	}
+	terminal := d.takeOrphanTerminalLocked()
 	d.currentTurn = active
 	d.status = "running"
 	d.thread = append(d.thread, ThreadEntry{ID: turnID + "-user", Kind: "user_message", Status: "completed", Text: promptText(prompt), CreatedAt: now, UpdatedAt: now})
 	d.pruneThreadLocked()
 	d.mu.Unlock()
+	if terminal != nil {
+		d.sendOrphanUpdate(*terminal)
+	}
 	d.emitTurnEvent(active, TurnEvent{Type: "started", TurnID: turnID})
 	d.emitHookTurn(RuntimeTurnEvent{Type: "started", SessionID: d.sessionID, TurnID: turnID})
 	go d.runPrompt(ctx, active, prompt)
@@ -696,16 +713,102 @@ func (d *acpSessionDriver) emitOrphanSessionUpdate(notification SessionNotificat
 	if d == nil || d.updates == nil {
 		return
 	}
+	previous := d.bindOrphanUpdate(&notification)
+	for _, extra := range previous {
+		d.sendOrphanUpdate(extra)
+	}
+	d.sendOrphanUpdate(notification)
+}
+
+func (d *acpSessionDriver) sendOrphanUpdate(notification SessionNotification) {
+	if d == nil || d.updates == nil {
+		return
+	}
 	select {
 	case d.updates <- notification:
 	default:
 		if d.hooks.OnEventDrop != nil {
 			d.hooks.OnEventDrop(RuntimeEventDrop{
 				SessionID: d.sessionID,
-				EventType: notification.Update.SessionUpdate,
+				TurnID:    notification.UpdateID,
+				EventType: firstNonEmpty(notification.Update.SessionUpdate, "orphan_terminal"),
 			})
 		}
 	}
+}
+
+func (d *acpSessionDriver) bindOrphanUpdate(notification *SessionNotification) []SessionNotification {
+	if notification == nil {
+		return nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	kind := strings.TrimSpace(notification.Update.SessionUpdate)
+	msgID := strings.TrimSpace(notification.Update.MessageID)
+	if isOrphanIdleUpdate(kind) {
+		if d.orphanID == "" {
+			return nil
+		}
+		notification.UpdateID = d.orphanID
+		notification.Terminal = true
+		d.orphanID = ""
+		d.orphanMessage = ""
+		return nil
+	}
+	if !isOrphanBodyUpdate(kind) {
+		notification.UpdateID = d.orphanID
+		return nil
+	}
+	var previous []SessionNotification
+	if d.orphanID != "" && msgID != "" && d.orphanMessage != "" && msgID != d.orphanMessage {
+		previous = append(previous, SessionNotification{
+			SessionID: d.sessionID,
+			UpdateID:  d.orphanID,
+			Terminal:  true,
+		})
+		d.orphanID = ""
+		d.orphanMessage = ""
+	}
+	if d.orphanID == "" {
+		d.orphanGen++
+		if msgID != "" {
+			d.orphanID = msgID
+		} else {
+			d.orphanID = fmt.Sprintf("orphan:%s:%d", d.sessionID, d.orphanGen)
+		}
+		d.orphanMessage = msgID
+	} else if d.orphanMessage == "" && msgID != "" {
+		d.orphanMessage = msgID
+	}
+	notification.UpdateID = d.orphanID
+	return previous
+}
+
+func (d *acpSessionDriver) takeOrphanTerminalLocked() *SessionNotification {
+	if d.orphanID == "" {
+		return nil
+	}
+	notification := SessionNotification{
+		SessionID: d.sessionID,
+		UpdateID:  d.orphanID,
+		Terminal:  true,
+	}
+	d.orphanID = ""
+	d.orphanMessage = ""
+	return &notification
+}
+
+func isOrphanBodyUpdate(kind string) bool {
+	switch strings.TrimSpace(kind) {
+	case "agent_message_chunk", "agent_message", "message", "agent_thought_chunk", "user_message_chunk", "tool_call", "tool_call_update", "plan":
+		return true
+	default:
+		return false
+	}
+}
+
+func isOrphanIdleUpdate(kind string) bool {
+	return strings.TrimSpace(kind) == "available_commands_update"
 }
 
 func (d *acpSessionDriver) SessionUpdates() <-chan SessionNotification {

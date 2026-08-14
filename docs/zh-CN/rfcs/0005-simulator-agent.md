@@ -33,5 +33,6 @@ simulator 支持确定性 prompt：
 - write
 - run
 - rename
+- followup（`/followup` 先返回 STARTED，再发出 orphan tool/text update）
 
 使用 `make harness-admission` 作为第一道 simulator gate。

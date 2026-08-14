@@ -20,7 +20,9 @@ func (s *Session) Capabilities() RuntimeCapabilities {
 
 // Updates emits session/update notifications that arrived with no in-flight
 // turn. Hosts that bind events to session/prompt must drain this channel for
-// background follow-up text.
+// background follow-up text. Each notification carries UpdateID (protocol
+// messageId, or orphan:{session}:{n}) so hosts can group a generation; Terminal
+// is true when that generation closes.
 func (s *Session) Updates() <-chan SessionNotification {
 	if s == nil {
 		return nil
