@@ -433,11 +433,22 @@ func (d *acpSessionDriver) runPrompt(ctx context.Context, active *activeTurn, pr
 		d.finishTurn(active, TurnCompletion{}, err)
 		return
 	}
-	d.mu.RLock()
-	outputText := active.outputText.String()
-	d.mu.RUnlock()
-	completion := TurnCompletion{TurnID: active.id, OutputText: outputText, StopReason: resp.StopReason, Usage: resp.Usage}
-	d.finishTurn(active, completion, nil)
+	// session/prompt returning is not the end of inbound JSON. Claude may have
+	// already written agent_message_chunk lines after the result; snapshot
+	// OutputText only after the read loop has no complete line left. No timer:
+	// a grace period still drops slower chunks. Keep currentTurn until then so
+	// those lines fold into outputText instead of becoming orphans.
+	settle := func() {
+		d.mu.RLock()
+		outputText := active.outputText.String()
+		d.mu.RUnlock()
+		d.finishTurn(active, TurnCompletion{TurnID: active.id, OutputText: outputText, StopReason: resp.StopReason, Usage: resp.Usage}, nil)
+	}
+	if d.connection != nil {
+		d.connection.AfterReadIdle(settle)
+		return
+	}
+	settle()
 }
 
 // emitTurnEvent non-blockingly delivers an intermediate event. A full buffer
@@ -605,7 +616,7 @@ func (d *acpSessionDriver) handleSessionUpdate(notification SessionNotification)
 	d.mu.Lock()
 	active := d.currentTurn
 	switch update.SessionUpdate {
-	case "agent_message_chunk":
+	case "agent_message_chunk", "agent_message", "message":
 		if active != nil {
 			active.outputText.WriteString(sessionUpdateText(update))
 		}
@@ -687,7 +698,7 @@ func (d *acpSessionDriver) handleSessionUpdate(notification SessionNotification)
 		return
 	}
 	switch update.SessionUpdate {
-	case "agent_message_chunk":
+	case "agent_message_chunk", "agent_message", "message":
 		// Text was already folded into outputText above; recompute once for the event.
 		d.emitTurnEvent(active, TurnEvent{Type: "text", TurnID: active.id, Text: sessionUpdateText(update)})
 	case "agent_thought_chunk":

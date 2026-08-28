@@ -2,6 +2,7 @@ package acpruntime
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -96,6 +97,10 @@ type Peer struct {
 
 	closed    chan struct{}
 	closeOnce sync.Once
+
+	idleMu   sync.Mutex
+	readIdle bool
+	idleFns  []func()
 }
 
 const (
@@ -160,7 +165,11 @@ func (p *Peer) RegisterNotification(method string, handler RPCNotificationHandle
 
 func (p *Peer) Start(ctx context.Context) error {
 	for {
+		if !p.hasBufferedLine() {
+			p.markReadIdle(true)
+		}
 		line, err := p.readMessageLine()
+		p.markReadIdle(false)
 		if len(line) > 0 {
 			if p.opts.OnRawMessage != nil {
 				p.opts.OnRawMessage("inbound", append(json.RawMessage(nil), line...))
@@ -187,6 +196,54 @@ func (p *Peer) Start(ctx context.Context) error {
 			return err
 		}
 	}
+}
+
+// AfterIdle runs fn after the inbound read loop has no complete JSON line left
+// to process. session/prompt can return while a later session/update is already
+// in the stdio buffer; waiting here folds that update into the still-active turn
+// before OutputText is snapshotted. fn runs either on the caller or on the read
+// loop; it must not block the read loop.
+func (p *Peer) AfterIdle(fn func()) {
+	if p == nil || fn == nil {
+		return
+	}
+	p.idleMu.Lock()
+	if p.readIdle {
+		p.idleMu.Unlock()
+		fn()
+		return
+	}
+	p.idleFns = append(p.idleFns, fn)
+	p.idleMu.Unlock()
+}
+
+func (p *Peer) markReadIdle(idle bool) {
+	p.idleMu.Lock()
+	p.readIdle = idle
+	var fns []func()
+	if idle {
+		fns = p.idleFns
+		p.idleFns = nil
+	}
+	p.idleMu.Unlock()
+	for _, fn := range fns {
+		fn()
+	}
+}
+
+func (p *Peer) hasBufferedLine() bool {
+	if p == nil || p.reader == nil {
+		return false
+	}
+	n := p.reader.Buffered()
+	if n == 0 {
+		return false
+	}
+	buf, err := p.reader.Peek(n)
+	if len(buf) == 0 && err != nil {
+		return false
+	}
+	return bytes.IndexByte(buf, '\n') >= 0
 }
 
 func (p *Peer) Done() <-chan struct{} {

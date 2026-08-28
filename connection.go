@@ -47,6 +47,19 @@ type Client struct {
 	Authority    AuthorityHandlers
 }
 
+// AfterReadIdle runs fn once inbound JSON-RPC has no complete line left.
+// Used to snapshot TurnCompletion.OutputText after draining buffered
+// session/update notifications that followed session/prompt on the wire.
+func (c *Connection) AfterReadIdle(fn func()) {
+	if c == nil || c.peer == nil {
+		if fn != nil {
+			fn()
+		}
+		return
+	}
+	c.peer.AfterIdle(fn)
+}
+
 func NewConnection(peer *Peer, client Client) *Connection {
 	return NewConnectionWithObservability(peer, client, ObservabilityOptions{})
 }

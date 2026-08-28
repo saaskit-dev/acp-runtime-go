@@ -55,6 +55,74 @@ func TestPeerCallRawRoundTrip(t *testing.T) {
 	}
 }
 
+func TestAfterIdleAppliesBufferedNotification(t *testing.T) {
+	clientReader, serverWriter := io.Pipe()
+	defer clientReader.Close()
+	defer serverWriter.Close()
+
+	client := NewPeer(clientReader, io.Discard, PeerOptions{})
+	var mu sync.Mutex
+	var applied string
+	client.RegisterNotification("session/update", func(ctx context.Context, raw json.RawMessage) {
+		var notification SessionNotification
+		if err := json.Unmarshal(raw, &notification); err != nil {
+			t.Errorf("unmarshal session/update: %v", err)
+			return
+		}
+		mu.Lock()
+		applied = sessionUpdateText(notification.Update)
+		mu.Unlock()
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() { _ = client.Start(ctx) }()
+	defer client.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		var result map[string]any
+		errCh <- client.Call(ctx, "session/prompt", map[string]any{}, &result)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		client.pendingMu.Lock()
+		n := len(client.pending)
+		client.pendingMu.Unlock()
+		if n > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("call did not register pending id")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	if _, err := io.WriteString(serverWriter, `{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(serverWriter, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","text":"late"}}}`+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("Call() error = %v", err)
+	}
+
+	idle := make(chan struct{})
+	client.AfterIdle(func() { close(idle) })
+	select {
+	case <-idle:
+	case <-ctx.Done():
+		t.Fatal("AfterIdle did not run")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if applied != "late" {
+		t.Fatalf("notification applied = %q, want late", applied)
+	}
+}
+
 func TestPeerRawMessageHookExcludesFrameDelimiter(t *testing.T) {
 	var out bytes.Buffer
 	var raw json.RawMessage

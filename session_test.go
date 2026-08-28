@@ -1,6 +1,7 @@
 package acpruntime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -505,6 +506,72 @@ func recvOrphanWait(t *testing.T, driver *acpSessionDriver, wait time.Duration) 
 	case <-time.After(wait):
 		t.Fatal("timed out waiting for orphan session update")
 		return SessionNotification{}
+	}
+}
+
+type writeAfterStopReason struct {
+	w     io.Writer
+	extra []byte
+	once  sync.Once
+}
+
+func (w *writeAfterStopReason) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte(`"stopReason"`)) {
+		wrote := false
+		w.once.Do(func() { wrote = true })
+		if wrote {
+			buf := append(append([]byte{}, p...), w.extra...)
+			if _, err := w.w.Write(buf); err != nil {
+				return 0, err
+			}
+			return len(p), nil
+		}
+	}
+	return w.w.Write(p)
+}
+
+func TestPromptOutputTextIncludesChunkBufferedAfterResult(t *testing.T) {
+	driver := newOrphanTestDriver()
+	providerReader, runtimeWriter := io.Pipe()
+	runtimeReader, providerWriter := io.Pipe()
+	late := &writeAfterStopReason{
+		w:     providerWriter,
+		extra: []byte(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_message_chunk","text":"late-chunk"}}}` + "\n"),
+	}
+	runtimePeer := NewPeer(runtimeReader, runtimeWriter, PeerOptions{})
+	providerPeer := NewPeer(providerReader, late, PeerOptions{})
+	providerPeer.RegisterRequest("session/prompt", func(context.Context, json.RawMessage) (any, error) {
+		return PromptResponse{StopReason: "end_turn"}, nil
+	})
+	conn := NewConnection(runtimePeer, Client{})
+	conn.SetSessionUpdateHandler(func(ctx context.Context, notification SessionNotification) {
+		driver.handleSessionUpdate(notification)
+	})
+	driver.connection = conn
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = runtimePeer.Start(ctx) }()
+	go func() { _ = providerPeer.Start(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		runtimePeer.Close()
+		providerPeer.Close()
+		_ = providerReader.Close()
+		_ = runtimeWriter.Close()
+		_ = runtimeReader.Close()
+		_ = providerWriter.Close()
+	})
+
+	handle := driver.StartTurn(context.Background(), RuntimePrompt{Text: "hi"})
+	select {
+	case result := <-handle.Completion:
+		if result.Err != nil {
+			t.Fatalf("completion err = %v", result.Err)
+		}
+		if result.Completion.OutputText != "late-chunk" {
+			t.Fatalf("OutputText = %q, want late-chunk", result.Completion.OutputText)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("turn did not complete")
 	}
 }
 
