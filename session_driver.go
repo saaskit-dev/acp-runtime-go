@@ -57,6 +57,13 @@ type acpSessionDriver struct {
 	rawConfig     map[string]any
 	queuePolicy   QueuePolicy
 	updates       chan SessionNotification
+
+	// Only authoritative snapshots outside overlapping config changes may
+	// suppress initial-config RPCs. All fields are protected by mu.
+	configOptionsCurrent bool
+	configChangeVersion  uint64
+	configChangesPending int
+
 	// read-model caps (resolved defaults; 0 should not appear after construction)
 	maxThread      int
 	maxToolCalls   int
@@ -125,6 +132,7 @@ func newACPSessionDriver(bootstrap sessionBootstrap) *acpSessionDriver {
 		maxPermissions: maxPermissions,
 	}
 	driver.metadata.SessionID = bootstrap.SessionResponse.SessionID
+	driver.configOptionsCurrent = bootstrap.SessionResponse.ConfigOptions != nil
 	bootstrap.Connection.SetSessionUpdateHandler(func(ctx context.Context, notification SessionNotification) {
 		driver.handleSessionUpdate(notification)
 	})
@@ -246,6 +254,9 @@ func (d *acpSessionDriver) replaceConfigOptionsLocked(options []SessionConfigOpt
 	}
 	d.metadata.AgentConfigOptions = next
 	d.rawConfig = rawConfigFromMetadata(d.metadata)
+	// ponytail: uncorrelated in-flight notifications stay untrusted; provider
+	// revisions could allow reuse without an idle notification/full response.
+	d.configOptionsCurrent = d.configChangesPending == 0
 }
 
 func (d *acpSessionDriver) Close(ctx context.Context) error {
@@ -352,7 +363,24 @@ func (d *acpSessionDriver) CancelTurn(ctx context.Context, turnID string) (bool,
 	return true, nil
 }
 
+func (d *acpSessionDriver) beginConfigChange() (version uint64, exclusive bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.configChangeVersion++
+	d.configChangesPending++
+	d.configOptionsCurrent = false
+	return d.configChangeVersion, d.configChangesPending == 1
+}
+
+func (d *acpSessionDriver) endConfigChange() {
+	d.mu.Lock()
+	d.configChangesPending--
+	d.mu.Unlock()
+}
+
 func (d *acpSessionDriver) SetAgentMode(ctx context.Context, modeID string) error {
+	d.beginConfigChange()
+	defer d.endConfigChange()
 	if err := d.connection.SetSessionMode(ctx, SetSessionModeRequest{SessionID: d.sessionID, ModeID: modeID}); err != nil {
 		return err
 	}
@@ -364,6 +392,8 @@ func (d *acpSessionDriver) SetAgentMode(ctx context.Context, modeID string) erro
 }
 
 func (d *acpSessionDriver) SetAgentConfigOption(ctx context.Context, id string, value any) error {
+	version, exclusive := d.beginConfigChange()
+	defer d.endConfigChange()
 	resp, err := d.connection.SetSessionConfigOption(ctx, SetSessionConfigOptionRequest{SessionID: d.sessionID, OptionID: id, Value: value})
 	if err != nil {
 		return err
@@ -372,6 +402,9 @@ func (d *acpSessionDriver) SetAgentConfigOption(ctx context.Context, id string, 
 	d.rawConfig[id] = value
 	if resp.ConfigOptions != nil {
 		d.replaceConfigOptionsLocked(*resp.ConfigOptions)
+		// Local response order cannot prove freshness after overlap or a
+		// notification, which may overtake this response's decoding.
+		d.configOptionsCurrent = exclusive && d.configChangesPending == 1 && version == d.configChangeVersion
 	} else {
 		// Older providers returned an empty response. Preserve their legacy
 		// behavior while waiting for a config_option_update notification.
@@ -622,10 +655,13 @@ func (d *acpSessionDriver) handleSessionUpdate(notification SessionNotification)
 		}
 	case "current_mode_update":
 		if update.CurrentModeID != "" {
+			d.configChangeVersion++
+			d.configOptionsCurrent = false
 			d.metadata.CurrentModeID = update.CurrentModeID
 			d.rawConfig["mode"] = update.CurrentModeID
 		}
 	case "config_option_update":
+		d.configChangeVersion++
 		d.replaceConfigOptionsLocked(update.ConfigOptions)
 	case "session_info_update":
 		if update.Title != nil {

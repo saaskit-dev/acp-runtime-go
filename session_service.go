@@ -3,6 +3,7 @@ package acpruntime
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"time"
 )
@@ -439,8 +440,10 @@ func applyInitialConfig(ctx context.Context, driver *acpSessionDriver, config In
 		report.Applied = append(report.Applied, item)
 	}
 	for id, value := range config.Raw {
-		if err := driver.SetAgentConfigOption(ctx, id, value); err != nil {
-			return report, err
+		if !initialConfigOptionEqual(driver, id, value) {
+			if err := driver.SetAgentConfigOption(ctx, id, value); err != nil {
+				return report, err
+			}
 		}
 		report.Applied = append(report.Applied, InitialConfigReportItem{Key: id, ID: id, Value: value})
 	}
@@ -448,15 +451,19 @@ func applyInitialConfig(ctx context.Context, driver *acpSessionDriver, config In
 }
 
 func applyInitialConfigOption(ctx context.Context, driver *acpSessionDriver, profile AgentProfile, key string, value any) (InitialConfigReportItem, error) {
+	driver.mu.RLock()
 	optionID := selectInitialConfigOption(driver.metadata.AgentConfigOptions, profile, key)
+	driver.mu.RUnlock()
 	if optionID == "" {
 		return InitialConfigReportItem{Key: key, Value: value, Reason: "option_not_found"}, nil
 	}
 	var lastErr error
 	for _, alias := range initialConfigAliases(profile, key, value) {
-		if err := driver.SetAgentConfigOption(ctx, optionID, alias); err != nil {
-			lastErr = err
-			continue
+		if !initialConfigOptionEqual(driver, optionID, alias) {
+			if err := driver.SetAgentConfigOption(ctx, optionID, alias); err != nil {
+				lastErr = err
+				continue
+			}
 		}
 		return InitialConfigReportItem{Key: key, ID: optionID, Value: alias}, nil
 	}
@@ -464,6 +471,23 @@ func applyInitialConfigOption(ctx context.Context, driver *acpSessionDriver, pro
 		return InitialConfigReportItem{}, lastErr
 	}
 	return InitialConfigReportItem{Key: key, Value: value, Reason: "option_not_applied"}, nil
+}
+
+// Read each target after the preceding RPC, not from a cached startup
+// snapshot: changing mode/model can reset effort or remove options entirely.
+// Keep explicit public setters unconditional, including equal-value calls.
+func initialConfigOptionEqual(driver *acpSessionDriver, id string, value any) bool {
+	driver.mu.RLock()
+	defer driver.mu.RUnlock()
+	if !driver.configOptionsCurrent || driver.configChangesPending != 0 || value == nil {
+		return false
+	}
+	for _, option := range driver.metadata.AgentConfigOptions {
+		if option.ID == id {
+			return option.Value != nil && reflect.DeepEqual(option.Value, value)
+		}
+	}
+	return false
 }
 
 func selectInitialConfigOption(options []RuntimeAgentConfigOption, profile AgentProfile, key string) string {
@@ -494,9 +518,15 @@ func applyInitialConfigMode(ctx context.Context, driver *acpSessionDriver, mode 
 		if !ok || strings.TrimSpace(modeID) == "" {
 			continue
 		}
-		if err := driver.SetAgentMode(ctx, modeID); err != nil {
-			lastErr = err
-			continue
+		driver.mu.RLock()
+		// A failed alias may have partially changed the provider's mode.
+		equal := lastErr == nil && driver.configChangesPending == 0 && driver.metadata.CurrentModeID == modeID
+		driver.mu.RUnlock()
+		if !equal {
+			if err := driver.SetAgentMode(ctx, modeID); err != nil {
+				lastErr = err
+				continue
+			}
 		}
 		return modeID, nil
 	}
