@@ -48,7 +48,13 @@ type agentCheck struct {
 	name      string // human label
 	pkg       string // npm package name for version query + cache key
 	buildFunc func() (acp.Agent, map[string]any) // agent + optional session/new _meta
-	apiKeyEnv string // env var that must be present to run the real test
+	apiKeyEnv string                            // env var that must be present to run the real test
+	// localVersion, when set, sources the version from the LOCAL CLI instead
+	// of npm (native transports drive the user's own binary).
+	localVersion func() (string, error)
+	// localAuth marks engines that authenticate through their own CLI login
+	// (no provider API key env is required).
+	localAuth bool
 }
 
 func main() {
@@ -64,6 +70,28 @@ func main() {
 			pkg:       "@agentclientprotocol/codex-acp",
 			buildFunc: buildCodexAgent,
 			apiKeyEnv: "OPENAI_API_KEY", // CODEX_API_KEY also accepted; checked in apiKeyPresent
+		},
+		{
+			name:       "codex-native",
+			pkg:        "native:codex",
+			buildFunc:  buildNativeCodexAgent,
+			localVersion: func() (string, error) {
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+				return acp.ProbeNativeEngineVersion(ctx, "codex")
+			},
+			localAuth: true,
+		},
+		{
+			name:       "claude-native",
+			pkg:        "native:claude",
+			buildFunc:  buildNativeClaudeAgent,
+			localVersion: func() (string, error) {
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+				return acp.ProbeNativeEngineVersion(ctx, "claude")
+			},
+			localAuth: true,
 		},
 	}
 
@@ -81,7 +109,7 @@ func main() {
 	hasFailure := false
 
 	for _, c := range checks {
-		version, vErr := npmLatestVersion(c.pkg)
+		version, vErr := c.version()
 		if vErr != nil {
 			fmt.Printf("%s: ⚠ could not query npm version (%v)\n", c.name, vErr)
 			// Can't determine version → fall through to test if key is present,
@@ -103,7 +131,7 @@ func main() {
 			fmt.Printf("  (cached was v%s, version changed)\n", cache[c.pkg])
 		}
 
-		if !canRunAgent(c.apiKeyEnv) {
+		if !c.canRun() {
 			fmt.Printf("  spawn+prompt: SKIPPED (no %s and no gateway; version uncached)\n\n", c.apiKeyEnv)
 			continue
 		}
@@ -137,6 +165,40 @@ func main() {
 	}
 	fmt.Println("Result: OK — no failures (all PASS, CACHED, or SKIPPED).")
 	os.Exit(0)
+}
+
+// version resolves the engine version: local CLI probe for native engines,
+// npm latest for wrapper packages.
+func (c agentCheck) version() (string, error) {
+	if c.localVersion != nil {
+		return c.localVersion()
+	}
+	return npmLatestVersion(c.pkg)
+}
+
+// canRun reports whether credentials exist for this engine: local-login
+// engines always run; wrapper engines need their provider key or the gateway.
+func (c agentCheck) canRun() bool {
+	if c.localAuth {
+		return true
+	}
+	return canRunAgent(c.apiKeyEnv)
+}
+
+// buildNativeCodexAgent constructs the codex native transport agent. The CLI
+// carries its own login; CODEX_NATIVE_TEST_HOME optionally redirects
+// CODEX_HOME (sandboxed/CI runs point it at a prepared copy).
+func buildNativeCodexAgent() (acp.Agent, map[string]any) {
+	agent := acp.CreateCodexNativeAgent(acp.Agent{})
+	if home := os.Getenv("CODEX_NATIVE_TEST_HOME"); home != "" {
+		agent.Env = map[string]string{"CODEX_HOME": home}
+	}
+	return agent, nil
+}
+
+// buildNativeClaudeAgent constructs the claude native transport agent.
+func buildNativeClaudeAgent() (acp.Agent, map[string]any) {
+	return acp.CreateClaudeCodeNativeAgent(acp.Agent{}), nil
 }
 
 // cacheFilePath returns the path to the version cache file. It honors the

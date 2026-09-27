@@ -104,6 +104,10 @@ func ResolveRuntimeAgentFromRegistry(ctx context.Context, agentID string) (Agent
 		return CreateOpenCodeAgent(Agent{}), nil
 	case PiACPRegistryID:
 		return CreatePiAgent(Agent{}), nil
+	case CodexNativeRegistryID:
+		return CreateCodexNativeAgent(Agent{}), nil
+	case ClaudeCodeNativeRegistryID:
+		return CreateClaudeCodeNativeAgent(Agent{}), nil
 	}
 	reg, err := fetchRegistry(ctx)
 	if err != nil {

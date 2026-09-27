@@ -23,6 +23,10 @@ func NewRuntime(factory ConnectionFactory, options RuntimeOptions) *Runtime {
 	if factory == nil {
 		factory = NewStdioConnectionFactory(StdioFactoryOptions{})
 	}
+	// Native transports (Agent.Type claude-native / codex-native) route to
+	// in-process bridges before the stdio ACP factory; everything else is
+	// delegated unchanged, so the switch is invisible to existing hosts.
+	factory = withNativeTransport(factory)
 	return &Runtime{
 		options:  options,
 		service:  NewSessionService(factory, options),

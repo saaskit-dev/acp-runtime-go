@@ -64,6 +64,18 @@ func ResolveAgentProfile(agent Agent) AgentProfile {
 			return agent, map[string]any{SystemPromptMetaKey: prompt.Text}
 		}
 		profile.ApplyAgentConfig = applyClaudeAgentConfig
+	case ClaudeCodeNativeRegistryID:
+		// Same unified-config projection as the ACP path: AgentConfig lands in
+		// _meta.claudeCode.options, which the native adapter translates into
+		// spawn flags (allowedTools/disallowedTools/settings). The yolo mode
+		// alias matches the ACP behavior.
+		profile.ApplyAgentConfig = applyClaudeAgentConfig
+		profile.CreateInitialConfigAliases = func(key string, value any) []any {
+			if key == "mode" && value == "yolo" {
+				return []any{"bypassPermissions", value}
+			}
+			return []any{value}
+		}
 	case GitHubCopilotACPRegistryID:
 		profile.NormalizeInitializeAuthMethods = func(agent Agent, methods []AuthMethod) []AuthMethod {
 			if len(methods) > 0 {
