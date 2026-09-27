@@ -136,6 +136,14 @@ func TestStdioDisposeContinuesAfterCallerCancellation(t *testing.T) {
 }
 
 func TestStdioDisposeSignalsProcessGroup(t *testing.T) {
+	// This test verifies process-group discovery THROUGH ps output, so it can
+	// only run where ps may inspect processes (hardened sandboxes deny it and
+	// the child's pgid fields come back empty — that is an environment limit,
+	// not a runtime regression; the dispose path itself uses the Setpgid pgid
+	// and works without ps).
+	if out, err := exec.Command("ps", "-o", "pgid=", "-p", strconv.Itoa(os.Getpid())).Output(); err != nil || len(strings.Fields(string(out))) == 0 {
+		t.Skipf("ps cannot inspect process info in this environment (err=%v, out=%q)", err, string(out))
+	}
 	pidFile, err := os.CreateTemp(t.TempDir(), "child-pid-*")
 	if err != nil {
 		t.Fatalf("CreateTemp() error = %v", err)

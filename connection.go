@@ -66,38 +66,48 @@ func NewConnection(peer *Peer, client Client) *Connection {
 
 func NewConnectionWithObservability(peer *Peer, client Client, observability ObservabilityOptions) *Connection {
 	conn := &Connection{peer: peer, observability: observability}
-	if client.Authority.Permission != nil {
-		peer.RegisterRequest("session/request_permission", func(ctx context.Context, raw json.RawMessage) (any, error) {
-			var req struct {
-				SessionID  string             `json:"sessionId"`
-				ToolCallID string             `json:"toolCallId"`
-				Title      string             `json:"title"`
-				Kind       string             `json:"kind"`
-				Options    []PermissionOption `json:"options"`
-			}
-			if err := json.Unmarshal(raw, &req); err != nil {
-				return nil, err
-			}
-			permissionReq := PermissionRequest{
-				SessionID:  req.SessionID,
-				ToolCallID: req.ToolCallID,
-				Title:      req.Title,
-				Kind:       req.Kind,
-				Options:    req.Options,
-			}
-			decision, err := client.Authority.Permission(ctx, permissionReq)
+	// session/request_permission is ALWAYS answered, even when the host did
+	// not register a permission authority. The ACP spec requires the client to
+	// respond; leaving it unregistered would surface as JSON-RPC -32601
+	// "method not found", leaving the agent's failure behavior undefined.
+	// Without an authority the runtime fails closed via
+	// defaultDenyPermissionDecision.
+	peer.RegisterRequest("session/request_permission", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		var req struct {
+			SessionID  string             `json:"sessionId"`
+			ToolCallID string             `json:"toolCallId"`
+			Title      string             `json:"title"`
+			Kind       string             `json:"kind"`
+			Options    []PermissionOption `json:"options"`
+		}
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return nil, err
+		}
+		permissionReq := PermissionRequest{
+			SessionID:  req.SessionID,
+			ToolCallID: req.ToolCallID,
+			Title:      req.Title,
+			Kind:       req.Kind,
+			Options:    req.Options,
+		}
+		var decision PermissionDecision
+		if client.Authority.Permission != nil {
+			created, err := client.Authority.Permission(ctx, permissionReq)
 			if err != nil {
 				return nil, err
 			}
-			conn.permissionObserverMu.RLock()
-			observer := conn.permissionObserver
-			conn.permissionObserverMu.RUnlock()
-			if observer != nil {
-				observer(permissionReq, decision)
-			}
-			return permissionResponse{Outcome: decision.Outcome, OptionID: decision.OptionID}, nil
-		})
-	}
+			decision = created
+		} else {
+			decision = defaultDenyPermissionDecision(permissionReq)
+		}
+		conn.permissionObserverMu.RLock()
+		observer := conn.permissionObserver
+		conn.permissionObserverMu.RUnlock()
+		if observer != nil {
+			observer(permissionReq, decision)
+		}
+		return permissionResponse{Outcome: decision.Outcome, OptionID: decision.OptionID}, nil
+	})
 	if client.Authority.Filesystem != nil {
 		peer.RegisterRequest("fs/read_text_file", func(ctx context.Context, raw json.RawMessage) (any, error) {
 			var req struct {
@@ -233,6 +243,20 @@ func (c *Connection) SetSessionUpdateHandler(handler func(context.Context, Sessi
 		}
 		handler(ctx, notification)
 	})
+}
+
+// defaultDenyPermissionDecision synthesizes a fail-closed decision for hosts
+// that did not register a permission authority. Preference: an explicit
+// reject_* option from the agent's own option list (Outcome "selected" with
+// its optionId); otherwise the generic Outcome "cancelled", which tells the
+// agent no option was chosen. Both are spec-valid responses, and both deny.
+func defaultDenyPermissionDecision(req PermissionRequest) PermissionDecision {
+	for _, option := range req.Options {
+		if strings.HasPrefix(option.Kind, "reject") {
+			return PermissionDecision{Outcome: "selected", OptionID: option.ID}
+		}
+	}
+	return PermissionDecision{Outcome: "cancelled"}
 }
 
 func (c *Connection) Initialize(ctx context.Context, req InitializeRequest) (InitializeResponse, error) {

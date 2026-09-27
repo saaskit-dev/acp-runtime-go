@@ -98,6 +98,14 @@ type Peer struct {
 	closed    chan struct{}
 	closeOnce sync.Once
 
+	// closeErrMu guards closeErr, the transport-level error that ended the
+	// read loop (set via closeWithReason when Start exits on a read failure).
+	// Pending Call consumers receive it wrapped around io.ErrClosedPipe so
+	// errors.Is(err, io.ErrClosedPipe) keeps working while the message carries
+	// the underlying cause (e.g. "file already closed" after process death).
+	closeErrMu sync.Mutex
+	closeErr   error
+
 	idleMu   sync.Mutex
 	readIdle bool
 	idleFns  []func()
@@ -189,7 +197,7 @@ func (p *Peer) Start(ctx context.Context) error {
 			}
 		}
 		if err != nil {
-			p.Close()
+			p.closeWithReason(err)
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
@@ -248,6 +256,32 @@ func (p *Peer) hasBufferedLine() bool {
 
 func (p *Peer) Done() <-chan struct{} {
 	return p.closed
+}
+
+// closeWithReason records why the transport died before closing the peer.
+// Pending Calls then surface the cause instead of a bare ErrClosedPipe.
+func (p *Peer) closeWithReason(err error) {
+	if err != nil {
+		p.closeErrMu.Lock()
+		if p.closeErr == nil {
+			p.closeErr = err
+		}
+		p.closeErrMu.Unlock()
+	}
+	p.Close()
+}
+
+// closeReason returns the recorded transport error wrapped so that
+// errors.Is(err, io.ErrClosedPipe) remains true; when no cause was recorded
+// it returns io.ErrClosedPipe unchanged.
+func (p *Peer) closeReason() error {
+	p.closeErrMu.Lock()
+	reason := p.closeErr
+	p.closeErrMu.Unlock()
+	if reason == nil {
+		return io.ErrClosedPipe
+	}
+	return fmt.Errorf("%w: %v", io.ErrClosedPipe, reason)
 }
 
 func (p *Peer) Close() {
@@ -325,10 +359,10 @@ func (p *Peer) callRaw(ctx context.Context, method string, params json.RawMessag
 		}
 		return nil, ctx.Err()
 	case <-p.closed:
-		return nil, io.ErrClosedPipe
+		return nil, p.closeReason()
 	case response, ok := <-ch:
 		if !ok {
-			return nil, io.ErrClosedPipe
+			return nil, p.closeReason()
 		}
 		if response.Error != nil {
 			return nil, response.Error

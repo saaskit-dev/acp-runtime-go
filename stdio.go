@@ -17,6 +17,12 @@ import (
 type StdioFactoryOptions struct {
 	Stderr       string
 	OnACPMessage func(direction string, message []byte)
+	// OnProcessExit, when set, fires once after the agent process has fully
+	// exited — natural death or teardown — with the Wait error (nil on a clean
+	// exit) and the captured stderr tail (empty unless Stderr == ""). It lets
+	// hosts log WHY an agent vanished; mid-turn RPC failures surface to callers
+	// as wrapped io.ErrClosedPipe errors carrying the transport cause.
+	OnProcessExit func(err error, stderrTail string)
 }
 
 func NewStdioConnectionFactory(options StdioFactoryOptions) ConnectionFactory {
@@ -68,8 +74,29 @@ func NewStdioConnectionFactory(options StdioFactoryOptions) ConnectionFactory {
 		conn := NewConnectionWithObservability(peer, input.Client, input.Observability)
 		startCtx, cancelStart := context.WithCancel(context.WithoutCancel(ctx))
 		done := make(chan error, 1)
+		// cmd.Wait may run exactly once. waitDone closes after it returns and
+		// waitErr memoizes the result, so the teardown path and the process-exit
+		// monitor below can both observe the outcome regardless of who reads
+		// first — a value-carrying channel would let the first reader starve
+		// the second.
+		var (
+			waitOnce sync.Once
+			waitDone = make(chan struct{})
+			waitErr  error
+		)
+		doWait := func() <-chan struct{} {
+			waitOnce.Do(func() { go func() { waitErr = cmd.Wait(); close(waitDone) }() })
+			return waitDone
+		}
+		waitResult := func() error { <-doWait(); return waitErr }
 		go func() {
 			done <- peer.Start(startCtx)
+			// The read loop only ends when the child's stdout closes, i.e. the
+			// process is going down (naturally or via teardown). Report the
+			// final Wait result + stderr tail once available.
+			if options.OnProcessExit != nil {
+				options.OnProcessExit(waitResult(), stderr.String())
+			}
 		}()
 		var teardownOnce sync.Once
 		teardownDone := make(chan struct{})
@@ -80,11 +107,10 @@ func NewStdioConnectionFactory(options StdioFactoryOptions) ConnectionFactory {
 					defer close(teardownDone)
 					cancelStart()
 					_ = stdin.Close()
-					waitCh := make(chan error, 1)
-					go func() { waitCh <- cmd.Wait() }()
+					waitDone := doWait()
 					select {
-					case err := <-waitCh:
-						if err != nil && !errors.Is(err, context.Canceled) {
+					case <-waitDone:
+						if err := waitResult(); err != nil && !errors.Is(err, context.Canceled) {
 							teardownErr = err
 						}
 					case <-time.After(1500 * time.Millisecond):
@@ -92,9 +118,9 @@ func NewStdioConnectionFactory(options StdioFactoryOptions) ConnectionFactory {
 							_ = signalProcessTree(processGroupID, cmd.Process, syscall.SIGTERM)
 						}
 						select {
-						case err := <-waitCh:
+						case <-waitDone:
 							_ = signalProcessTree(processGroupID, nil, syscall.SIGTERM)
-							if err != nil && !errors.Is(err, context.Canceled) {
+							if err := waitResult(); err != nil && !errors.Is(err, context.Canceled) {
 								teardownErr = err
 							}
 						case <-time.After(time.Second):
@@ -106,9 +132,9 @@ func NewStdioConnectionFactory(options StdioFactoryOptions) ConnectionFactory {
 							// timed out earlier still cannot orphan the only cleanup
 							// attempt; we just stop waiting for an unkillable tree.
 							select {
-							case err := <-waitCh:
+							case <-waitDone:
 								_ = signalProcessTree(processGroupID, nil, syscall.SIGKILL)
-								if err != nil && !errors.Is(err, context.Canceled) {
+								if err := waitResult(); err != nil && !errors.Is(err, context.Canceled) {
 									teardownErr = fmt.Errorf("agent process required forced teardown: %w; stderr tail: %s", err, stderr.String())
 								} else {
 									teardownErr = fmt.Errorf("agent process required forced teardown; stderr tail: %s", stderr.String())

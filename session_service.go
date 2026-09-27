@@ -3,6 +3,7 @@ package acpruntime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"time"
@@ -199,6 +200,16 @@ func (s *SessionService) bootstrap(ctx context.Context, agent Agent, cwd string,
 	if err != nil {
 		_ = runSessionCleanup(handle.Dispose)
 		return sessionBootstrap{}, err
+	}
+	// The agent answers with the protocol version it will actually speak. A
+	// NEWER version than this runtime understands means the wire format may
+	// have changed underneath us; refuse instead of misparsing. Older or
+	// absent (0) versions are tolerated for compatibility with agents that
+	// predate or omit strict negotiation.
+	if resp.ProtocolVersion > ProtocolVersion {
+		_ = runSessionCleanup(handle.Dispose)
+		return sessionBootstrap{}, wrapError(ErrorProtocol, "initialize",
+			fmt.Sprintf("agent speaks ACP protocol version %d; this runtime supports up to %d", resp.ProtocolVersion, ProtocolVersion), nil)
 	}
 	methods := profile.NormalizeInitializeAuthMethods(agent, resp.AuthMethods)
 	runtimeMethods := profile.NormalizeRuntimeAuthMethods(agent, runtimeAuthMethodsFromACP(methods))

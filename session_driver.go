@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"time"
@@ -133,6 +134,21 @@ func newACPSessionDriver(bootstrap sessionBootstrap) *acpSessionDriver {
 	}
 	driver.metadata.SessionID = bootstrap.SessionResponse.SessionID
 	driver.configOptionsCurrent = bootstrap.SessionResponse.ConfigOptions != nil
+	// Native bridges travel engine/version probe results in the initialize
+	// _meta; surface them so Session.Diagnostics() shows a below-floor warning.
+	if info, ok := bootstrap.InitializeResponse.Meta["x-acp-runtime-native"].(map[string]any); ok {
+		if driver.diagnostics.Raw == nil {
+			driver.diagnostics.Raw = map[string]any{}
+		}
+		driver.diagnostics.Raw["nativeEngine"] = info
+		if below, ok := info["belowVerifiedFloor"].(bool); ok && below {
+			engine, _ := info["engine"].(string)
+			version, _ := info["version"].(string)
+			floor, _ := info["verifiedFloor"].(string)
+			driver.diagnostics.Warnings = append(driver.diagnostics.Warnings,
+				fmt.Sprintf("native %s engine version %s is below the verified floor %s", engine, version, floor))
+		}
+	}
 	bootstrap.Connection.SetSessionUpdateHandler(func(ctx context.Context, notification SessionNotification) {
 		driver.handleSessionUpdate(notification)
 	})
@@ -463,6 +479,15 @@ func (d *acpSessionDriver) StartTurn(ctx context.Context, prompt RuntimePrompt) 
 func (d *acpSessionDriver) runPrompt(ctx context.Context, active *activeTurn, prompt RuntimePrompt) {
 	resp, err := d.connection.Prompt(ctx, PromptRequest{SessionID: d.sessionID, Prompt: mapPrompt(prompt)})
 	if err != nil {
+		// A closed pipe mid-turn almost always means the agent process died
+		// (crash, OOM kill, stray signal). Surface that as an explicit
+		// process-kind error instead of a bare io.ErrClosedPipe, so hosts can
+		// distinguish "agent vanished" from protocol/app errors. The underlying
+		// transport cause stays chained for diagnostics.
+		if errors.Is(err, io.ErrClosedPipe) {
+			err = wrapError(ErrorProcess, "session/prompt",
+				"agent connection closed while the turn was in flight (agent process likely exited)", err)
+		}
 		d.finishTurn(active, TurnCompletion{}, err)
 		return
 	}
