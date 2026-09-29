@@ -19,7 +19,11 @@ daily at 06:00 UTC. It invokes `cmd/acp-compat-check`, which for each wrapper:
    and runs a minimal prompt (`Reply with exactly: COMPAT_OK`), asserting the
    full chain (spawn → initialize → session/new → session/prompt → output)
    works. On PASS, the cache is updated with the new version.
-4. Reports PASS / FAIL / SKIPPED / CACHED per agent.
+4. Reports PASS / FAIL / SKIPPED / INFRA_ERROR / CACHED per agent.
+
+Native engines probe the local `codex` / `claude` CLI version and require the
+binary on PATH plus its own prepared login. The scheduled runner does not
+install these CLIs; absent binaries are SKIPPED before probing or spawning.
 
 The cache is a small JSON file (`.compat-versions.json`) mapping package names
 to the last version that passed. In CI it is persisted across runs via
@@ -29,7 +33,8 @@ to the last version that passed. In CI it is persisted across runs via
 When a test **fails** (exit code 1), the workflow opens (or updates) a GitHub
 Issue titled `[compat-check] ACP wrapper compatibility regression detected`,
 labeled `compat-regression`, with the full check output and a link to the CI
-run. When the check later **passes** again, the issue is automatically closed.
+run. Only a complete PASS/CACHED run (exit 0) closes the issue. Missing prerequisites
+or infrastructure errors produce exit 2 and neither open nor close issues.
 Note: a failed version is **not** cached, so the next run retries it —
 transient failures self-heal.
 
@@ -71,20 +76,23 @@ the secrets as environment variables.
 The same check runs locally with no CI setup:
 
 ```bash
-# Without keys: reports SKIPPED for uncached versions (exit 0)
-go run ./cmd/acp-compat-check
+# Build once to preserve exit codes (go run wraps nonzero program exits as 1).
+go build -o /tmp/acp-compat-check ./cmd/acp-compat-check
+
+# Without keys: reports SKIPPED for uncached versions (exit 2).
+/tmp/acp-compat-check
 
 # Via unified router gateway (covers both agents with one key pair):
 UNIFIED_ROUTER_BASE_URL=https://your-router/v1 \
 UNIFIED_ROUTER_KEY=cfut_... \
 CLAUDE_GATEWAY_MODEL=glm-5.2 \
-go run ./cmd/acp-compat-check
+/tmp/acp-compat-check
 
 # With direct provider keys:
-ANTHROPIC_API_KEY=sk-ant-... go run ./cmd/acp-compat-check
+ANTHROPIC_API_KEY=sk-ant-... /tmp/acp-compat-check
 
 # Point the cache at a custom path (default: ./.compat-versions.json)
-COMPAT_CACHE=/tmp/compat.json go run ./cmd/acp-compat-check
+COMPAT_CACHE=/tmp/compat.json /tmp/acp-compat-check
 ```
 
 Sample output (first run, with a key):
@@ -99,7 +107,7 @@ claude-agent-acp: latest=0.55.0
 codex-acp: latest=1.1.0
   spawn+prompt: SKIPPED (no OPENAI_API_KEY)
 
-Result: OK — no failures (all PASS, CACHED, or SKIPPED).
+Result: INCOMPLETE — prerequisites or infrastructure prevented compatibility checks.
 ```
 
 Sample output (next day, version unchanged):
@@ -116,8 +124,15 @@ codex-acp: latest=1.1.0
 
 | Code | Meaning |
 | ---- | ------- |
-| 0    | No failures (all PASS, CACHED, or SKIPPED). |
-| 1    | At least one agent failed (regression detected). |
+| 0    | All agents PASS or CACHED; may close a stale regression issue. |
+| 1    | At least one compatibility FAIL; opens/updates the regression issue. |
+| 2    | SKIPPED or INFRA_ERROR with no FAIL; leaves regression issues unchanged. |
+
+INFRA_ERROR covers recognized credential, billing, rate-limit, provider HTTP,
+network, timeout, and process prerequisite errors in both RPC errors and output.
+Unknown errors, malformed protocol replies, and output missing `COMPAT_OK`
+without an infrastructure diagnostic remain FAIL. A simultaneous FAIL takes
+precedence over incomplete checks. Only PASS updates the version cache.
 
 ## Manual dispatch
 

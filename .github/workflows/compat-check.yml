@@ -22,7 +22,10 @@ name: compat-check
 #     ANTHROPIC_API_KEY — for the claude-agent-acp smoke test
 #     OPENAI_API_KEY    — for the codex-acp smoke test (CODEX_API_KEY also works)
 #
-# Agents whose key is absent (and no gateway) are SKIPPED (not failed).
+# Missing credentials or native CLIs are SKIPPED. Native checks require a
+# prepared CLI login; this workflow deliberately does not install unauthenticated
+# native CLIs. Provider/auth/billing/network failures are INFRA_ERROR.
+# Only compatibility FAIL opens/updates an issue. Incomplete checks never close it.
 
 on:
   schedule:
@@ -59,6 +62,11 @@ jobs:
           path: .compat-versions.json
           key: compat-versions-cache
 
+      # Run the binary directly: go run turns exit 2 (infrastructure) into 1.
+      # Build failures stop the job before any regression issue action.
+      - name: Build compat check
+        run: go build -o /tmp/acp-compat-check ./cmd/acp-compat-check
+
       - name: Run compat check
         id: check
         env:
@@ -70,10 +78,11 @@ jobs:
           # Option B: direct provider keys (alternative to gateway)
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
         run: |
           # Capture output to a file so the issue-creation step can embed it.
           set +e
-          go run ./cmd/acp-compat-check > compat-output.txt 2>&1
+          /tmp/acp-compat-check > compat-output.txt 2>&1
           code=$?
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
           cat compat-output.txt

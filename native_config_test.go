@@ -50,9 +50,7 @@ func TestClaudeNativeInitialConfigFlags(t *testing.T) {
 // MCPServers + AgentConfig settings into claude spawn flags and documents.
 func TestClaudeNativeMCPAndSettingsArgs(t *testing.T) {
 	e := &claudeNativeEngine{}
-	if err := e.Start(context.Background(), nativeEngineOptions{Agent: Agent{Command: "claude"}}); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	e.opts = nativeEngineOptions{Agent: Agent{Command: "claude"}}
 	proc := &claudeProc{eng: e}
 	req := NewSessionRequest{
 		MCPServers: []MCPServer{

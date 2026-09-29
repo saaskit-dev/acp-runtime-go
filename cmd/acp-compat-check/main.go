@@ -14,9 +14,10 @@
 //  2. If the version matches the cached "last tested OK" version → CACHED (skip).
 //  3. Else if the API key env var is present, spawn the real agent and run a
 //     minimal prompt; on PASS, update the cache with the new version.
-//  4. Report PASS / FAIL / SKIPPED / CACHED.
+//  4. Report PASS / FAIL / SKIPPED / INFRA_ERROR / CACHED.
 //
-// Exit codes: 0 = no FAIL (all PASS, CACHED, or SKIPPED); 1 = at least one FAIL.
+// Exit codes: 0 = all PASS/CACHED; 1 = compatibility FAIL; 2 = incomplete check.
+// Invoke the compiled binary in CI: go run maps nonzero program exits to 1.
 package main
 
 import (
@@ -54,7 +55,8 @@ type agentCheck struct {
 	localVersion func() (string, error)
 	// localAuth marks engines that authenticate through their own CLI login
 	// (no provider API key env is required).
-	localAuth bool
+	localAuth   bool
+	localBinary string
 }
 
 func main() {
@@ -72,26 +74,28 @@ func main() {
 			apiKeyEnv: "OPENAI_API_KEY", // CODEX_API_KEY also accepted; checked in apiKeyPresent
 		},
 		{
-			name:       "codex-native",
-			pkg:        "native:codex",
-			buildFunc:  buildNativeCodexAgent,
+			name:      "codex-native",
+			pkg:       "native:codex",
+			buildFunc: buildNativeCodexAgent,
 			localVersion: func() (string, error) {
 				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 				defer cancel()
 				return acp.ProbeNativeEngineVersion(ctx, "codex")
 			},
-			localAuth: true,
+			localAuth:   true,
+			localBinary: "codex",
 		},
 		{
-			name:       "claude-native",
-			pkg:        "native:claude",
-			buildFunc:  buildNativeClaudeAgent,
+			name:      "claude-native",
+			pkg:       "native:claude",
+			buildFunc: buildNativeClaudeAgent,
 			localVersion: func() (string, error) {
 				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 				defer cancel()
 				return acp.ProbeNativeEngineVersion(ctx, "claude")
 			},
-			localAuth: true,
+			localAuth:   true,
+			localBinary: "claude",
 		},
 	}
 
@@ -107,14 +111,20 @@ func main() {
 	fmt.Println()
 
 	hasFailure := false
+	hasIncomplete := false
 
 	for _, c := range checks {
+		// A missing native CLI is an unmet prerequisite, even with a cache entry.
+		if c.localAuth && !c.canRun() {
+			fmt.Printf("%s: spawn+prompt: SKIPPED (%s CLI unavailable on PATH)\n\n", c.name, c.localBinary)
+			hasIncomplete = true
+			continue
+		}
 		version, vErr := c.version()
 		if vErr != nil {
-			fmt.Printf("%s: ⚠ could not query npm version (%v)\n", c.name, vErr)
-			// Can't determine version → fall through to test if key is present,
-			// treating it as uncached so we don't silently skip on npm errors.
-			version = "unknown"
+			fmt.Printf("%s: INFRA_ERROR (could not query engine version: %v)\n\n", c.name, vErr)
+			hasIncomplete = true
+			continue
 		} else {
 			fmt.Printf("%s: latest=%s\n", c.name, version)
 		}
@@ -133,6 +143,7 @@ func main() {
 
 		if !c.canRun() {
 			fmt.Printf("  spawn+prompt: SKIPPED (no %s and no gateway; version uncached)\n\n", c.apiKeyEnv)
+			hasIncomplete = true
 			continue
 		}
 
@@ -144,6 +155,9 @@ func main() {
 				cache[c.pkg] = version
 				cacheDirty = true
 			}
+		case "INFRA_ERROR":
+			fmt.Printf("  spawn+prompt: INFRA_ERROR (%s)\n\n", detail)
+			hasIncomplete = true
 		case "FAIL":
 			fmt.Printf("  spawn+prompt: FAIL (%s)\n\n", detail)
 			hasFailure = true
@@ -159,11 +173,15 @@ func main() {
 		}
 	}
 
-	if hasFailure {
+	if resultExitCode(hasFailure, hasIncomplete) == 1 {
 		fmt.Println("Result: FAIL — at least one agent did not produce the expected output.")
 		os.Exit(1)
 	}
-	fmt.Println("Result: OK — no failures (all PASS, CACHED, or SKIPPED).")
+	if hasIncomplete {
+		fmt.Println("Result: INCOMPLETE — prerequisites or infrastructure prevented compatibility checks.")
+		os.Exit(2)
+	}
+	fmt.Println("Result: OK — all agents PASS or CACHED.")
 	os.Exit(0)
 }
 
@@ -177,10 +195,11 @@ func (c agentCheck) version() (string, error) {
 }
 
 // canRun reports whether credentials exist for this engine: local-login
-// engines always run; wrapper engines need their provider key or the gateway.
+// engines require their CLI on PATH; wrapper engines need a key or gateway.
 func (c agentCheck) canRun() bool {
 	if c.localAuth {
-		return true
+		_, err := exec.LookPath(c.localBinary)
+		return err == nil
 	}
 	return canRunAgent(c.apiKeyEnv)
 }
@@ -341,7 +360,7 @@ func runAgentCheck(build func() (acp.Agent, map[string]any), label string) (stri
 
 	cwd, err := os.Getwd()
 	if err != nil {
-		return "FAIL", fmt.Sprintf("os.Getwd: %v", err)
+		return "INFRA_ERROR", fmt.Sprintf("os.Getwd: %v", err)
 	}
 
 	start := time.Now()
@@ -353,7 +372,7 @@ func runAgentCheck(build func() (acp.Agent, map[string]any), label string) (stri
 	opts := acp.StartSessionOptions{Agent: agent, CWD: cwd, Meta: meta}
 	session, err := runtime.StartSession(ctx, opts)
 	if err != nil {
-		return "FAIL", fmt.Sprintf("StartSession error: %v", err)
+		return classifyCheckResult(err, ""), fmt.Sprintf("StartSession error: %v", err)
 	}
 	defer session.Close(context.Background())
 
@@ -361,10 +380,10 @@ func runAgentCheck(build func() (acp.Agent, map[string]any), label string) (stri
 	completion, err := session.Run(ctx, prompt)
 	elapsed := time.Since(start).Truncate(100 * time.Millisecond)
 	if err != nil {
-		return "FAIL", fmt.Sprintf("Run error after %s: %v", elapsed, err)
+		return classifyCheckResult(err, completion.OutputText), fmt.Sprintf("Run error after %s: %v", elapsed, err)
 	}
-	if !strings.Contains(completion.OutputText, sentinelToken) {
-		return "FAIL", fmt.Sprintf("output=%q (missing %s) after %s", completion.OutputText, sentinelToken, elapsed)
+	if status := classifyCheckResult(nil, completion.OutputText); status != "PASS" {
+		return status, fmt.Sprintf("output=%q (missing %s) after %s", completion.OutputText, sentinelToken, elapsed)
 	}
 	return "PASS", fmt.Sprintf("output=%q, %s", completion.OutputText, elapsed)
 }
