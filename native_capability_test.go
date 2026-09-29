@@ -1,7 +1,6 @@
 package acpruntime
 
 import (
-	"context"
 	"encoding/json"
 	"testing"
 )
@@ -59,9 +58,6 @@ func TestCodexDaemonPooling(t *testing.T) {
 	e.opts = nativeEngineOptions{Agent: Agent{Command: "codex", Env: map[string]string{
 		"CODEX_CONFIG": `{"model_provider":"magpie"}`,
 	}}}
-	if err := e.Start(context.Background(), e.opts); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
 
 	keyA := e.daemonKey(nil, []MCPServer{{Name: "fs", Command: "uvx"}})
 	keyA2 := e.daemonKey(nil, []MCPServer{{Name: "fs", Command: "uvx"}})
