@@ -184,9 +184,11 @@ func TestRPCErrorIncludesDataInErrorString(t *testing.T) {
 }
 
 func TestParseRPCIDSupportsNumericResponses(t *testing.T) {
+	if _, ok := parseRPCID(json.RawMessage(`"42"`)); ok {
+		t.Fatal("string id must not match numeric request")
+	}
 	for _, raw := range []json.RawMessage{
 		json.RawMessage(`42`),
-		json.RawMessage(`"42"`),
 		json.RawMessage(" \t42\r\n"),
 	} {
 		id, ok := parseRPCID(raw)
@@ -465,14 +467,26 @@ func TestCallCancelEmitsCancelRequestOnWire(t *testing.T) {
 		return nil, ctx.Err()
 	})
 
+	observed := make(chan struct{}, 1)
+	sent := make(chan struct{}, 1)
 	var cancelFrame []byte
 	var cancelMu sync.Mutex
 	client := NewPeer(clientReader, clientWriter, PeerOptions{
 		OnRawMessage: func(direction string, message json.RawMessage) {
+			if direction == "outbound" && bytes.Contains(message, []byte(`"method":"slow"`)) {
+				select {
+				case sent <- struct{}{}:
+				default:
+				}
+			}
 			if direction == "outbound" && bytes.Contains(message, []byte(`$/cancel_request`)) {
 				cancelMu.Lock()
 				cancelFrame = append(cancelFrame[:0], message...)
 				cancelMu.Unlock()
+				select {
+				case observed <- struct{}{}:
+				default:
+				}
 			}
 		},
 	})
@@ -497,8 +511,18 @@ func TestCallCancelEmitsCancelRequestOnWire(t *testing.T) {
 		t.Fatalf("slow handler never started")
 	}
 
+	select {
+	case <-sent:
+	case <-time.After(time.Second):
+		t.Fatal("initial request not successfully written")
+	}
 	callCancel()
 	<-callDone
+	select {
+	case <-observed:
+	case <-time.After(time.Second):
+		t.Fatal("best-effort cancel was not written")
+	}
 
 	cancelMu.Lock()
 	frame := append([]byte(nil), cancelFrame...)

@@ -75,16 +75,30 @@ type PeerOptions struct {
 }
 
 type Peer struct {
-	reader *bufio.Reader
-	writer io.Writer
-	opts   PeerOptions
-	rawMu  sync.RWMutex
+	reader       *bufio.Reader
+	writer       io.Writer
+	readerCloser io.Closer
+	opts         PeerOptions
+	rawMu        sync.RWMutex
 
-	nextID  atomic.Int64
-	writeMu sync.Mutex
+	nextID        atomic.Int64
+	writeMu       sync.Mutex
+	writeQueue    chan rpcWriteJob
+	writerRunning bool
 
-	pendingMu sync.Mutex
-	pending   map[int64]chan rpcMessage
+	pendingMu       sync.Mutex
+	pending         map[int64]chan rpcMessage
+	pendingMethods  map[int64]string
+	pendingLife     map[int64]chan struct{}
+	pendingBoundary map[int64]func()
+	pendingKnown    map[int64]*atomic.Bool
+	fenceMu         sync.Mutex
+	receivedSeq     uint64
+	processedSeq    uint64
+	receiveFences   []rpcReceiveFence
+	inboundWorkMu   sync.Mutex
+	inboundWork     map[uint64]chan struct{}
+	inboundSeq      uint64
 
 	handlersMu           sync.RWMutex
 	requestHandlers      map[string]RPCHandler
@@ -116,6 +130,7 @@ const (
 	defaultRPCReadBufferSize = 64 * 1024
 	maxRPCMessageSize        = 16 * 1024 * 1024
 	maxRPCScanDepth          = 128
+	maxRPCInboundRequests    = 64
 )
 
 var (
@@ -139,14 +154,21 @@ func (p *Peer) observeRawMessage(direction string, message []byte) {
 func NewPeer(r io.Reader, w io.Writer, opts PeerOptions) *Peer {
 	p := &Peer{
 		reader:               bufio.NewReaderSize(r, defaultRPCReadBufferSize),
+		writeQueue:           make(chan rpcWriteJob, 64),
 		writer:               w,
 		opts:                 opts,
 		pending:              map[int64]chan rpcMessage{},
+		pendingMethods:       map[int64]string{},
+		pendingLife:          map[int64]chan struct{}{},
+		pendingBoundary:      map[int64]func(){},
+		pendingKnown:         map[int64]*atomic.Bool{},
+		inboundWork:          map[uint64]chan struct{}{},
 		requestHandlers:      map[string]RPCHandler{},
 		notificationHandlers: map[string]RPCNotificationHandler{},
 		inboundCancel:        map[string]context.CancelFunc{},
 		closed:               make(chan struct{}),
 	}
+	p.readerCloser, _ = r.(io.Closer)
 	// Auto-register the protocol-level $/cancel_request notification handler so
 	// every Peer can honor peer-initiated cancellation of in-flight inbound
 	// requests (ACP schema-v1.17.0, x-side: "protocol", bidirectional). Callers
@@ -158,7 +180,7 @@ func NewPeer(r io.Reader, w io.Writer, opts PeerOptions) *Peer {
 		if err := json.Unmarshal(raw, &params); err != nil || len(params.RequestID) == 0 {
 			return // malformed cancel; per spec, silently ignore
 		}
-		idKey := string(trimJSONSpace(params.RequestID))
+		idKey := canonicalRequestID(params.RequestID)
 		p.inboundCancelMu.Lock()
 		cancel, ok := p.inboundCancel[idKey]
 		p.inboundCancelMu.Unlock()
@@ -188,8 +210,11 @@ func (p *Peer) Start(ctx context.Context) error {
 		}
 		line, err := p.readMessageLine()
 		p.markReadIdle(false)
-		if len(line) > 0 {
-			p.observeRawMessage("inbound", line)
+		if len(line) > 0 || err == nil {
+			seq := p.nextReceivedSequence()
+			if len(line) > 0 {
+				p.observeRawMessage("inbound", line)
+			}
 			if msg, ok := parseRPCMessage(line); ok {
 				if len(msg.ID) > 0 && msg.Method == "" {
 					p.resolvePending(msg)
@@ -197,12 +222,34 @@ func (p *Peer) Start(ctx context.Context) error {
 					if len(msg.ID) > 0 {
 						msg.ID = copyRawMessage(msg.ID)
 						msg.Params = copyRawMessage(msg.Params)
-						go p.handleRequest(ctx, msg)
+						requestCtx, finish, ok := p.prepareInboundRequest(ctx, msg)
+						if !ok {
+							p.markReceivedProcessed(seq)
+							continue
+						}
+						p.inboundWorkMu.Lock()
+						if len(p.inboundWork) >= maxRPCInboundRequests {
+							p.inboundWorkMu.Unlock()
+							finish()
+							p.tryWriteMessage(rpcMessage{JSONRPC: "2.0", ID: msg.ID, Error: &RPCError{Code: -32000, Message: "inbound request limit reached"}})
+							p.markReceivedProcessed(seq)
+							continue
+						}
+
+						done := make(chan struct{})
+						p.inboundWork[seq] = done
+						p.inboundWorkMu.Unlock()
+						go func() {
+							defer finish()
+							defer func() { p.inboundWorkMu.Lock(); delete(p.inboundWork, seq); close(done); p.inboundWorkMu.Unlock() }()
+							p.handlePreparedRequest(requestCtx, msg)
+						}()
 					} else {
 						p.handleNotification(ctx, msg)
 					}
 				}
 			}
+			p.markReceivedProcessed(seq)
 		}
 		if err != nil {
 			p.closeWithReason(err)
@@ -295,9 +342,17 @@ func (p *Peer) closeReason() error {
 func (p *Peer) Close() {
 	p.closeOnce.Do(func() {
 		close(p.closed)
+		// Closing real transports interrupts a blocked frame write/read. Arbitrary
+		// non-closable custom writers cannot provide this guarantee.
+		if closer, ok := p.writer.(io.Closer); ok {
+			_ = closer.Close()
+		}
+		if p.readerCloser != nil {
+			_ = p.readerCloser.Close()
+		}
 		p.pendingMu.Lock()
 		for id, ch := range p.pending {
-			delete(p.pending, id)
+			p.removePendingLocked(id)
 			close(ch)
 		}
 		p.pendingMu.Unlock()
@@ -334,17 +389,34 @@ func (p *Peer) CallRaw(ctx context.Context, method string, params json.RawMessag
 }
 
 func (p *Peer) callRaw(ctx context.Context, method string, params json.RawMessage) (json.RawMessage, error) {
+	return p.callRawBoundary(ctx, method, params, nil)
+}
+
+func (p *Peer) callRawBoundary(ctx context.Context, method string, params json.RawMessage, boundary func()) (json.RawMessage, error) {
 	idValue := p.nextID.Add(1)
 	var idBuffer [20]byte
 	idBytes := strconv.AppendInt(idBuffer[:0], idValue, 10)
 	msg := rpcMessage{JSONRPC: "2.0", ID: idBytes, Method: method, Params: params}
 	ch := make(chan rpcMessage, 1)
 	p.pendingMu.Lock()
+	select {
+	case <-p.closed:
+		p.pendingMu.Unlock()
+		return nil, p.closeReason()
+	default:
+	}
 	p.pending[idValue] = ch
+	p.pendingMethods[idValue] = method
+	p.pendingLife[idValue] = make(chan struct{})
+	known := &atomic.Bool{}
+	p.pendingKnown[idValue] = known
+	if boundary != nil {
+		p.pendingBoundary[idValue] = boundary
+	}
 	p.pendingMu.Unlock()
-	if err := p.writeMessage(msg); err != nil {
+	if err := p.writeMessageContext(ctx, msg); err != nil {
 		p.pendingMu.Lock()
-		delete(p.pending, idValue)
+		p.removePendingLocked(idValue)
 		p.pendingMu.Unlock()
 		return nil, err
 	}
@@ -356,17 +428,27 @@ func (p *Peer) callRaw(ctx context.Context, method string, params json.RawMessag
 		// Remove from pending first so a late response is dropped, not delivered.
 		p.pendingMu.Lock()
 		_, stillPending := p.pending[idValue]
-		delete(p.pending, idValue)
+		p.removePendingLocked(idValue)
 		p.pendingMu.Unlock()
 		if stillPending {
 			// Per ACP schema-v1.17.0 CancelRequestNotification, the param field
 			// is "requestId" (camelCase), typed as RequestId (null|int64|string).
 			// We emit the same int64 id we assigned in the original request.
 			cancelParams, _ := json.Marshal(map[string]any{"requestId": json.RawMessage(idBytes)})
-			_ = p.writeMessage(rpcMessage{JSONRPC: "2.0", Method: "$/cancel_request", Params: cancelParams})
+			p.tryWriteMessage(rpcMessage{JSONRPC: "2.0", Method: "$/cancel_request", Params: cancelParams})
 		}
 		return nil, ctx.Err()
 	case <-p.closed:
+		if known.Load() {
+			response, ok := <-ch
+			if !ok {
+				return nil, p.closeReason()
+			}
+			if response.Error != nil {
+				return nil, response.Error
+			}
+			return response.Result, nil
+		}
 		return nil, p.closeReason()
 	case response, ok := <-ch:
 		if !ok {
@@ -392,7 +474,7 @@ func (p *Peer) NotifyRaw(ctx context.Context, method string, params json.RawMess
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
-		return p.writeMessage(rpcMessage{JSONRPC: "2.0", Method: method, Params: normalizeRaw(params)})
+		return p.writeMessageContext(ctx, rpcMessage{JSONRPC: "2.0", Method: method, Params: normalizeRaw(params)})
 	}
 }
 
@@ -404,15 +486,143 @@ func (p *Peer) resolvePending(msg rpcMessage) {
 	msg.Result = copyRawMessage(msg.Result)
 	p.pendingMu.Lock()
 	ch := p.pending[id]
-	delete(p.pending, id)
+	method := p.pendingMethods[id]
+	boundary := p.pendingBoundary[id]
+	if known := p.pendingKnown[id]; known != nil {
+		known.Store(true)
+	}
+	p.removePendingLocked(id)
 	p.pendingMu.Unlock()
-	if ch != nil {
+	if ch == nil {
+		return
+	}
+	if boundary != nil {
+		boundary()
+	}
+	if method != "session/prompt" {
 		ch <- msg
 		close(ch)
+		return
+	}
+	// Capture only complete frames already received in this bufio buffer. This
+	// finite watermark is not a read-idle heuristic or proof of remote stopping:
+	// the terminal response provides that proof. Later frames remain separate.
+	target, fence := p.captureReceiveFence()
+	go func() {
+		defer close(ch)
+		if !p.awaitReceived(fence) {
+			return
+		}
+		p.inboundWorkMu.Lock()
+		var prior []<-chan struct{}
+		for seq, done := range p.inboundWork {
+			if seq <= target {
+				prior = append(prior, done)
+			}
+		}
+		p.inboundWorkMu.Unlock()
+		for _, done := range prior {
+			if !p.awaitReceived(done) {
+				return
+			}
+		}
+		ch <- msg
+	}()
+}
+
+type rpcReceiveFence struct {
+	target uint64
+	done   chan struct{}
+}
+
+func (p *Peer) nextReceivedSequence() uint64 {
+	p.fenceMu.Lock()
+	defer p.fenceMu.Unlock()
+	p.receivedSeq++
+	return p.receivedSeq
+}
+func (p *Peer) markReceivedProcessed(seq uint64) {
+	p.fenceMu.Lock()
+	defer p.fenceMu.Unlock()
+	p.processedSeq = seq
+	remaining := p.receiveFences[:0]
+	for _, fence := range p.receiveFences {
+		if fence.target <= seq {
+			close(fence.done)
+		} else {
+			remaining = append(remaining, fence)
+		}
+	}
+	p.receiveFences = remaining
+}
+func (p *Peer) captureReceiveFence() (uint64, <-chan struct{}) {
+	buffered, _ := p.reader.Peek(p.reader.Buffered())
+	p.fenceMu.Lock()
+	defer p.fenceMu.Unlock()
+	target := p.receivedSeq + uint64(bytes.Count(buffered, []byte{'\n'}))
+	done := make(chan struct{})
+	if p.processedSeq >= target {
+		close(done)
+	} else {
+		p.receiveFences = append(p.receiveFences, rpcReceiveFence{target, done})
+	}
+	return target, done
+}
+func (p *Peer) awaitReceived(done <-chan struct{}) bool {
+	select {
+	case <-done:
+		return true
+	default:
+	}
+	select {
+	case <-done:
+		return true
+	case <-p.closed:
+		select {
+		case <-done:
+			return true
+		default:
+			return false
+		}
 	}
 }
 
+// prepareInboundRequest runs in receive order, before dispatching the handler.
+// A cancellation frame immediately following a request can therefore never
+// race ahead of its cancellation registration.
+func (p *Peer) prepareInboundRequest(ctx context.Context, msg rpcMessage) (context.Context, func(), bool) {
+	reqCtx, cancel := context.WithCancel(ctx)
+	idKey := canonicalRequestID(msg.ID)
+	p.inboundCancelMu.Lock()
+	select {
+	case <-p.closed:
+		p.inboundCancelMu.Unlock()
+		cancel()
+		return nil, nil, false
+	default:
+	}
+	if _, exists := p.inboundCancel[idKey]; exists {
+		p.inboundCancelMu.Unlock()
+		cancel()
+		p.tryWriteMessage(rpcMessage{JSONRPC: "2.0", ID: msg.ID, Error: &RPCError{Code: -32600, Message: "duplicate in-flight request id"}})
+		return nil, nil, false
+	}
+	p.inboundCancel[idKey] = cancel
+	p.inboundCancelMu.Unlock()
+	finish := func() { cancel(); p.inboundCancelMu.Lock(); delete(p.inboundCancel, idKey); p.inboundCancelMu.Unlock() }
+	return reqCtx, finish, true
+}
+
 func (p *Peer) handleRequest(ctx context.Context, msg rpcMessage) {
+	reqCtx, finish, ok := p.prepareInboundRequest(ctx, msg)
+	if !ok {
+		return
+	}
+	defer finish()
+	p.handlePreparedRequest(reqCtx, msg)
+}
+
+func (p *Peer) handlePreparedRequest(reqCtx context.Context, msg rpcMessage) {
 	p.handlersMu.RLock()
 	handler := p.requestHandlers[msg.Method]
 	p.handlersMu.RUnlock()
@@ -420,26 +630,7 @@ func (p *Peer) handleRequest(ctx context.Context, msg rpcMessage) {
 		_ = p.writeMessage(rpcMessage{JSONRPC: "2.0", ID: msg.ID, Error: &RPCError{Code: -32601, Message: "method not found"}})
 		return
 	}
-	// Create a cancellable child context and register it so a peer-sent
-	// $/cancel_request can interrupt this handler. Per ACP schema-v1.17.0,
-	// honoring cancellation is MAY (best-effort); handlers that don't check
-	// ctx simply run to completion. The original request still gets a final
-	// response (normal result or -32800 if the handler returns ctx.Err()).
-	reqCtx, cancel := context.WithCancel(ctx)
-	idKey := string(msg.ID)
-	p.inboundCancelMu.Lock()
-	p.inboundCancel[idKey] = cancel
-	p.inboundCancelMu.Unlock()
-	defer func() {
-		cancel()
-		// Best-effort cleanup. IDs are unique per-peer (monotonic on our side,
-		// and peers rarely reuse ids), so a stale entry is unlikely; if a
-		// re-entrant same-id request raced us, the worst case is deleting an
-		// entry that will be re-added, which is harmless.
-		p.inboundCancelMu.Lock()
-		delete(p.inboundCancel, idKey)
-		p.inboundCancelMu.Unlock()
-	}()
+
 	result, err := handler(reqCtx, msg.Params)
 	if err != nil {
 		var rpcErr *RPCError
@@ -472,17 +663,118 @@ func (p *Peer) handleNotification(ctx context.Context, msg rpcMessage) {
 	}
 }
 
-func (p *Peer) writeMessage(msg rpcMessage) error {
-	bufferPtr := rpcWriteBufferPool.Get().(*[]byte)
-	buffer := appendRPCMessage((*bufferPtr)[:0], msg)
+// rpcWriteJob owns its serialized frame. One bounded, per-connection writer
+// handles all writes; cancellation never starts a second blocking writer.
+type rpcWriteJob struct {
+	ctx   context.Context
+	frame []byte
+	done  chan error
+	state *rpcWriteState
+}
+type rpcWriteState struct {
+	done chan struct{}
+	err  error
+}
 
+func (p *Peer) startWriter() {
 	p.writeMu.Lock()
-	p.observeRawMessage("outbound", buffer)
-	buffer = append(buffer, '\n')
-	_, err := p.writer.Write(buffer)
+	if !p.writerRunning {
+		p.writerRunning = true
+		go p.drainWrites()
+	}
 	p.writeMu.Unlock()
-	recycleRPCWriteBuffer(bufferPtr, buffer)
-	return err
+}
+
+func (p *Peer) drainWrites() {
+	for {
+		var job rpcWriteJob
+		p.writeMu.Lock()
+		select {
+		case job = <-p.writeQueue:
+			p.writeMu.Unlock()
+		default:
+			p.writerRunning = false
+			p.writeMu.Unlock()
+			return
+		}
+		var err error
+		select {
+		case <-job.ctx.Done():
+			err = job.ctx.Err()
+		case <-p.closed:
+			err = p.closeReason()
+		default:
+			p.observeRawMessage("outbound_attempt", job.frame[:len(job.frame)-1])
+			var n int
+			n, err = p.writer.Write(job.frame)
+			if err == nil && n != len(job.frame) {
+				err = io.ErrShortWrite
+			}
+			if job.state != nil {
+				job.state.err = err
+				close(job.state.done)
+			}
+			if err == nil {
+				p.observeRawMessage("outbound", job.frame[:len(job.frame)-1])
+			}
+			if err != nil {
+				p.closeWithReason(err)
+			}
+		}
+		if job.done != nil {
+			job.done <- err
+		}
+	}
+}
+
+func (p *Peer) writeMessage(msg rpcMessage) error {
+	return p.writeMessageContext(context.Background(), msg)
+}
+
+func (p *Peer) writeMessageContext(ctx context.Context, msg rpcMessage) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	job := rpcWriteJob{ctx: ctx, frame: append(appendRPCMessage(nil, msg), '\n'), done: make(chan error, 1), state: &rpcWriteState{done: make(chan struct{})}}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.closed:
+		return p.closeReason()
+	case p.writeQueue <- job:
+	}
+	p.startWriter()
+	select {
+	case err := <-job.done:
+		return err
+	case <-p.closed:
+		return p.closeReason()
+	case <-ctx.Done():
+		// A fully committed frame can still be cancelled at the request layer.
+		select {
+		case <-job.state.done:
+			return job.state.err
+		default:
+		}
+		// A partial frame cannot safely be followed by another frame. Fail the
+		// connection, wake pending requests, and interrupt closable transports.
+		p.closeWithReason(ctx.Err())
+		return ctx.Err()
+	}
+}
+
+func (p *Peer) tryWriteMessage(msg rpcMessage) {
+	job := rpcWriteJob{ctx: context.Background(), frame: append(appendRPCMessage(nil, msg), '\n')}
+	select {
+	case <-p.closed:
+		return
+	default:
+	}
+	select {
+	case p.writeQueue <- job:
+		p.startWriter()
+	default:
+	}
 }
 
 func recycleRPCWriteBuffer(bufferPtr *[]byte, buffer []byte) {
@@ -1157,17 +1449,45 @@ func skipJSONSpace(bytes []byte, i int) int {
 }
 
 func parseRPCID(raw json.RawMessage) (int64, bool) {
+	// Outgoing requests use numeric IDs. A string containing the same digits is
+	// a different JSON-RPC identity and must never resolve their pending call.
 	id := trimJSONSpace(raw)
-	if len(id) == 0 {
-		return 0, false
-	}
-	if id[0] == '"' {
-		if len(id) < 2 || id[len(id)-1] != '"' {
-			return 0, false
-		}
-		return parsePositiveInt64Bytes(id[1 : len(id)-1])
-	}
 	return parsePositiveInt64Bytes(id)
+}
+
+func canonicalRequestID(raw json.RawMessage) string {
+	id := trimJSONSpace(raw)
+	if len(id) > 0 && id[0] == '"' {
+		var value string
+		if json.Unmarshal(id, &value) == nil {
+			return "s:" + value
+		}
+	}
+	if value, err := strconv.ParseInt(string(id), 10, 64); err == nil {
+		return "n:" + strconv.FormatInt(value, 10)
+	}
+	return "j:" + string(id)
+}
+
+func (p *Peer) removePendingLocked(id int64) {
+	delete(p.pending, id)
+	delete(p.pendingMethods, id)
+	delete(p.pendingBoundary, id)
+	delete(p.pendingKnown, id)
+	if life := p.pendingLife[id]; life != nil {
+		delete(p.pendingLife, id)
+		close(life)
+	}
+}
+func (p *Peer) requestLifetime(raw json.RawMessage) (<-chan struct{}, bool) {
+	id, ok := parseRPCID(raw)
+	if !ok {
+		return nil, false
+	}
+	p.pendingMu.Lock()
+	defer p.pendingMu.Unlock()
+	life, ok := p.pendingLife[id]
+	return life, ok
 }
 
 func isRawNull(raw json.RawMessage) bool {
