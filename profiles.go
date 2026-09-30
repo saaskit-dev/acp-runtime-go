@@ -133,18 +133,18 @@ func defaultAgentProfile() AgentProfile {
 		},
 		MapOperationKind: func(kind string) string {
 			switch strings.ToLower(kind) {
-			case "read", "search":
+			case "read", "search", "read_file":
 				return "read_file"
-			case "edit", "delete", "move":
+			case "edit", "delete", "move", "write_file":
 				return "write_file"
-			case "execute":
+			case "execute", "execute_command":
 				return "execute_command"
-			case "fetch":
+			case "fetch", "network_request":
 				return "network_request"
-			case "":
-				return "unknown"
-			default:
+			case "mcp_call":
 				return "mcp_call"
+			default:
+				return "unknown"
 			}
 		},
 	}
@@ -202,9 +202,13 @@ func injectCodexSystemPromptConfig(existingEnv map[string]string, prompt SystemP
 	}
 	config := map[string]any{}
 	if existing := env["CODEX_CONFIG"]; existing != "" {
-		if err := json.Unmarshal([]byte(existing), &config); err != nil {
-			// Corrupt prior JSON: start a fresh object rather than fail session start.
-			config = map[string]any{}
+		var err error
+		config, err = parseConfigObject([]byte(existing), "CODEX_CONFIG")
+		if err != nil {
+			return nil, err
+		}
+		if err := validateCodexConfig(config); err != nil {
+			return nil, err
 		}
 	}
 	text := strings.TrimSpace(prompt.Text)
@@ -232,7 +236,7 @@ func injectCodexSystemPromptConfig(existingEnv map[string]string, prompt SystemP
 
 // applyClaudeAgentConfig translates AgentConfig into Claude Code's native format:
 // _meta.claudeCode.options (disallowedTools, allowedTools, settings.permissions).
-// Model is handled separately via InitialConfig (the standard ACP config option).
+// Model reaches the wrapper SDK options (ACP) or resolved spawn metadata (native).
 func applyClaudeAgentConfig(agent Agent, cfg AgentConfig) (Agent, map[string]any) {
 	opts := ClaudeCodeOptions{
 		DisallowedTools: cfg.DisallowedTools,
@@ -252,6 +256,13 @@ func applyClaudeAgentConfig(agent Agent, cfg AgentConfig) (Agent, map[string]any
 		opts.Settings = map[string]any{"permissions": perm}
 	}
 	meta := CreateClaudeCodeOptions(opts)
+	if cfg.Model != "" {
+		if agent.Type == ClaudeCodeACPRegistryID {
+			mergeExtraIntoClaudeOptions(meta, map[string]any{"model": cfg.Model})
+		} else {
+			meta["model"] = cfg.Model
+		}
+	}
 	// Extra fields go into claudeCode.options directly.
 	if len(cfg.Extra) > 0 {
 		mergeExtraIntoClaudeOptions(meta, cfg.Extra)
@@ -275,9 +286,7 @@ func applyCodexAgentConfig(agent Agent, cfg AgentConfig) (Agent, map[string]any)
 	} else if cfg.Sandbox == "full-access" {
 		codexOpts.ApprovalPolicy = "never"
 	}
-	if len(cfg.Permissions.Deny) > 0 {
-		codexOpts.WritableRoots = filterWritableRoots(cfg.Permissions.Deny)
-	}
+	codexOpts.Extra = cfg.Extra
 	env, err := buildCodexEnv(codexOpts, agent.Env)
 	if err != nil {
 		return agent, nil // best-effort: skip on JSON error
@@ -320,18 +329,6 @@ func codexSandboxName(unified string) string {
 	}
 }
 
-// filterWritableRoots extracts path-like entries from a deny list for Codex's
-// writable_roots (best-effort: only entries containing "/" are treated as paths).
-func filterWritableRoots(deny []string) []string {
-	var roots []string
-	for _, d := range deny {
-		if strings.Contains(d, "/") {
-			roots = append(roots, d)
-		}
-	}
-	return roots
-}
-
 // mergeExtraIntoClaudeOptions deep-merges extra fields into the
 // _meta.claudeCode.options map.
 func mergeExtraIntoClaudeOptions(meta map[string]any, extra map[string]any) {
@@ -343,9 +340,7 @@ func mergeExtraIntoClaudeOptions(meta map[string]any, extra map[string]any) {
 	if !ok {
 		return
 	}
-	for k, v := range extra {
-		options[k] = v
-	}
+	cc["options"] = mergeSessionMeta(options, extra)
 }
 
 func runtimeAuthMethodsFromACP(methods []AuthMethod) []RuntimeAuthenticationMethod {

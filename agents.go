@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 const (
@@ -141,7 +142,11 @@ func buildCodexEnv(opts CodexConfig, existingEnv map[string]string) (map[string]
 	config := map[string]any{}
 	// Parse existing CODEX_CONFIG if present, so we merge rather than clobber.
 	if existing := env["CODEX_CONFIG"]; existing != "" {
-		_ = json.Unmarshal([]byte(existing), &config)
+		var err error
+		config, err = parseConfigObject([]byte(existing), "CODEX_CONFIG")
+		if err != nil {
+			return nil, err
+		}
 	}
 	if opts.Model != "" {
 		config["model"] = opts.Model
@@ -152,14 +157,26 @@ func buildCodexEnv(opts CodexConfig, existingEnv map[string]string) (map[string]
 	if opts.ApprovalPolicy != "" {
 		config["approval_policy"] = opts.ApprovalPolicy
 	}
-	if len(opts.WritableRoots) > 0 {
-		config["writable_roots"] = opts.WritableRoots
+	if len(opts.WritableRoots) > 0 || opts.NetworkAccess != nil {
+		nested := map[string]any{}
+		if value, exists := config["sandbox_workspace_write"]; exists {
+			var ok bool
+			nested, ok = value.(map[string]any)
+			if !ok || nested == nil {
+				return nil, configError("CODEX_CONFIG", "sandbox_workspace_write", "expected a non-null object")
+			}
+		}
+		if len(opts.WritableRoots) > 0 {
+			nested["writable_roots"] = append([]string(nil), opts.WritableRoots...)
+		}
+		if opts.NetworkAccess != nil {
+			nested["network_access"] = *opts.NetworkAccess
+		}
+		config["sandbox_workspace_write"] = nested
 	}
-	if opts.NetworkAccess != nil {
-		config["sandbox_workspace_write"] = map[string]any{"network_access": *opts.NetworkAccess}
-	}
-	for k, v := range opts.Extra {
-		config[k] = v
+	config = mergeSessionMeta(config, opts.Extra)
+	if err := validateCodexConfig(config); err != nil {
+		return nil, err
 	}
 	data, err := json.Marshal(config)
 	if err != nil {
@@ -180,12 +197,27 @@ func buildCodexEnv(opts CodexConfig, existingEnv map[string]string) (map[string]
 //	    Permission: acp.OpenCodePermission{Deny: []string{"bash"}},
 //	})
 //	session, _ := runtime.StartSession(ctx, acp.StartSessionOptions{Agent: agent, CWD: cwd})
+var openCodeConfigWriteMu sync.Mutex
+
 func WriteOpenCodeConfig(cwd string, opts OpenCodeConfig) error {
+	openCodeConfigWriteMu.Lock()
+	defer openCodeConfigWriteMu.Unlock()
 	config := map[string]any{}
 	// Preserve existing opencode.json if present.
 	existingPath := filepath.Join(cwd, "opencode.json")
+	mode := os.FileMode(0o644)
 	if data, err := os.ReadFile(existingPath); err == nil {
-		_ = json.Unmarshal(data, &config)
+		config, err = parseConfigObject(data, "opencode.json")
+		if err != nil {
+			return err
+		}
+		stat, err := os.Stat(existingPath)
+		if err != nil {
+			return err
+		}
+		mode = stat.Mode().Perm()
+	} else if !os.IsNotExist(err) {
+		return err
 	}
 	if opts.Model != "" {
 		config["model"] = opts.Model
@@ -204,15 +236,51 @@ func WriteOpenCodeConfig(cwd string, opts OpenCodeConfig) error {
 		if len(opts.Permission.Ask) > 0 {
 			perm["ask"] = opts.Permission.Ask
 		}
+		if existing, exists := config["permission"]; exists {
+			object, ok := existing.(map[string]any)
+			if !ok || object == nil {
+				return configError("opencode.json", "permission", "expected a non-null object")
+			}
+			perm = mergeSessionMeta(object, perm)
+		}
 		config["permission"] = perm
 	}
-	for k, v := range opts.Extra {
-		config[k] = v
+	config = mergeSessionMeta(config, opts.Extra)
+	if permission, exists := config["permission"]; exists {
+		object, ok := permission.(map[string]any)
+		if !ok || object == nil {
+			return configError("opencode.json", "permission", "expected a non-null object")
+		}
+		for _, key := range []string{"allow", "deny", "ask"} {
+			if value, exists := object[key]; exists && !isStringList(value) {
+				return configError("opencode.json", "permission."+key, "expected a string array")
+			}
+		}
 	}
 	data, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal opencode.json: %w", err)
 	}
 	data = append(data, '\n')
-	return os.WriteFile(existingPath, data, 0o644)
+	file, err := os.CreateTemp(cwd, ".opencode-*.json")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+	if err := file.Chmod(mode); err != nil {
+		file.Close()
+		return err
+	}
+	if _, err := file.Write(data); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(file.Name(), existingPath)
 }

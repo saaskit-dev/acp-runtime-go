@@ -303,7 +303,19 @@ func normalizeMCPServers(servers []MCPServer) []MCPServer {
 // lets the provider profile project them exactly once, applies AgentConfig,
 // then merges all remaining caller metadata. Create and Resume share this path.
 func prepareAgentSessionStart(profile AgentProfile, input StartSessionOptions) (Agent, map[string]any, error) {
-	agent := input.Agent
+	agent := cloneOwned(input.Agent)
+	if err := validateAgentStartConfig(agent, input.AgentConfig, input.Meta); err != nil {
+		return agent, nil, err
+	}
+	if agent.Type == CodexNativeRegistryID || agent.Type == ClaudeCodeNativeRegistryID {
+		for key, value := range map[string]any{"model": input.InitialConfig.Model, "mode": input.InitialConfig.Mode, "effort": input.InitialConfig.Effort} {
+			if value != nil {
+				if explicit, exists := input.Meta[key]; exists && !reflect.DeepEqual(explicit, value) {
+					return agent, nil, configError("InitialConfig", key, "conflicts with explicit session metadata")
+				}
+			}
+		}
+	}
 	prompt, callerMeta, err := extractSystemPrompt(input.Meta)
 	if err != nil {
 		return agent, nil, err
@@ -332,7 +344,10 @@ func prepareAgentSessionStart(profile AgentProfile, input StartSessionOptions) (
 	if len(callerMeta) > 0 {
 		sessionMeta = mergeSessionMeta(sessionMeta, callerMeta)
 	}
-	return agent, sessionMeta, nil
+	if err := validateAgentStartConfig(agent, input.AgentConfig, sessionMeta); err != nil {
+		return agent, nil, err
+	}
+	return resolveNativeInitialConfig(agent, sessionMeta, input.InitialConfig)
 }
 
 func extractSystemPrompt(meta map[string]any) (*SystemPromptProjection, map[string]any, error) {

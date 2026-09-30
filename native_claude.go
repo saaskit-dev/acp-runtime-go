@@ -884,6 +884,7 @@ func claudeUsageFromRaw(raw json.RawMessage) *Usage {
 }
 
 func stringSliceFromAny(v any) []string {
+ if list,ok:=v.([]string);ok{return append([]string(nil),list...)}
 	list, ok := v.([]any)
 	if !ok {
 		return nil
