@@ -14,8 +14,11 @@
 
 - ACP protocol version: `1`
 - ACP source repo: `https://github.com/agentclientprotocol/agent-client-protocol`
-- ACP source ref: `schema-v1.17.0`
-- Last verified against upstream docs: `2026-07-05`
+- ACP source ref: `schema-v1.23.0`
+- Last verified against upstream docs: `2026-09-30`
+- 稳定 wire protocol 仍为 `1`；可选能力与实验接口边界见[覆盖矩阵](docs/zh-CN/research/protocol-coverage-matrix.md)
+
+稳定升级的权限、取消、配置、Gateway 与部署边界见[迁移说明](docs/zh-CN/guides/stable-upgrade-migration.md)。
 
 ## 快速开始
 

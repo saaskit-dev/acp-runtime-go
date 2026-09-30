@@ -1,139 +1,45 @@
-[English](../../../research/protocol-coverage-matrix.md)
+# ACP 稳定协议覆盖矩阵
 
-# ACP 协议覆盖矩阵
+固定目标为官方 `schema-v1.23.0`，commit `6d08f412a7a1370d3cc9a124e3be3d6acf92641e`；wire protocol 仍为 **1**。这不代表实现所有可选能力。[英文详细说明](../../research/protocol-coverage-matrix.md)
 
-- 状态：Draft
-- 日期：2026-04-03
+`testdata/acp/` 保存完整官方稳定 schema、1.17 基线、SHA-256 锁、独立手写 raw JSON fixtures，以及 Python stdio peer。`jsonschema==4.26.0` 验证实际 Go 输出，测试不需要账号或收费模型调用。
 
-## 1. 目的
+| 能力 | 支持范围 |
+|---|---|
+| 初始化、new、prompt、cancel、update | 稳定 v1；由独立 stdio peer 与运行时回归测试覆盖 |
+| permission | 标准嵌套 toolCall / optionId / outcome；保留名称、输入、内容、位置、元数据；非法选项、未知结果、超时、取消和过期作用域 fail closed |
+| load / resume | 初始化后必须有对应能力；响应 `{}` 不丢请求 session ID；冲突 ID 拒绝 |
+| list / close / delete / logout | 依照 advertised 对象存在性调用；空对象不丢失 |
+| usage_update | 顶层 used / size / 可选 cost；零值保留，与实验性每轮 token usage 分开 |
+| boolean config | 明确声明 client session.configOptions.boolean={}；仅向提供 boolean 选项的 agent 发送 type=boolean；false 不转字符串或视为缺失 |
+| select config | 公开 Options / Groups 保留；wire 分组放在 options 中，使用 group/name/options |
+| tool-call name | 创建与更新保留；省略和 null 不覆盖旧值 |
+| elicitation form / URL | 分别安装 handler 才声明；accept/decline/cancel、超时、关闭、重复/未知完成 ID、原连接和原会话/turn 作用域隔离 |
+| terminal auth | 必须安装独立交互认证 handler；只用宿主配置命令；退出0后重新连接初始化，再由受认证限制的 session 操作核验 |
+| terminal 工具执行 | 与交互认证能力分开，不能代替 terminal-auth handler |
+| fork | 现有实验接口；默认关闭，须显式 EnableExperimentalFeatures |
+| v2、alpha、notice、compaction、unstable 新增项 | 排除，不因跟进稳定 tag 自动启用 |
 
-这份文档定义 `acp-runtime` 应如何覆盖 ACP 官方协议中的能力，并规定 harness 如何记录每个 agent 的协议兼容结果。
+## 宿主必须实现的安全交互
 
-这里的目标不是要求 runtime 在第一阶段把所有 optional 特性都实现完，而是要求：
+Elicitation 放在连接层，允许建 session 前按 requestId 交互。宿主须显示请求 agent、消息，以及拒绝/取消控件；form 提交前允许用户检查修改，不能收集密码、API key、token、恢复码、私钥或支付凭证。库会拒绝明显凭证字段和未知表单类型，但不能替代宿主对语义与用户授权的核验。
 
-- ACP 协议能力全部进入覆盖模型
-- 每个 agent 的宣告能力都必须有测试结果
-- 每一项结果都必须有 transcript 证据
+URL handler 必须显示完整 URL 与域名，获得用户同意，并使用模型无法读取页面/输入的安全外部上下文。库不会自动打开或预取 URL。accept 只表示同意打开，不代表外部流程完成；完成通知必须匹配原连接和原请求。
 
-## 2. 结果状态
+权限和 elicitation 默认两分钟超时，分别可通过 PermissionTimeout / Elicitation.Timeout 调整。回调须遵守取消上下文。每连接最多32个尚未退出的权限回调执行；即使调用方超时，不响应取消的回调仍占用槽位，避免无限启动 goroutine。session 取消会取消其未决交互；缺 handler 时不声明能力。
 
-矩阵中每一项能力都应落在以下状态之一：
+终端认证 handler 接收宿主原 command、base/extra args 加认证 args、CWD 与覆盖合并后的配置环境；宿主负责继承启动环境并展示真正交互终端。库不执行无界面登录、不保存凭证、不解析成功输出模式。terminal method ID 绝不发给 authenticate。只尝试一次，非0/无退出码/信号/取消/重连失败均失败；退出0本身不是“已经认证”的证明。
 
-- `PASS`
-- `FAIL`
-- `N/A`
-- `MISSING`
+## 迁移与验证边界
 
-含义：
+- permission 的旧扁平 JSON 与 Outcome="allow" 不再接受；使用 selected+请求实际提供的 option ID，或 cancelled
+- 默认拒绝只选择实际提供的 reject_once/reject_always；未知 reject 前缀或没有拒绝选项时返回 cancelled
+- load/resume 的 Go 公开别名保留，内部 wire DTO 分离，身份由请求决定
+- capability 空对象表示支持；nil 表示缺失；false 不是对象
+- boolean 只接受 Go bool，缺失/null/数字/字符串不能替代 false
+- 初始化后未声明的可选方法不会发出；实验 Fork 须明确开启
+- 旧 adapter 的自由字符串配置扩展不冒称稳定 select/boolean
 
-- `PASS`：agent 宣告支持，且 harness 测试通过
-- `FAIL`：agent 宣告支持，但 harness 测试失败
-- `N/A`：agent 未宣告该 capability，或该能力不适用于当前 agent
-- `MISSING`：agent 宣告支持，但当前还没有对应测试或本次未执行
+独立 schema/peer 测试不等于真实 Claude/Codex 或跨平台认证 UI 验证。真实 CLI 测试仍需显式启用并固定 provider 版本。raw-message observer 属于显式诊断接口，可能包含用户内容，宿主必须负责脱敏和保留策略。
 
-## 3. 覆盖原则
-
-- 协议能力全部进入 matrix
-- baseline 能力必须进入首批实现与首批测试
-- optional 能力如果 agent 宣告支持，则必须执行对应测试
-- extension 能力允许单独记录，但不能伪装成标准协议能力
-
-## 4. 覆盖层级
-
-矩阵中的每项能力都应同时标注：
-
-- 协议层级：`baseline` / `optional` / `extension`
-- runtime 实现状态：`planned` / `partial` / `implemented`
-- harness 状态：`has-case` / `missing-case`
-
-## 5. 协议能力矩阵
-
-下表用于定义标准覆盖范围。
-
-| 能力组 | 方法 / 能力 | 协议层级 | 说明 | harness 要求 |
-| ---- | ---- | ---- | ---- | ---- |
-| 初始化 | `initialize` | baseline | 建立能力协商入口 | 必测 |
-| 认证 | `authenticate` | optional | 仅当 agent 触发认证流时测试 | 按需 |
-| Session | `session/new` | baseline | 创建会话 | 必测 |
-| Session | `session/load` | optional | 恢复并回放历史 | agent 宣告支持即必测 |
-| Session | `session/list` | optional | 列出可装载 session | agent 宣告支持即必测 |
-| Prompt | `session/prompt` | baseline | 发起 turn | 必测 |
-| Prompt | `session/update` | baseline | turn 事件流与消息更新 | 必测 |
-| Prompt | `session/cancel` | baseline | 取消 active turn | 必测 |
-| Mode | `session/set_mode` | optional | 切换 mode | agent 宣告支持即必测 |
-| Mode | `current_mode_update` | optional | agent 主动更新当前 mode | agent 宣告支持即必测 |
-| Config | `session/set_config_option` | optional | 设置配置项 | agent 宣告支持即必测 |
-| Config | `config_option_update` | optional | agent 主动更新配置状态 | agent 宣告支持即必测 |
-| Permission | `session/request_permission` | optional | 请求宿主权限决策 | agent 使用 client authority 时必测 |
-| FS | `fs/read_text_file` | optional | 读取文件 | 若 agent 使用该能力则必测 |
-| FS | `fs/write_text_file` | optional | 写入文件 | 若 agent 使用该能力则必测 |
-| Terminal | `terminal/create` | optional | 创建 terminal | 若 terminal capability 存在则必测 |
-| Terminal | `terminal/output` | optional | 获取输出 | 若 terminal capability 存在则必测 |
-| Terminal | `terminal/wait_for_exit` | optional | 等待退出 | 若 terminal capability 存在则必测 |
-| Terminal | `terminal/kill` | optional | 杀死进程 | 若 terminal capability 存在则必测 |
-| Terminal | `terminal/release` | optional | 释放 terminal 资源 | 若 terminal capability 存在则必测 |
-| Tool Calls | `tool_call` / `tool_call_update` | baseline | 通过 `session/update` 上报工具调用状态 | 必测 |
-| Extensibility | `_meta` | baseline | 附加元数据透传 | 必测兼容 |
-| Extensibility | 自定义 `_` 前缀方法 | extension | 私有扩展 | 记录即可 |
-
-## 6. 每项测试最少记录什么
-
-每个协议能力测试，至少需要在输出中包含：
-
-- 是否执行
-- 是否通过
-- 关联的 transcript 片段
-- 若失败，失败阶段
-- 若为 `N/A`，为什么是 `N/A`
-
-建议写入 `summary.json` 的字段：
-
-```json
-{
-  "protocolCoverage": {
-    "session/load": {
-      "status": "PASS",
-      "advertised": true,
-      "caseId": "protocol.session-load",
-      "notes": []
-    }
-  }
-}
-```
-
-## 7. transcript 关联要求
-
-协议覆盖结论必须能回溯到 transcript。
-
-例如：
-
-- `initialize` 的 request / response
-- `session/new` 的 request / response
-- `session/update` 的通知序列
-- `session/request_permission` 的请求与 decision
-- `terminal/*` 的调用序列
-
-如果某项能力没有 transcript 证据，不应标为 `PASS`。
-
-## 8. 与 runtime 实现的关系
-
-这份矩阵不是“当前必须全部实现完的功能列表”，而是：
-
-- runtime 设计边界的完整协议地图
-- harness 必须知道的完整覆盖面
-- 新 agent 接入时必须对照的兼容清单
-
-因此：
-
-- 可以有 `planned`
-- 可以有 `partial`
-- 但不能没有矩阵位置
-
-## 9. 当前结论
-
-`acp-runtime` 后续应把 ACP 官方协议中我们可能涉及的能力全部纳入 coverage matrix。
-
-是否在 v1 首批实现，不由这份矩阵决定；
-但是否被纳入测试与接入门禁，由这份矩阵决定。
-
-[English](../../research/protocol-coverage-matrix.md)
+完成回调在每连接独立单 worker 执行，队列上限32，接收会话/连接取消及超时。队列溢出通过 `Connection.ElicitationCompletionDrops()` 查询，不阻塞协议读取。宿主回调必须遵守取消上下文。

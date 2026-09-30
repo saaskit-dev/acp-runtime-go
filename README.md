@@ -17,8 +17,11 @@ Protocol alignment:
 
 - ACP protocol version: `1`
 - ACP source repo: `https://github.com/agentclientprotocol/agent-client-protocol`
-- ACP source ref: `schema-v1.17.0`
-- Last verified against upstream docs: `2026-07-05`
+- ACP source ref: `schema-v1.23.0`
+- Last verified against upstream docs: `2026-09-30`
+- Stable wire protocol remains `1`; optional support and experimental exclusions: [coverage matrix](docs/research/protocol-coverage-matrix.md)
+
+See the [stable upgrade migration guide](docs/guides/stable-upgrade-migration.md) for corrected permission, cancellation, configuration, gateway and deployment semantics.
 
 ## Quick Start
 
