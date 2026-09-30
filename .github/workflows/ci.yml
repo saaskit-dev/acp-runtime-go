@@ -1,27 +1,90 @@
 name: CI
-
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
-
+permissions:
+  contents: read
 jobs:
-  lint-and-test:
+  contract:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24.x"
+          go-version: "1.24.13"
           cache: true
-
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install required independent schema validator before tests
+        run: |
+          python -m pip install jsonschema==4.26.0
+          python -c 'from jsonschema import Draft202012Validator'
       - name: Vet
         run: go vet ./...
-
-      - name: Test
-        run: go test ./...
-
+      - name: Credential-free tests
+        run: go test -count=1 ./...
+      - name: Race tests
+        run: go test -race -count=1 ./...
       - name: Build commands
         run: make build
+      - name: Observed-wire stable harness audit
+        run: make harness-full
+      - name: Validate actual observed wire against stable schema
+        run: python harness/validate_transcript.py harness-outputs/full.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: harness-observed-wire
+          path: harness-outputs/full.json
+          retention-days: 7
+  stable-schema:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pinned schema validator
+        run: python -m pip install jsonschema==4.26.0
+      - name: Validate pinned official schema and raw fixtures
+        run: |
+          python testdata/acp/validate_fixtures.py
+          python testdata/native/validate_codex_contract.py
+          python .github/workflows/test_check_stable_schema.py
+
+  compile-platforms:
+    name: Compile only ${{ matrix.goos }}/${{ matrix.goarch }} (no runtime claim)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+    env:
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.13"
+      - name: Cross-compile production and test packages without execution
+        run: |
+          set -euo pipefail
+          go build ./...
+          mkdir -p /tmp/acp-cross-tests
+          index=0
+          for package in $(go list ./...); do
+            go test -c -o "/tmp/acp-cross-tests/$index.test" "$package"
+            index=$((index + 1))
+          done
+          echo 'Compilation only; macOS/Windows runtime behavior remains unverified'

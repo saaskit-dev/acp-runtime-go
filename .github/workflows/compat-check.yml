@@ -1,160 +1,164 @@
 name: compat-check
 
-# Monitors upstream ACP wrapper packages (@agentclientprotocol/claude-agent-acp,
-# @agentclientprotocol/codex-acp) for breaking changes. Runs daily and on
-# manual dispatch. If a wrapper stops producing correct output (spawn + prompt
-# smoke test fails), opens or updates a tracking GitHub Issue.
-#
-# To avoid burning API quota on unchanged versions, the check caches the last
-# successfully-tested version of each wrapper (.compat-versions.json, persisted
-# across runs via actions/cache). When the npm latest version matches the
-# cached version, the expensive spawn+prompt is skipped (reported CACHED).
-#
-# Two ways to provide credentials (configure under Settings → Secrets → Actions):
-#
-#   Option A — unified router gateway (recommended, single secret pair):
-#     UNIFIED_ROUTER_BASE_URL — e.g. https://your-router/v1
-#     UNIFIED_ROUTER_KEY      — router API key
-#     CLAUDE_GATEWAY_MODEL    — (optional) model for claude, e.g. glm-5.2
-#     CODEX_GATEWAY_MODEL     — (optional) model for codex, defaults to deepseek-chat
-#
-#   Option B — direct provider keys:
-#     ANTHROPIC_API_KEY — for the claude-agent-acp smoke test
-#     OPENAI_API_KEY    — for the codex-acp smoke test (CODEX_API_KEY also works)
-#
-# Missing credentials or native CLIs are SKIPPED. Native checks require a
-# prepared CLI login; this workflow deliberately does not install unauthenticated
-# native CLIs. Provider/auth/billing/network failures are INFRA_ERROR.
-# Only compatibility FAIL opens/updates an issue. Incomplete checks never close it.
-
+# Live calls are opt-in at the CLI. This scheduled workflow deliberately opts
+# in to wrapper smoke tests using repository-managed credentials. Native tests
+# run only on an explicitly enabled, prepared runner; missing prerequisites
+# remain INCOMPLETE and never count as PASS.
 on:
   schedule:
-    # Daily at 06:00 UTC (14:00 Beijing time).
     - cron: "0 6 * * *"
   workflow_dispatch:
+    inputs:
+      native:
+        description: Run credential-gated native suite on the prepared runner
+        type: boolean
+        default: false
 
 permissions:
+  contents: read
   issues: write
 
+concurrency:
+  group: compat-check-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  check:
+  wrapper:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24.x"
+          go-version: "1.24.13"
           cache: true
-
       - uses: actions/setup-node@v4
         with:
-          node-version: "lts/*"
-
-      # Persist the version cache across runs so unchanged versions are not
-      # re-tested (saves API quota). The cache key is fixed so each run
-      # read+writes the same slot; only the file content evolves.
-      - name: Restore version cache
-        id: cache-restore
+          node-version: "22"
+      # Actions cache entries are immutable. Restore the newest entry for this
+      # exact runtime commit/platform, then save under a unique run key.
+      # The checker also validates source/schema/config/engine digests and TTL.
+      - name: Restore successful wrapper evidence
         uses: actions/cache/restore@v4
         with:
           path: .compat-versions.json
-          key: compat-versions-cache
-
-      # Run the binary directly: go run turns exit 2 (infrastructure) into 1.
-      # Build failures stop the job before any regression issue action.
-      - name: Build compat check
+          key: compat-v2-wrapper-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            compat-v2-wrapper-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}-
+      - name: Build checker
         run: go build -o /tmp/acp-compat-check ./cmd/acp-compat-check
-
-      - name: Run compat check
+      - name: Run wrapper suite
         id: check
         env:
-          # Option A: unified router gateway (single secret pair covers both agents)
           UNIFIED_ROUTER_BASE_URL: ${{ secrets.UNIFIED_ROUTER_BASE_URL }}
           UNIFIED_ROUTER_KEY: ${{ secrets.UNIFIED_ROUTER_KEY }}
           CLAUDE_GATEWAY_MODEL: ${{ secrets.CLAUDE_GATEWAY_MODEL }}
           CODEX_GATEWAY_MODEL: ${{ secrets.CODEX_GATEWAY_MODEL }}
-          # Option B: direct provider keys (alternative to gateway)
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
         run: |
-          # Capture output to a file so the issue-creation step can embed it.
           set +e
-          /tmp/acp-compat-check > compat-output.txt 2>&1
+          /tmp/acp-compat-check --suites wrapper --required wrapper --live --summary compat-summary.json > compat-output.txt 2>&1
           code=$?
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
           cat compat-output.txt
-          echo "---"
-          echo "exit code: $code"
-          exit 0  # always succeed here; the issue step decides what to do
-
-      # Save the (possibly updated) cache. run-always so a cache miss on the
-      # first run still populates it. save always succeeds even if the restore
-      # missed, because the file is written by the check when versions change.
-      - name: Save version cache
-        if: always()
+          python3 - <<'PY'
+          import json, os, pathlib
+          path = pathlib.Path('compat-summary.json')
+          summary = json.loads(path.read_text()) if path.exists() else {}
+          updated = summary.get('cacheUpdated', False) and pathlib.Path('.compat-versions.json').exists()
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f"cache_updated={str(updated).lower()}\n")
+              out.write(f"fresh_pass={str(summary.get('requiredFreshPass', False)).lower()}\n")
+              out.write(f"matrix={summary.get('matrixDigest', '')}\n")
+          if not updated:
+              print('Cache save skipped: no newly verified PASS evidence was persisted')
+          PY
+          exit 0
+      - name: Save newly verified wrapper evidence
+        if: steps.check.outputs.cache_updated == 'true'
         uses: actions/cache/save@v4
         with:
           path: .compat-versions.json
-          key: compat-versions-cache
-
-      - name: Open or update regression Issue
-        if: steps.check.outputs.exit_code == '1'
+          key: compat-v2-wrapper-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Upload exact suite summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compat-wrapper-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            compat-summary.json
+            compat-output.txt
+          retention-days: 14
+          if-no-files-found: warn
+      - name: Track verified wrapper regression
+        if: steps.check.outputs.exit_code == '1' && vars.COMPAT_MANAGE_ISSUES == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MATRIX: ${{ steps.check.outputs.matrix }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          LABEL="compat-regression"
-          TITLE="[compat-check] ACP wrapper compatibility regression detected"
-          # Render the captured output as a fenced code block in the issue body.
-          BODY=$(cat <<'BODY_EOF'
-          A scheduled compatibility check detected that at least one ACP wrapper
-          stopped producing the expected output against this runtime. This usually
-          means an upstream wrapper release introduced a breaking change.
-
-          **Action required:** investigate the failing agent(s), pin or update the
-          wrapper, and re-run the check.
-
-          ---
-
-          #### Check output
-          ```text
-          BODY_EOF
-          )
-          BODY="${BODY}$(cat compat-output.txt)"
-          BODY="${BODY}"$'\n```\n\n'"CI run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-
-          # Check for an existing open issue with the same title to avoid dupes.
-          EXISTING=$(gh issue list --state open --search "${TITLE} in:title" --limit 1 --json number --jq '.[0].number' || true)
-          if [ -n "$EXISTING" ]; then
-            echo "Updating existing issue #$EXISTING with a new failure comment."
-            gh issue comment "$EXISTING" --body "## Regression still detected (${{ github.run_id }})
-
-          ${BODY}"
+          title="[compat-check:wrapper] ACP wrapper compatibility regression"
+          printf '<!-- compat-matrix:%s -->\nWrapper suite failed. Native results do not affect this issue.\n\nRun: %s\n\n' "$MATRIX" "$RUN_URL" > issue-body.txt
+          cat compat-output.txt >> issue-body.txt
+          existing=$(gh issue list --state open --search "${title} in:title" --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -1)
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file issue-body.txt
           else
-            echo "Opening new regression issue."
-            # Create the label if it does not exist (ignore error if it does).
-            gh label create "$LABEL" --description "Upstream ACP wrapper compatibility regression" --color D73A4A 2>/dev/null || true
-            gh issue create \
-              --title "${TITLE}" \
-              --body "${BODY}" \
-              --label "$LABEL"
+            gh issue create --title "$title" --body-file issue-body.txt
           fi
-
-      - name: Close stale regression Issue (check passed)
-        if: steps.check.outputs.exit_code == '0'
+      - name: Close only freshly reverified identical matrix
+        if: steps.check.outputs.exit_code == '0' && steps.check.outputs.fresh_pass == 'true' && vars.COMPAT_MANAGE_ISSUES == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MATRIX: ${{ steps.check.outputs.matrix }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          TITLE="[compat-check] ACP wrapper compatibility regression detected"
-          EXISTING=$(gh issue list --state open --search "${TITLE} in:title" --limit 1 --json number --jq '.[0].number' || true)
-          if [ -n "$EXISTING" ]; then
-            echo "Check passed; closing resolved issue #$EXISTING."
-            gh issue comment "$EXISTING" --body "✅ Compatibility check passed on run ${{ github.run_id }}. Closing this issue."
-            gh issue close "$EXISTING"
-          else
-            echo "Check passed; no open regression issue to close."
+          # CACHED, incomplete, differently scoped and old unscoped issues are
+          # never auto-closed. Changed matrices need maintainer review.
+          title="[compat-check:wrapper] ACP wrapper compatibility regression"
+          existing=$(gh issue list --state open --search "${title} in:title" --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -1)
+          if [ -n "$existing" ]; then
+            gh issue view "$existing" --json body,comments > issue-state.json
+            if python3 - "$MATRIX" <<'PY'
+          import json, sys
+          issue = json.load(open('issue-state.json'))
+          marker = '<!-- compat-matrix:' + sys.argv[1] + ' -->'
+          texts = [issue['body']] + [c['body'] for c in issue['comments']]
+          matrices = [text.split('-->', 1)[0] + '-->' for text in texts if text.startswith('<!-- compat-matrix:')]
+          sys.exit(0 if matrices and all(m == marker for m in matrices) else 1)
+          PY
+            then
+              gh issue close "$existing" --comment "Wrapper suite freshly passed the identical recorded matrix. Evidence: $RUN_URL"
+            else
+              echo 'Matrix differs or issue has no scoped evidence; maintainer review required'
+            fi
           fi
+      - name: Report suite completion
+        if: steps.check.outputs.exit_code != '0'
+        env:
+          EXIT_CODE: ${{ steps.check.outputs.exit_code }}
+        run: exit "${EXIT_CODE:-2}"
+
+  native:
+    if: github.event_name == 'workflow_dispatch' && inputs.native && vars.COMPAT_NATIVE_ENABLED == 'true'
+    runs-on: [self-hosted, acp-native]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.13"
+      - name: Build checker
+        run: go build -o acp-compat-check ./cmd/acp-compat-check
+      - name: Run explicitly enabled native suite
+        run: ./acp-compat-check --suites native --required native --live --refresh --summary compat-native-summary.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compat-native-${{ github.run_id }}-${{ github.run_attempt }}
+          path: compat-native-summary.json
+          retention-days: 14

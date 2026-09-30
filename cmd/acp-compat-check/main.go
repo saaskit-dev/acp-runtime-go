@@ -1,32 +1,17 @@
-// Command acp-compat-check verifies that the latest published ACP wrapper
-// packages still work with this runtime. It is designed to run both locally
-// (go run ./cmd/acp-compat-check) and in CI (scheduled workflow).
-//
-// To avoid burning API quota on unchanged versions, it caches the last
-// successfully-tested version of each wrapper in a small JSON file
-// (.compat-versions.json, or the path in COMPAT_CACHE). When the npm latest
-// version matches the cached version, the expensive spawn+prompt smoke test is
-// skipped (reported as CACHED). The test only runs when a version is new or the
-// cached entry is absent.
-//
-// For each wrapper:
-//  1. Query npm for the current latest version.
-//  2. If the version matches the cached "last tested OK" version → CACHED (skip).
-//  3. Else if the API key env var is present, spawn the real agent and run a
-//     minimal prompt; on PASS, update the cache with the new version.
-//  4. Report PASS / FAIL / SKIPPED / INFRA_ERROR / CACHED.
-//
-// Exit codes: 0 = all PASS/CACHED; 1 = compatibility FAIL; 2 = incomplete check.
-// Invoke the compiled binary in CI: go run maps nonzero program exits to 1.
+// Command acp-compat-check runs credential-free contract checks by default.
+// Live wrapper/native suites are explicit and cache only successful evidence
+// bound to the full runtime, schema, fixture, configuration and engine identity.
 package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	acp "github.com/saaskit-dev/acp-runtime-go"
@@ -46,10 +31,10 @@ const (
 )
 
 type agentCheck struct {
-	name      string // human label
-	pkg       string // npm package name for version query + cache key
+	name      string                             // human label
+	pkg       string                             // npm package name for version query + cache key
 	buildFunc func() (acp.Agent, map[string]any) // agent + optional session/new _meta
-	apiKeyEnv string                            // env var that must be present to run the real test
+	apiKeyEnv string                             // env var that must be present to run the real test
 	// localVersion, when set, sources the version from the LOCAL CLI instead
 	// of npm (native transports drive the user's own binary).
 	localVersion func() (string, error)
@@ -59,130 +44,23 @@ type agentCheck struct {
 	localBinary string
 }
 
-func main() {
-	checks := []agentCheck{
-		{
-			name:      "claude-agent-acp",
-			pkg:       "@agentclientprotocol/claude-agent-acp",
-			buildFunc: buildClaudeAgent,
-			apiKeyEnv: "ANTHROPIC_API_KEY",
-		},
-		{
-			name:      "codex-acp",
-			pkg:       "@agentclientprotocol/codex-acp",
-			buildFunc: buildCodexAgent,
-			apiKeyEnv: "OPENAI_API_KEY", // CODEX_API_KEY also accepted; checked in apiKeyPresent
-		},
-		{
-			name:      "codex-native",
-			pkg:       "native:codex",
-			buildFunc: buildNativeCodexAgent,
-			localVersion: func() (string, error) {
-				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-				defer cancel()
-				return acp.ProbeNativeEngineVersion(ctx, "codex")
-			},
-			localAuth:   true,
-			localBinary: "codex",
-		},
-		{
-			name:      "claude-native",
-			pkg:       "native:claude",
-			buildFunc: buildNativeClaudeAgent,
-			localVersion: func() (string, error) {
-				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-				defer cancel()
-				return acp.ProbeNativeEngineVersion(ctx, "claude")
-			},
-			localAuth:   true,
-			localBinary: "claude",
-		},
+func main() { os.Exit(runMain(os.Args[1:])) }
+
+func availableChecks() []agentCheck {
+	return []agentCheck{
+		{name: "claude-agent-acp", pkg: "@agentclientprotocol/claude-agent-acp", buildFunc: buildClaudeAgent, apiKeyEnv: "ANTHROPIC_API_KEY"},
+		{name: "codex-acp", pkg: "@agentclientprotocol/codex-acp", buildFunc: buildCodexAgent, apiKeyEnv: "OPENAI_API_KEY"},
+		{name: "codex-native", pkg: "native:codex", buildFunc: buildNativeCodexAgent, localVersion: func() (string, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			return acp.ProbeNativeEngineVersion(ctx, "codex")
+		}, localAuth: true, localBinary: "codex"},
+		{name: "claude-native", pkg: "native:claude", buildFunc: buildNativeClaudeAgent, localVersion: func() (string, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			return acp.ProbeNativeEngineVersion(ctx, "claude")
+		}, localAuth: true, localBinary: "claude"},
 	}
-
-	cachePath := cacheFilePath()
-	cache, _ := loadCache(cachePath) // missing/invalid cache is fine → all "new"
-	cacheDirty := false
-
-	fmt.Printf("acp-compat-check — %s\n", time.Now().UTC().Format("2006-01-02 15:04:05 UTC"))
-	fmt.Printf("cache: %s\n", cachePath)
-	if gatewayConfigured() {
-		fmt.Printf("gateway: %s (via %s + %s)\n", os.Getenv(gatewayBaseURLEnv), gatewayBaseURLEnv, gatewayKeyEnv)
-	}
-	fmt.Println()
-
-	hasFailure := false
-	hasIncomplete := false
-
-	for _, c := range checks {
-		// A missing native CLI is an unmet prerequisite, even with a cache entry.
-		if c.localAuth && !c.canRun() {
-			fmt.Printf("%s: spawn+prompt: SKIPPED (%s CLI unavailable on PATH)\n\n", c.name, c.localBinary)
-			hasIncomplete = true
-			continue
-		}
-		version, vErr := c.version()
-		if vErr != nil {
-			fmt.Printf("%s: INFRA_ERROR (could not query engine version: %v)\n\n", c.name, vErr)
-			hasIncomplete = true
-			continue
-		} else {
-			fmt.Printf("%s: latest=%s\n", c.name, version)
-		}
-
-		// Fast path: version unchanged since last successful test → skip the
-		// expensive spawn+prompt. This is the key optimization: day-to-day,
-		// when nothing changed, we do a single `npm view` per agent and stop.
-		if version != "unknown" && cache[c.pkg] == version {
-			fmt.Printf("  spawn+prompt: CACHED (already tested v%s)\n\n", version)
-			continue
-		}
-
-		if cache[c.pkg] != "" {
-			fmt.Printf("  (cached was v%s, version changed)\n", cache[c.pkg])
-		}
-
-		if !c.canRun() {
-			fmt.Printf("  spawn+prompt: SKIPPED (no %s and no gateway; version uncached)\n\n", c.apiKeyEnv)
-			hasIncomplete = true
-			continue
-		}
-
-		status, detail := runAgentCheck(c.buildFunc, c.name)
-		switch status {
-		case "PASS":
-			fmt.Printf("  spawn+prompt: PASS (%s)\n\n", detail)
-			if version != "unknown" {
-				cache[c.pkg] = version
-				cacheDirty = true
-			}
-		case "INFRA_ERROR":
-			fmt.Printf("  spawn+prompt: INFRA_ERROR (%s)\n\n", detail)
-			hasIncomplete = true
-		case "FAIL":
-			fmt.Printf("  spawn+prompt: FAIL (%s)\n\n", detail)
-			hasFailure = true
-			// Do NOT update cache on failure: next run will retry the same
-			// version, which is what we want (transient failures self-heal).
-		}
-	}
-
-	// Persist updated cache so future runs skip unchanged versions.
-	if cacheDirty {
-		if err := saveCache(cachePath, cache); err != nil {
-			fmt.Printf("⚠ could not write cache: %v\n", err)
-		}
-	}
-
-	if resultExitCode(hasFailure, hasIncomplete) == 1 {
-		fmt.Println("Result: FAIL — at least one agent did not produce the expected output.")
-		os.Exit(1)
-	}
-	if hasIncomplete {
-		fmt.Println("Result: INCOMPLETE — prerequisites or infrastructure prevented compatibility checks.")
-		os.Exit(2)
-	}
-	fmt.Println("Result: OK — all agents PASS or CACHED.")
-	os.Exit(0)
 }
 
 // version resolves the engine version: local CLI probe for native engines,
@@ -230,27 +108,6 @@ func cacheFilePath() string {
 	return ".compat-versions.json"
 }
 
-func loadCache(path string) (map[string]string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return map[string]string{}, err
-	}
-	var m map[string]string
-	if err := json.Unmarshal(data, &m); err != nil {
-		return map[string]string{}, err
-	}
-	return m, nil
-}
-
-func saveCache(path string, cache map[string]string) error {
-	data, err := json.MarshalIndent(cache, "", "  ")
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-	return os.WriteFile(path, data, 0o644)
-}
-
 // npmLatestVersion queries `npm view <pkg> version` and returns the trimmed
 // latest version string.
 func npmLatestVersion(pkg string) (string, error) {
@@ -260,7 +117,11 @@ func npmLatestVersion(pkg string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(string(out)), nil
+	version := strings.TrimSpace(string(out))
+	if !regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$`).MatchString(version) {
+		return "", fmt.Errorf("npm returned no exact semantic version")
+	}
+	return version, nil
 }
 
 // apiKeyPresent checks whether the given env var (or a documented fallback)
@@ -354,27 +215,62 @@ func buildCodexAgent() (acp.Agent, map[string]any) {
 
 // runAgentCheck spawns the real agent, runs a minimal prompt, and verifies the
 // sentinel token appears in the output. Returns (status, detail).
-func runAgentCheck(build func() (acp.Agent, map[string]any), label string) (string, string) {
+func runAgentCheck(build func() (acp.Agent, map[string]any), label string) (status string, detail string) {
+	var stderrMu sync.Mutex
+	var stderrTail string
+	defer func() {
+		stderrMu.Lock()
+		defer stderrMu.Unlock()
+		if stderrTail != "" {
+			detail += "; stderr tail: " + stderrTail
+		}
+		detail = redactDiagnostic(detail)
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
 	defer cancel()
 
-	cwd, err := os.Getwd()
+	cwd, err := os.MkdirTemp("", "acp-compat-smoke-")
 	if err != nil {
-		return "INFRA_ERROR", fmt.Sprintf("os.Getwd: %v", err)
+		return "INFRA_ERROR", fmt.Sprintf("create isolated smoke directory: %v", err)
 	}
+	defer os.RemoveAll(cwd)
 
 	start := time.Now()
 	runtime := acp.NewRuntime(acp.NewStdioConnectionFactory(acp.StdioFactoryOptions{
-		Stderr: "ignore", // keep CI logs clean; errors surface via empty output
+		OnProcessExit: func(_ error, tail string) { stderrMu.Lock(); stderrTail = redactDiagnostic(tail); stderrMu.Unlock() },
 	}), acp.RuntimeOptions{})
 
+	defer func() {
+		cleanup, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stop()
+		if closeErr := runtime.Close(cleanup); closeErr != nil {
+			if status == "PASS" {
+				status = classifyCheckResult(closeErr, "")
+			}
+			detail += "; cleanup: " + closeErr.Error()
+		}
+	}()
 	agent, meta := build()
+	if !strings.HasSuffix(label, "-native") {
+		if agent.Env == nil {
+			agent.Env = map[string]string{}
+		}
+		// Wrapper smoke uses explicit environment credentials, never a user's
+		// per-project or home configuration/login. Native retains its CLI login.
+		home := filepath.Join(cwd, "home")
+		if err := os.MkdirAll(home, 0700); err != nil {
+			return "INFRA_ERROR", err.Error()
+		}
+		agent.Env["HOME"] = home
+		agent.Env["CODEX_HOME"] = filepath.Join(home, ".codex")
+		agent.Env["CLAUDE_CONFIG_DIR"] = filepath.Join(home, ".claude")
+		agent.Env["XDG_CONFIG_HOME"] = filepath.Join(home, ".config")
+	}
 	opts := acp.StartSessionOptions{Agent: agent, CWD: cwd, Meta: meta}
 	session, err := runtime.StartSession(ctx, opts)
 	if err != nil {
 		return classifyCheckResult(err, ""), fmt.Sprintf("StartSession error: %v", err)
 	}
-	defer session.Close(context.Background())
 
 	prompt := fmt.Sprintf("Reply with exactly and only: %s", sentinelToken)
 	completion, err := session.Run(ctx, prompt)

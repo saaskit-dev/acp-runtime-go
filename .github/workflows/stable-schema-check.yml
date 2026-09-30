@@ -1,0 +1,27 @@
+name: stable-schema-check
+# Read-only discovery: do not change pins, open issues, or create pull requests.
+on:
+  schedule:
+    - cron: "30 6 * * *"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Read official stable release metadata and schema hash
+        run: python .github/workflows/check_stable_schema.py
+      - name: Retain metadata and reviewable schema diff
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stable-schema-observation-${{ github.run_id }}
+          path: schema-observation/
+          retention-days: 14
+          if-no-files-found: warn

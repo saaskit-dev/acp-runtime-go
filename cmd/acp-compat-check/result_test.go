@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestClassifyCheckResult(t *testing.T) {
@@ -88,54 +89,77 @@ func TestResultExitCode(t *testing.T) {
 	}
 }
 
-func TestMainSkipsMissingNativeCLI(t *testing.T) {
+func TestMainWrapperScopeSkipsMissingNativeCLI(t *testing.T) {
 	if os.Getenv("COMPAT_TEST_HELPER") == "1" {
-		main()
-		return
+		os.Exit(runMain(nil))
 	}
 	if runtime.GOOS == "windows" {
 		t.Skip("shell fixture requires Unix")
 	}
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "npm"), []byte("#!/bin/sh\necho 1.0.0\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	cachePath := filepath.Join(dir, "cache.json")
-	cache := map[string]string{
-		"@agentclientprotocol/claude-agent-acp": "1.0.0",
-		"@agentclientprotocol/codex-acp": "1.0.0",
-		"native:codex": "1.0.0",
-		"native:claude": "1.0.0",
-	}
-	if err := saveCache(cachePath, cache); err != nil {
-		t.Fatal(err)
-	}
-	before, err := os.ReadFile(cachePath)
+	git, err := exec.LookPath("git")
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Symlink(git, filepath.Join(dir, "git")); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\ncase \"$3\" in version) echo 1.0.0;; *) echo sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==;; esac\n"
+	if err = os.WriteFile(filepath.Join(dir, "npm"), []byte(script), 0755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir)
-	t.Setenv("COMPAT_CACHE", cachePath)
+	t.Setenv("COMPAT_SUITES", "wrapper")
+	t.Setenv("COMPAT_REQUIRED", "wrapper")
 	t.Setenv("COMPAT_TEST_HELPER", "1")
-	cmd := exec.Command(os.Args[0], "-test.run=^TestMainSkipsMissingNativeCLI$")
-	out, err := cmd.CombinedOutput()
-	var exitErr *exec.ExitError
-	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 2 {
-		t.Fatalf("want incomplete exit 2, got %v; output=%s", err, out)
-	}
-	for _, binary := range []string{"codex", "claude"} {
-		if !strings.Contains(string(out), binary+"-native: spawn+prompt: SKIPPED ("+binary+" CLI unavailable on PATH)") {
-			t.Fatalf("missing skip diagnostic for %s: %s", binary, out)
-		}
-	}
-	if strings.Contains(string(out), "FAIL") {
-		t.Fatalf("missing native CLI must not report regression: %s", out)
-	}
-	after, err := os.ReadFile(cachePath)
+	t.Setenv("COMPAT_SUMMARY", filepath.Join(dir, "summary.json"))
+	t.Setenv("COMPAT_CACHE", filepath.Join(dir, "cache.json"))
+	base, err := runtimeIdentity()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(before) != string(after) {
-		t.Fatal("incomplete checks must not update cached versions")
+	cache := newCache()
+	now := time.Now().UTC()
+	for _, check := range availableChecks() {
+		if check.localAuth {
+			continue
+		}
+		id := base
+		id.Suite = "wrapper"
+		id.Engine = check.name
+		id.EngineVersion = "1.0.0"
+		id.ArtifactDigest = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+		cache.Entries[id.key()] = cacheEntry{Identity: id, Status: statusPass, VerifiedAt: now, ExpiresAt: now.Add(time.Hour), Source: "fixture"}
 	}
+	if err = saveCache(cacheFilePath(), cache); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(cacheFilePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestMainWrapperScopeSkipsMissingNativeCLI$")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("wrapper scope must exit 0: %v: %s", err, out)
+	}
+	t.Logf("wrapper-scope exit 0:\n%s", out)
+	for _, want := range []string{"wrapper/claude-agent-acp: CACHED", "wrapper/codex-acp: CACHED", "native/codex-native: SKIPPED (suite not selected)", "native/claude-native: SKIPPED (suite not selected)"} {
+		if !strings.Contains(string(out), want) {
+			t.Fatalf("missing %q in %s", want, out)
+		}
+	}
+	after, _ := os.ReadFile(cacheFilePath())
+	if string(before) != string(after) {
+		t.Fatal("cache hit changed evidence")
+	}
+	t.Setenv("COMPAT_SUITES", "wrapper,native")
+	t.Setenv("COMPAT_REQUIRED", "wrapper,native")
+	cmd = exec.Command(os.Args[0], "-test.run=^TestMainWrapperScopeSkipsMissingNativeCLI$")
+	out, err = cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 2 {
+		t.Fatalf("required missing native must exit 2: %v: %s", err, out)
+	}
+	t.Logf("required-native exit 2:\n%s", out)
 }

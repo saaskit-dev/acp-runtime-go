@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
+	acp "github.com/saaskit-dev/acp-runtime-go"
 	"net"
 	"os"
 	"os/exec"
@@ -19,7 +21,7 @@ var infraHTTPStatus = regexp.MustCompile(`(?i)(?:unexpected status|http(?: statu
 // not silently suppressed. A successful sentinel takes precedence over
 // transient diagnostic text from a recovered request.
 func classifyCheckResult(err error, output string) string {
-	if err == nil && strings.Contains(output, sentinelToken) {
+	if err == nil && hasSentinel(output) {
 		return "PASS"
 	}
 	if isInfrastructureError(err, output) {
@@ -28,7 +30,50 @@ func classifyCheckResult(err error, output string) string {
 	return "FAIL"
 }
 
+type failureKind string
+
+const (
+	failureInfra    failureKind = "infrastructure"
+	failureProtocol failureKind = "protocol"
+	failureProvider failureKind = "provider"
+)
+
+type checkError struct {
+	Kind  failureKind
+	Cause error
+}
+
+func (e *checkError) Error() string { return fmt.Sprintf("%s: %v", e.Kind, e.Cause) }
+func (e *checkError) Unwrap() error { return e.Cause }
+func hasSentinel(output string) bool {
+	for _, line := range strings.Split(output, "\n") {
+		if strings.TrimSpace(line) == sentinelToken {
+			return true
+		}
+	}
+	return false
+}
+
 func isInfrastructureError(err error, output string) bool {
+	var typed *checkError
+	if errors.As(err, &typed) {
+		return typed.Kind == failureInfra
+	}
+	var rpc *acp.RPCError
+	if errors.As(err, &rpc) && (rpc.Code == -32600 || rpc.Code == -32601 || rpc.Code == -32602 || rpc.Code == -32700) {
+		return false
+	}
+	var runtimeErr *acp.RuntimeError
+	if errors.As(err, &runtimeErr) {
+		if runtimeErr.Kind == acp.ErrorProtocol {
+			return false
+		}
+		if runtimeErr.Kind == acp.ErrorAuthentication {
+			return true
+		}
+	}
+	// Legacy provider diagnostics below are a fallback only after typed errors.
+
 	if errors.Is(err, exec.ErrNotFound) || errors.Is(err, os.ErrPermission) ||
 		errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return true
