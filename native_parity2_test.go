@@ -72,7 +72,7 @@ func TestCodexApprovalDeniedAndApproved(t *testing.T) {
 		}
 		daemon := &codexDaemon{key: "test", eng: e, turns: map[string]*codexTurn{}}
 		daemon.mu.Lock()
-		daemon.turns["t1"] = &codexTurn{done: make(chan struct{})}
+		daemon.turns["t1"] = &codexTurn{id: "turn1", done: make(chan struct{}), permissionCtx: context.Background()}
 		daemon.mu.Unlock()
 		return daemon
 	}
@@ -80,7 +80,7 @@ func TestCodexApprovalDeniedAndApproved(t *testing.T) {
 	deniedCalled := false
 	p := newTestProc(PermissionDecision{Outcome: "cancelled"}, &deniedCalled)
 	resp, err := p.handleApproval(context.Background(), json.RawMessage(
-		`{"threadId":"t1","callId":"c1","command":["rm","-rf","/"]}`))
+		`{"threadId":"t1","turnId":"turn1","callId":"c1","command":["rm","-rf","/"]}`))
 	if err != nil {
 		t.Fatalf("handleApproval: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestCodexApprovalDeniedAndApproved(t *testing.T) {
 	approvedCalled := false
 	p2 := newTestProc(PermissionDecision{Outcome: "selected", OptionID: "approve"}, &approvedCalled)
 	resp2, err := p2.handleApproval(context.Background(), json.RawMessage(
-		`{"threadId":"t1","callId":"c2","command":["ls"]}`))
+		`{"threadId":"t1","turnId":"turn1","callId":"c2","command":["ls"]}`))
 	if err != nil {
 		t.Fatalf("handleApproval: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestClaudeNativeFork(t *testing.T) {
 		Args:    []string{"-test.run=TestFakeClaudeStreamJSON", "--"},
 		Env:     map[string]string{"GO_WANT_HELPER_PROCESS": "1"},
 	})
-	runtime := NewRuntime(nil, RuntimeOptions{})
+	runtime := NewRuntime(nil, RuntimeOptions{EnableExperimentalFeatures: true})
 	session, err := runtime.ForkSession(ctx, ForkSessionOptions{
 		StartSessionOptions: StartSessionOptions{Agent: agent, CWD: t.TempDir()},
 		SessionID:           "orig-1",

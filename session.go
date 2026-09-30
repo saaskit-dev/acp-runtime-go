@@ -10,8 +10,10 @@ type Session struct {
 	driver  SessionDriver
 	updates <-chan SessionNotification
 
-	mu     sync.RWMutex
-	closed bool
+	mu        sync.RWMutex
+	closed    bool
+	cleanupMu contextLock
+	cleaned   bool
 }
 
 func (s *Session) Capabilities() RuntimeCapabilities {
@@ -61,42 +63,56 @@ func (s *Session) Snapshot() RuntimeSnapshot {
 }
 
 func (s *Session) Close(ctx context.Context) error {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return nil
+	if err := s.cleanupMu.LockContext(ctx); err != nil {
+		return err
 	}
+	defer s.cleanupMu.Unlock()
+	s.mu.Lock()
 	s.closed = true
 	s.mu.Unlock()
+	if s.cleaned {
+		return nil
+	}
+	if err := s.driver.Close(ctx); err != nil {
+		return err
+	}
+	s.cleaned = true
 	if s.runtime != nil {
 		s.runtime.unregister(s.driver)
 	}
-	return s.driver.Close(ctx)
+	return nil
 }
 
-// Delete issues session/delete to remove the session's persistent history from
-// the agent, then closes the session locally. Use this instead of Close when
-// the host wants the session forgotten rather than just ended.
+// Delete removes provider history and closes this handle. Failed cleanup stays
+// registered so Runtime.Close can retry releasing the connection.
 func (s *Session) Delete(ctx context.Context) error {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return nil
+	if err := s.cleanupMu.LockContext(ctx); err != nil {
+		return err
 	}
+	defer s.cleanupMu.Unlock()
+	s.mu.Lock()
 	s.closed = true
 	s.mu.Unlock()
+	if s.cleaned {
+		return nil
+	}
+	if err := s.driver.Delete(ctx); err != nil {
+		return err
+	}
+	s.cleaned = true
 	if s.runtime != nil {
 		s.runtime.unregister(s.driver)
 	}
-	return s.driver.Delete(ctx)
+	return nil
 }
 
 // Logout asks the agent to discard cached credentials (logout). It does not
 // close the session; pair with Close or Delete as needed.
 func (s *Session) Logout(ctx context.Context) error {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.closed {
+	closed := s.closed
+	s.mu.RUnlock()
+	if closed {
 		return sessionClosedError("session.logout")
 	}
 	return s.driver.Logout(ctx)
@@ -104,8 +120,9 @@ func (s *Session) Logout(ctx context.Context) error {
 
 func (s *Session) StartTurn(ctx context.Context, prompt RuntimePrompt) TurnHandle {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.closed {
+	closed := s.closed
+	s.mu.RUnlock()
+	if closed {
 		return closedTurnHandle(sessionClosedError("session.start_turn"))
 	}
 	return s.driver.StartTurn(ctx, prompt)
@@ -119,8 +136,9 @@ func (s *Session) Run(ctx context.Context, text string) (TurnCompletion, error) 
 
 func (s *Session) CancelTurn(ctx context.Context, turnID string) (bool, error) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.closed {
+	closed := s.closed
+	s.mu.RUnlock()
+	if closed {
 		return false, sessionClosedError("session.cancel_turn")
 	}
 	return s.driver.CancelTurn(ctx, turnID)
@@ -128,8 +146,9 @@ func (s *Session) CancelTurn(ctx context.Context, turnID string) (bool, error) {
 
 func (s *Session) SetAgentMode(ctx context.Context, modeID string) error {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.closed {
+	closed := s.closed
+	s.mu.RUnlock()
+	if closed {
 		return sessionClosedError("session.set_agent_mode")
 	}
 	return s.driver.SetAgentMode(ctx, modeID)
@@ -137,8 +156,9 @@ func (s *Session) SetAgentMode(ctx context.Context, modeID string) error {
 
 func (s *Session) SetAgentConfigOption(ctx context.Context, id string, value any) error {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.closed {
+	closed := s.closed
+	s.mu.RUnlock()
+	if closed {
 		return sessionClosedError("session.set_agent_config_option")
 	}
 	return s.driver.SetAgentConfigOption(ctx, id, value)

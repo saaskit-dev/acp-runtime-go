@@ -287,7 +287,7 @@ func (p *initialConfigProvider) connect(t *testing.T) (*SessionService, *Peer) {
 		panic("handler replaced below")
 	})
 	peer.RegisterRequest("initialize", func(context.Context, json.RawMessage) (any, error) {
-		return InitializeResponse{}, nil
+		return InitializeResponse{ProtocolVersion: 1, AgentCapabilities: AgentCapabilities{LoadSession: true, SessionCapabilities: SessionCapabilities{Resume: map[string]any{}, Close: map[string]any{}, Delete: map[string]any{}}}}, nil
 	})
 	for _, method := range []string{"session/new", "session/resume", "session/load", "session/fork"} {
 		peer.RegisterRequest(method, func(context.Context, json.RawMessage) (any, error) {
@@ -379,7 +379,7 @@ func TestInitialConfigRPCCounts(t *testing.T) {
 				prepare: func(p *initialConfigProvider) {
 					p.change = func(string, any) error { p.response.ConfigOptions = p.response.ConfigOptions[:1]; return nil }
 				},
-				want: []string{"model=sonnet"}},
+				want: []string{"model=sonnet"}, wantErr: true},
 			{name: "model changes effort selector", config: InitialConfig{Model: "sonnet", Effort: "high"},
 				prepare: func(p *initialConfigProvider) {
 					p.change = func(id string, _ any) error {
@@ -395,20 +395,20 @@ func TestInitialConfigRPCCounts(t *testing.T) {
 				prepare: func(p *initialConfigProvider) { p.legacy = true },
 				want:    []string{"model=sonnet", "reasoning_effort=high", "reasoning_effort=high"}},
 			{name: "raw sees latest response", config: InitialConfig{Model: "sonnet", Raw: map[string]any{"model": "sonnet"}}, want: []string{"model=sonnet"}},
-			{name: "missing options skip", config: InitialConfig{Model: "haiku", Effort: "high"},
-				prepare: func(p *initialConfigProvider) { p.response.ConfigOptions = nil }},
+			{name: "missing options fail explicitly", config: InitialConfig{Model: "haiku", Effort: "high"},
+				prepare: func(p *initialConfigProvider) { p.response.ConfigOptions = nil }, wantErr: true},
 			{name: "missing mode sends", config: InitialConfig{Mode: "plan"},
 				prepare: func(p *initialConfigProvider) { p.response.Modes = nil }, want: []string{"mode=plan"}},
 			{name: "unknown raw errors", config: InitialConfig{Raw: map[string]any{"unknown": "x"}}, want: []string{"unknown=x"}, wantErr: true},
 			{name: "nil current not equal", config: InitialConfig{Raw: map[string]any{"fast": nil}},
-				prepare: func(p *initialConfigProvider) { p.response.ConfigOptions[2].Value = nil }, want: []string{"fast=<nil>"}},
+				prepare: func(p *initialConfigProvider) { p.response.ConfigOptions[2].Value = nil }, wantErr: true},
 			{name: "case sensitive values", config: InitialConfig{Model: "HAIKU"}, want: []string{"model=HAIKU"}},
 			{name: "structured raw equality", config: InitialConfig{Raw: map[string]any{"fast": map[string]any{"flags": []any{"a", "b"}}}},
 				prepare: func(p *initialConfigProvider) {
 					p.response.ConfigOptions[2].Value = map[string]any{"flags": []any{"a", "b"}}
-				}},
+				}, wantErr: true},
 			{name: "wire number type conservative", config: InitialConfig{Raw: map[string]any{"fast": 1}},
-				prepare: func(p *initialConfigProvider) { p.response.ConfigOptions[2].Value = float64(1) }, want: []string{"fast=1"}},
+				prepare: func(p *initialConfigProvider) { p.response.ConfigOptions[2].Value = float64(1) }, wantErr: true},
 			{name: "alias order", config: InitialConfig{Mode: "yolo"},
 				prepare: func(p *initialConfigProvider) { p.response.Modes.CurrentModeID = "yolo" }, want: []string{"mode=bypassPermissions"}},
 			{name: "alias fallback", config: InitialConfig{Mode: "yolo"},
@@ -458,7 +458,7 @@ func TestInitialConfigRPCCounts(t *testing.T) {
 				}
 				if err == nil {
 					want := metadataFromSessionResponse(p.response)
-					if got := driver.Metadata(); !reflect.DeepEqual(got, want) {
+					if got := driver.Metadata(); func() bool { got.ConfigApplication = ConfigApplicationReport{}; return !reflect.DeepEqual(got, want) }() {
 						t.Fatalf("metadata = %#v, want %#v", got, want)
 					}
 				}
@@ -467,7 +467,7 @@ func TestInitialConfigRPCCounts(t *testing.T) {
 	}
 }
 
-func TestInitialConfigDoesNotChangeExplicitSettersOrLoadFork(t *testing.T) {
+func TestInitialConfigAppliesLoadAndGatesExperimentalFork(t *testing.T) {
 	p := &initialConfigProvider{response: NewSessionResponse{
 		SessionID: "session-1", Modes: &SessionModeState{CurrentModeID: "plan"},
 		ConfigOptions: []SessionConfigOption{configOption("model", "Model", "haiku")},
@@ -484,7 +484,7 @@ func TestInitialConfigDoesNotChangeExplicitSettersOrLoadFork(t *testing.T) {
 	if err := driver.SetAgentConfigOption(context.Background(), "model", "haiku"); err != nil {
 		t.Fatal(err)
 	}
-	for _, load := range []func(context.Context, LoadSessionOptions) (SessionDriver, error){service.Load, service.Fork} {
+	for _, load := range []func(context.Context, LoadSessionOptions) (SessionDriver, error){service.Load} {
 		_, err := load(context.Background(), LoadSessionOptions{SessionID: "session-1", StartSessionOptions: StartSessionOptions{InitialConfig: InitialConfig{Mode: "different", Model: "different"}}})
 		if err != nil {
 			t.Fatal(err)
@@ -492,7 +492,10 @@ func TestInitialConfigDoesNotChangeExplicitSettersOrLoadFork(t *testing.T) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if want := []string{"mode=plan", "model=haiku"}; !reflect.DeepEqual(p.calls, want) {
+	if _, err := service.Fork(context.Background(), LoadSessionOptions{SessionID: "session-1"}); err == nil {
+		t.Fatal("experimental fork enabled by default")
+	}
+	if want := []string{"mode=plan", "model=haiku", "mode=different", "model=different"}; !reflect.DeepEqual(p.calls, want) {
 		t.Fatalf("calls = %v, want %v", p.calls, want)
 	}
 }
@@ -527,10 +530,10 @@ func TestInitialConfigOptionAliasesAndMissingReport(t *testing.T) {
 	profile := defaultAgentProfile()
 	profile.CreateInitialConfigAliases = func(key string, value any) []any { return []any{"haiku", value} }
 	report, err := applyInitialConfig(context.Background(), driver, InitialConfig{Model: "friendly-name", Effort: "high"}, profile)
-	if err != nil {
-		t.Fatal(err)
+	if err == nil {
+		t.Fatal("missing requested option must fail explicitly")
 	}
-	want := []InitialConfigReportItem{{Key: "model", ID: "MODEL", Value: "haiku"}, {Key: "effort", Value: "high", Reason: "option_not_found"}}
+	want := []InitialConfigReportItem{{Key: "model", ID: "MODEL", Value: "haiku"}}
 	if !reflect.DeepEqual(report.Applied, want) {
 		t.Fatalf("report = %#v, want %#v", report.Applied, want)
 	}

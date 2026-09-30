@@ -4,13 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -52,18 +49,18 @@ func NewStdioConnectionFactory(options StdioFactoryOptions) ConnectionFactory {
 			return ConnectionHandle{}, err
 		}
 		var stderr bytes.Buffer
+		stderrTail := &tailWriter{limit: 4096, buf: &stderr}
 		switch options.Stderr {
 		case "inherit":
 			cmd.Stderr = os.Stderr
 		case "ignore":
 			cmd.Stderr = io.Discard
 		default:
-			cmd.Stderr = &tailWriter{limit: 4096, buf: &stderr}
+			cmd.Stderr = stderrTail
 		}
 		if err := cmd.Start(); err != nil {
 			return ConnectionHandle{}, wrapError(ErrorProcess, "stdio.spawn", "failed to spawn ACP stdio process", err)
 		}
-		processGroupID := processGroupIDAfterStart(cmd)
 		peerOptions := PeerOptions{}
 		if options.OnACPMessage != nil {
 			peerOptions.OnRawMessage = func(direction string, message json.RawMessage) {
@@ -73,91 +70,60 @@ func NewStdioConnectionFactory(options StdioFactoryOptions) ConnectionFactory {
 		peer := NewPeer(stdout, stdin, peerOptions)
 		conn := NewConnectionWithObservability(peer, input.Client, input.Observability)
 		startCtx, cancelStart := context.WithCancel(context.WithoutCancel(ctx))
-		done := make(chan error, 1)
-		// cmd.Wait may run exactly once. waitDone closes after it returns and
-		// waitErr memoizes the result, so the teardown path and the process-exit
-		// monitor below can both observe the outcome regardless of who reads
-		// first — a value-carrying channel would let the first reader starve
-		// the second.
-		var (
-			waitOnce sync.Once
-			waitDone = make(chan struct{})
-			waitErr  error
-		)
-		doWait := func() <-chan struct{} {
-			waitOnce.Do(func() { go func() { waitErr = cmd.Wait(); close(waitDone) }() })
-			return waitDone
+		var processWait nativeProcessWait
+		var cleanupMu sync.Mutex
+		var cleanupDone chan struct{}
+		var cleanupErr error
+		var cleanupComplete bool
+		startTeardown := func() <-chan struct{} {
+			cleanupMu.Lock()
+			defer cleanupMu.Unlock()
+			if cleanupComplete || cleanupDone != nil {
+				return cleanupDone
+			}
+			cleanupDone = make(chan struct{})
+			done := cleanupDone
+			go func() {
+				cancelStart()
+				// Cleanup remains owned after a caller timeout. Failed attempts may be
+				// retried using the same Wait result and captured process identities.
+				cleanupCtx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+				defer cancel()
+				err := stopNativeProcess(cleanupCtx, cmd, stdin, &processWait)
+				peer.Close()
+				cleanupMu.Lock()
+				cleanupErr = err
+				cleanupComplete = err == nil
+				close(done)
+				if err != nil {
+					cleanupDone = nil
+				}
+				cleanupMu.Unlock()
+			}()
+			return done
 		}
-		waitResult := func() error { <-doWait(); return waitErr }
 		go func() {
-			done <- peer.Start(startCtx)
-			// The read loop only ends when the child's stdout closes, i.e. the
-			// process is going down (naturally or via teardown). Report the
-			// final Wait result + stderr tail once available.
+			_ = peer.Start(startCtx)
+			// EOF can occur before descendants exit; take ownership of cleanup even
+			// when the caller has not yet closed its session handle.
+			_ = startTeardown()
 			if options.OnProcessExit != nil {
-				options.OnProcessExit(waitResult(), stderr.String())
+				processWait.mu.Lock()
+				processWait.startLocked(cmd)
+				done := processWait.done
+				processWait.mu.Unlock()
+				<-done
+				options.OnProcessExit(processWait.err, stderrTail.String())
 			}
 		}()
-		var teardownOnce sync.Once
-		teardownDone := make(chan struct{})
-		var teardownErr error
-		startTeardown := func() {
-			teardownOnce.Do(func() {
-				go func() {
-					defer close(teardownDone)
-					cancelStart()
-					_ = stdin.Close()
-					waitDone := doWait()
-					select {
-					case <-waitDone:
-						if err := waitResult(); err != nil && !errors.Is(err, context.Canceled) {
-							teardownErr = err
-						}
-					case <-time.After(1500 * time.Millisecond):
-						if cmd.Process != nil {
-							_ = signalProcessTree(processGroupID, cmd.Process, syscall.SIGTERM)
-						}
-						select {
-						case <-waitDone:
-							_ = signalProcessTree(processGroupID, nil, syscall.SIGTERM)
-							if err := waitResult(); err != nil && !errors.Is(err, context.Canceled) {
-								teardownErr = err
-							}
-						case <-time.After(time.Second):
-							if cmd.Process != nil {
-								_ = signalProcessTree(processGroupID, cmd.Process, syscall.SIGKILL)
-							}
-							// Hard-cap the final Wait after SIGKILL so a stuck reaper
-							// cannot pin the teardown goroutine forever. Callers that
-							// timed out earlier still cannot orphan the only cleanup
-							// attempt; we just stop waiting for an unkillable tree.
-							select {
-							case <-waitDone:
-								_ = signalProcessTree(processGroupID, nil, syscall.SIGKILL)
-								if err := waitResult(); err != nil && !errors.Is(err, context.Canceled) {
-									teardownErr = fmt.Errorf("agent process required forced teardown: %w; stderr tail: %s", err, stderr.String())
-								} else {
-									teardownErr = fmt.Errorf("agent process required forced teardown; stderr tail: %s", stderr.String())
-								}
-							case <-time.After(3 * time.Second):
-								_ = signalProcessTree(processGroupID, nil, syscall.SIGKILL)
-								teardownErr = fmt.Errorf("agent process did not exit after SIGKILL; stderr tail: %s", stderr.String())
-							}
-						}
-					}
-					peer.Close()
-					select {
-					case <-done:
-					default:
-					}
-				}()
-			})
-		}
 		dispose := func(ctx context.Context) error {
-			startTeardown()
+			done := startTeardown()
 			select {
-			case <-teardownDone:
-				return teardownErr
+			case <-done:
+				cleanupMu.Lock()
+				err := cleanupErr
+				cleanupMu.Unlock()
+				return err
 			case <-ctx.Done():
 				return ctx.Err()
 			}
@@ -167,11 +133,14 @@ func NewStdioConnectionFactory(options StdioFactoryOptions) ConnectionFactory {
 }
 
 type tailWriter struct {
+	mu    sync.Mutex
 	limit int
 	buf   *bytes.Buffer
 }
 
 func (w *tailWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	n, err := w.buf.Write(p)
 	if w.buf.Len() > w.limit {
 		data := append([]byte(nil), w.buf.Bytes()...)
@@ -180,3 +149,5 @@ func (w *tailWriter) Write(p []byte) (int, error) {
 	}
 	return n, err
 }
+
+func (w *tailWriter) String() string { w.mu.Lock(); defer w.mu.Unlock(); return w.buf.String() }

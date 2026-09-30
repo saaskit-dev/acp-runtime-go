@@ -1,0 +1,87 @@
+[
+  {
+    "schema": "TurnInterruptParams.json",
+    "value": {
+      "threadId": "thread",
+      "turnId": "real-turn-review"
+    }
+  },
+  {
+    "schema": "TurnInterruptResponse.json",
+    "value": {}
+  },
+  {
+    "schema": "TurnStartResponse.json",
+    "value": {
+      "turn": {
+        "id": "real-turn-review",
+        "items": [],
+        "status": "inProgress"
+      }
+    }
+  },
+  {
+    "schema": "TurnCompletedNotification.json",
+    "value": {
+      "threadId": "thread",
+      "turn": {
+        "id": "real-turn-review",
+        "items": [],
+        "status": "completed",
+        "error": null
+      }
+    }
+  },
+  {
+    "schema": "TurnCompletedNotification.json",
+    "value": {
+      "threadId": "thread",
+      "turn": {
+        "id": "real-turn-review",
+        "items": [],
+        "status": "interrupted",
+        "error": null
+      }
+    }
+  },
+  {
+    "schema": "TurnCompletedNotification.json",
+    "value": {
+      "threadId": "thread",
+      "turn": {
+        "id": "real-turn-review",
+        "items": [],
+        "status": "failed",
+        "error": {
+          "message": "provider failed",
+          "codexErrorInfo": "other",
+          "additionalDetails": "detail"
+        }
+      }
+    }
+  },
+  {
+    "schema": "CommandExecutionRequestApprovalParams.json",
+    "value": {
+      "threadId": "thread",
+      "turnId": "real-turn-review",
+      "itemId": "cmd_1",
+      "startedAtMs": 0,
+      "command": "cat /private/file",
+      "cwd": "/private",
+      "reason": "approval needed"
+    }
+  },
+  {
+    "schema": "CommandExecutionRequestApprovalResponse.json",
+    "value": {
+      "decision": "accept"
+    }
+  },
+  {
+    "schema": "CommandExecutionRequestApprovalResponse.json",
+    "value": {
+      "decision": "decline"
+    }
+  }
+]

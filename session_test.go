@@ -189,14 +189,10 @@ func TestSessionDriverPreservesMarkdownWhitespaceChunks(t *testing.T) {
 	}
 }
 
-func TestSetSessionConfigOptionAcceptsLegacyOptionID(t *testing.T) {
+func TestSetSessionConfigOptionRejectsLegacyOptionID(t *testing.T) {
 	var req SetSessionConfigOptionRequest
-	raw := []byte(`{"sessionId":"s1","optionId":"model","value":"opus"}`)
-	if err := json.Unmarshal(raw, &req); err != nil {
-		t.Fatalf("Unmarshal() error = %v", err)
-	}
-	if req.OptionID != "model" {
-		t.Fatalf("OptionID = %q, want model", req.OptionID)
+	if err := json.Unmarshal([]byte(`{"sessionId":"s1","optionId":"model","value":"opus"}`), &req); err == nil {
+		t.Fatal("legacy optionId accepted without configId")
 	}
 }
 
@@ -530,7 +526,7 @@ func (w *writeAfterStopReason) Write(p []byte) (int, error) {
 	return w.w.Write(p)
 }
 
-func TestPromptOutputTextIncludesChunkBufferedAfterResult(t *testing.T) {
+func TestPromptTerminalSeparatesBufferedPostResponseChunk(t *testing.T) {
 	driver := newOrphanTestDriver()
 	providerReader, runtimeWriter := io.Pipe()
 	runtimeReader, providerWriter := io.Pipe()
@@ -567,12 +563,21 @@ func TestPromptOutputTextIncludesChunkBufferedAfterResult(t *testing.T) {
 		if result.Err != nil {
 			t.Fatalf("completion err = %v", result.Err)
 		}
-		if result.Completion.OutputText != "late-chunk" {
-			t.Fatalf("OutputText = %q, want late-chunk", result.Completion.OutputText)
+		if result.Completion.OutputText != "" {
+			t.Fatalf("post-terminal chunk polluted completed output: %q", result.Completion.OutputText)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("turn did not complete")
 	}
+	select {
+	case update := <-driver.SessionUpdates():
+		if sessionUpdateText(update.Update) != "late-chunk" {
+			t.Fatalf("lost late session update: %+v", update)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("post-terminal update not delivered separately")
+	}
+
 }
 
 func connectPromptProvider(t *testing.T, driver *acpSessionDriver) {
@@ -671,13 +676,13 @@ func TestHandleSessionUpdateDoesNotEmitOrphanWhenDropDelivery(t *testing.T) {
 }
 
 func TestEmitOrphanSessionUpdateDropsWhenBufferFull(t *testing.T) {
-	var dropped []RuntimeEventDrop
+	dropped := make(chan RuntimeEventDrop, 1)
 	driver := &acpSessionDriver{
 		sessionID: "session-1",
 		updates:   make(chan SessionNotification, 1),
 		hooks: RuntimeHooks{
 			OnEventDrop: func(drop RuntimeEventDrop) {
-				dropped = append(dropped, drop)
+				dropped <- drop
 			},
 		},
 	}
@@ -689,11 +694,13 @@ func TestEmitOrphanSessionUpdateDropsWhenBufferFull(t *testing.T) {
 		SessionID: "session-1",
 		Update:    SessionUpdate{SessionUpdate: "agent_message_chunk", Text: "drop"},
 	})
-	if len(dropped) != 1 {
-		t.Fatalf("OnEventDrop count = %d, want 1", len(dropped))
-	}
-	if dropped[0].SessionID != "session-1" || dropped[0].EventType != "agent_message_chunk" {
-		t.Fatalf("drop = %#v", dropped[0])
+	select {
+	case drop := <-dropped:
+		if drop.SessionID != "session-1" || drop.EventType != "agent_message_chunk" {
+			t.Fatalf("drop = %#v", drop)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("drop hook not delivered")
 	}
 	if got := <-driver.SessionUpdates(); got.Update.Text != "keep" {
 		t.Fatalf("buffered update = %q, want keep", got.Update.Text)

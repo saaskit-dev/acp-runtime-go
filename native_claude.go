@@ -21,10 +21,10 @@ import (
 // its own spawn flags (model/permission-mode/system prompt/MCP config), so
 // sessions on the same connection are fully isolated — including MCP.
 //
-// The spawn is deferred to the first prompt so InitialConfig (delivered via
-// set_mode/set_config_option AFTER session/new) can join the spawn flags.
-// claude emits system/init lazily (after the first user message), so the ACP
-// session id is synthetic; the real uuid is recorded on the process.
+// New-session spawning is deferred to the first prompt; session configuration
+// is resolved before create/resume, and resume spawns with those resolved flags.
+// Claude emits system/init lazily, so the runtime allocates a resumable UUID and
+// supplies it with --session-id instead of exposing an unrelated synthetic ID.
 type claudeNativeEngine struct {
 	opts   nativeEngineOptions
 	mu     sync.Mutex
@@ -39,8 +39,8 @@ func (e *claudeNativeEngine) SessionConfigOptions() []SessionConfigOption {
 	modelCategory := "model"
 	modeCategory := "mode"
 	return []SessionConfigOption{
-		{Type: "string", ID: "model", Name: "Model", Category: &modelCategory, Value: ""},
-		{Type: "string", ID: "mode", Name: "Permission mode", Category: &modeCategory, Value: ""},
+		{Type: "select", ID: "model", Name: "Model", Category: &modelCategory, Value: "", Options: []SessionConfigChoice{{Value: "", Name: "Provider default"}}},
+		{Type: "select", ID: "mode", Name: "Permission mode", Category: &modeCategory, Value: "default", Options: claudeModeChoices()},
 	}
 }
 
@@ -88,6 +88,9 @@ func newClaudeNativeSessionID() (string, error) {
 }
 
 func (e *claudeNativeEngine) NewSession(ctx context.Context, opts nativeEngineOptions, req NewSessionRequest) (string, error) {
+	if err := validateClaudeNativeMeta(req.Meta); err != nil {
+		return "", err
+	}
 	id, err := newClaudeNativeSessionID()
 	if err != nil {
 		return "", wrapError(ErrorCreate, "native.claude.session_id", "create session identity", err)
@@ -105,8 +108,11 @@ func (e *claudeNativeEngine) NewSession(ctx context.Context, opts nativeEngineOp
 
 // LoadSession re-attaches to a PREVIOUS claude conversation by respawning the
 // CLI with --resume <session id>. Spawns immediately: the requested session
-// id is known and no deferred options are expected.
+// id and resolved startup options are already known.
 func (e *claudeNativeEngine) LoadSession(ctx context.Context, opts nativeEngineOptions, req LoadSessionRequest) (string, error) {
+	if err := validateClaudeNativeMeta(req.Meta); err != nil {
+		return "", err
+	}
 	proc := &claudeProc{
 		eng:          e,
 		acpSessionID: req.SessionID,
@@ -117,10 +123,15 @@ func (e *claudeNativeEngine) LoadSession(ctx context.Context, opts nativeEngineO
 	e.procs[req.SessionID] = proc
 	e.mu.Unlock()
 	if err := proc.ensureSpawned(ctx); err != nil {
-		e.mu.Lock()
-		delete(e.procs, req.SessionID)
-		e.mu.Unlock()
-		return "", err
+		cleanupErr := proc.kill(context.Background())
+		if cleanupErr == nil {
+			e.mu.Lock()
+			if e.procs[req.SessionID] == proc {
+				delete(e.procs, req.SessionID)
+			}
+			e.mu.Unlock()
+		}
+		return "", errors.Join(err, cleanupErr)
 	}
 	return req.SessionID, nil
 }
@@ -138,7 +149,7 @@ func (e *claudeNativeEngine) ForkSession(ctx context.Context, opts nativeEngineO
 		acpSessionID: id,
 		resumeFrom:   req.SessionID,
 		forkSession:  true,
-		pendingReq:   &NewSessionRequest{MCPServers: req.MCPServers},
+		pendingReq:   &NewSessionRequest{Meta: req.Meta, MCPServers: req.MCPServers, AdditionalDirectories: req.AdditionalDirectories},
 	}
 	e.mu.Lock()
 	e.procs[proc.acpSessionID] = proc
@@ -205,15 +216,23 @@ type claudeProc struct {
 	planTools      map[string]bool // tool ids that carried TodoWrite plans
 	mcpFile        string
 	settingsFile   string
+	writeMu        sync.Mutex
+	writeQueue     chan []byte
+	writerDone     chan struct{}
+	approvals      map[string]*claudeApproval
+	approvalSlots  chan struct{}
 	wait           nativeProcessWait
 }
 
 type claudeTurn struct {
-	done     chan struct{}
-	stop     string
-	usage    *Usage
-	err      error
-	finished bool
+	done             chan struct{}
+	stop             string
+	usage            *Usage
+	err              error
+	finished         bool
+	permissionCtx    context.Context
+	cancelPermission context.CancelFunc
+	cancelling       bool
 }
 
 func (p *claudeProc) setSpawnOption(key string, value any) error {
@@ -224,6 +243,9 @@ func (p *claudeProc) setSpawnOption(key string, value any) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.spawned {
+		if (key == "model" && s == p.model) || ((key == "mode" || key == "permissionMode") && s == p.permissionMode) {
+			return nil
+		}
 		return &RuntimeError{Kind: ErrorProtocol, Op: "native.claude.config", Msg: fmt.Sprintf("option %q is a spawn-time setting and the engine has already started", key)}
 	}
 	switch key {
@@ -265,6 +287,9 @@ func (p *claudeProc) buildArgs() ([]string, error) {
 	if model != "" {
 		args = append(args, "--model", model)
 	}
+	p.mu.Lock()
+	p.model = model
+	p.mu.Unlock()
 	permissionMode := p.permissionMode
 	if permissionMode == "" {
 		if v, ok := meta["mode"].(string); ok {
@@ -277,6 +302,9 @@ func (p *claudeProc) buildArgs() ([]string, error) {
 			args = append(args, "--allow-dangerously-skip-permissions")
 		}
 	}
+	p.mu.Lock()
+	p.permissionMode = permissionMode
+	p.mu.Unlock()
 	if p.resumeFrom == "" || p.forkSession {
 		args = append(args, "--session-id", p.acpSessionID)
 	}
@@ -406,8 +434,9 @@ func (p *claudeProc) ensureSpawned(ctx context.Context) error {
 	}
 	p.mu.Lock()
 	if p.spawned {
+		err := p.initErr
 		p.mu.Unlock()
-		return nil
+		return err
 	}
 	opts := p.eng.opts
 	p.mu.Unlock()
@@ -451,8 +480,25 @@ func (p *claudeProc) spawn(ctx context.Context, opts nativeEngineOptions, args [
 	cancelLoop := func() { closeLoopOnce.Do(func() { close(loopDone) }) }
 	p.loopOn = cancelLoop
 	p.exitDone = loopDone
+	p.writeQueue = make(chan []byte, 64)
+	p.writerDone = make(chan struct{})
+	go func() {
+		defer close(p.writerDone)
+		for {
+			select {
+			case <-loopDone:
+				return
+			case data := <-p.writeQueue:
+				if _, err := stdin.Write(append(data, '\n')); err != nil {
+					p.failWrite(err)
+					return
+				}
+			}
+		}
+	}()
 	go func() {
 		defer cancelLoop()
+		defer p.cancelPermissions()
 		scanner := bufio.NewScanner(stdout)
 		scanner.Buffer(make([]byte, 64*1024), maxRPCMessageSize)
 		for scanner.Scan() {
@@ -471,16 +517,22 @@ func (p *claudeProc) prompt(ctx context.Context, blocks []ContentBlock) (nativeT
 		p.mu.Unlock()
 		return nativeTurnResult{}, &RuntimeError{Kind: ErrorProcess, Op: "native.claude.turn", Msg: "a turn is already in flight"}
 	}
-	turn := &claudeTurn{done: make(chan struct{}), stop: "end_turn"}
+	permissionCtx, cancelPermission := context.WithCancel(context.Background())
+	turn := &claudeTurn{done: make(chan struct{}), stop: "end_turn", permissionCtx: permissionCtx, cancelPermission: cancelPermission}
 	p.turn = turn
 	p.mu.Unlock()
+	stopCancel := context.AfterFunc(ctx, p.cancel)
+	defer stopCancel()
 
 	msg, _ := json.Marshal(map[string]any{
 		"type":               "user",
 		"message":            map[string]any{"role": "user", "content": claudeContentFromBlocks(blocks)},
 		"parent_tool_use_id": nil,
 	})
-	p.writeLine(msg)
+	if err := p.writeLine(msg); err != nil {
+		p.failWrite(err)
+		return nativeTurnResult{}, err
+	}
 
 	select {
 	case <-turn.done:
@@ -493,8 +545,10 @@ func (p *claudeProc) prompt(ctx context.Context, blocks []ContentBlock) (nativeT
 	case <-ctx.Done():
 		return nativeTurnResult{}, ctx.Err()
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if turn.err != nil {
-		return nativeTurnResult{}, &RuntimeError{Kind: ErrorProcess, Op: "native.claude.turn", Msg: turn.err.Error()}
+		return nativeTurnResult{}, turn.err
 	}
 	return nativeTurnResult{StopReason: turn.stop, Usage: turn.usage}, nil
 }
@@ -504,16 +558,23 @@ func (p *claudeProc) prompt(ctx context.Context, blocks []ContentBlock) (nativeT
 func (p *claudeProc) cancel() {
 	p.mu.Lock()
 	turn := p.turn
-	p.mu.Unlock()
-	if turn == nil || turn.finished {
+	if turn == nil || turn.finished || turn.cancelling {
+		p.mu.Unlock()
 		return
 	}
+	turn.cancelling = true
+	if turn.cancelPermission != nil {
+		turn.cancelPermission()
+	}
+	p.mu.Unlock()
 	data, _ := json.Marshal(map[string]any{
 		"type":       "control_request",
 		"request_id": time.Now().UnixNano(),
 		"request":    map[string]any{"subtype": "interrupt"},
 	})
-	p.writeLine(data)
+	if err := p.writeLine(data); err != nil {
+		p.failWrite(err)
+	}
 }
 
 // handleLine processes one claude stream-json event.
@@ -532,12 +593,8 @@ func (p *claudeProc) handleLine(line []byte) {
 			ID      string          `json:"id"`
 			Content json.RawMessage `json:"content"`
 		} `json:"message"`
-		RequestID any `json:"request_id"`
-		Request   *struct {
-			Subtype  string          `json:"subtype"`
-			ToolName string          `json:"tool_name"`
-			Input    json.RawMessage `json:"input"`
-		} `json:"request"`
+		RequestID any                      `json:"request_id"`
+		Request   *claudePermissionRequest `json:"request"`
 	}
 	if err := json.Unmarshal(line, &ev); err != nil {
 		return
@@ -600,6 +657,9 @@ func (p *claudeProc) handleLine(line []byte) {
 		turn := p.turn
 		if turn != nil && !turn.finished {
 			turn.finished = true
+			if turn.cancelPermission != nil {
+				turn.cancelPermission()
+			}
 			turn.stop = ev.StopReason
 			if turn.stop == "" {
 				turn.stop = "end_turn"
@@ -617,44 +677,96 @@ func (p *claudeProc) handleLine(line []byte) {
 		p.mu.Unlock()
 	case "control_request":
 		if ev.Request != nil && ev.Request.Subtype == "can_use_tool" {
-			p.handleCanUseTool(ev.RequestID, ev.Request)
+			p.queueCanUseTool(ev.RequestID, ev.Request, append(json.RawMessage(nil), line...))
 		}
 	}
 }
 
-// handleCanUseTool maps claude's native permission prompt onto the ACP
+// claudePermissionRequest maps Claude's native permission prompt onto the ACP
 // session/request_permission round-trip with the host authority.
-func (p *claudeProc) handleCanUseTool(requestID any, req *struct {
-	Subtype  string          `json:"subtype"`
-	ToolName string          `json:"tool_name"`
-	Input    json.RawMessage `json:"input"`
-}) {
-	if p.eng.opts.requestPermission == nil {
-		p.writeControlResponse(requestID, "deny", "no permission authority configured")
+type claudeApproval struct {
+	turn    *claudeTurn
+	revoked bool
+}
+
+type claudePermissionRequest struct {
+	Subtype   string          `json:"subtype"`
+	ToolName  string          `json:"tool_name"`
+	ToolUseID string          `json:"tool_use_id"`
+	Input     json.RawMessage `json:"input"`
+}
+
+func (p *claudeProc) cancelPermissions() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.turn != nil && p.turn.cancelPermission != nil {
+		p.turn.cancelPermission()
+	}
+}
+
+// Keep native decoding live while approval is outstanding. Both retained input
+// and handler concurrency are bounded; duplicate IDs are denied and revoke the
+// original request so its delayed allow cannot be applied.
+func (p *claudeProc) queueCanUseTool(requestID any, req *claudePermissionRequest, raw json.RawMessage) {
+	keyBytes, _ := json.Marshal(requestID)
+	key := string(keyBytes)
+	p.mu.Lock()
+	turn := p.turn
+	if p.approvalSlots == nil {
+		p.approvalSlots = make(chan struct{}, 8)
+	}
+	if p.approvals == nil {
+		p.approvals = map[string]*claudeApproval{}
+	}
+	prior, duplicate := p.approvals[key]
+	token := &claudeApproval{turn: turn}
+	valid := turn != nil && !turn.finished && !turn.cancelling && turn.permissionCtx != nil && !duplicate && len(raw) <= 64*1024 && requestID != nil
+	if duplicate {
+		prior.revoked = true
+	}
+	if valid {
+		select {
+		case p.approvalSlots <- struct{}{}:
+			p.approvals[key] = token
+		default:
+			valid = false
+		}
+	}
+	p.mu.Unlock()
+	if !valid {
+		p.writeControlResponse(requestID, "deny", "inactive, duplicate, or excessive permission request")
 		return
 	}
-	permissionReq := PermissionRequest{
-		SessionID:  p.acpSessionIDLocked(),
-		ToolCallID: fmt.Sprintf("can_use_tool-%v", requestID),
-		Title:      req.ToolName,
-		Kind:       "execute",
-		Options: []PermissionOption{
-			{ID: "allow", Name: "Allow", Kind: "allow_once"},
-			{ID: "deny", Name: "Deny", Kind: "reject_once"},
-		},
-	}
-	decision, err := p.eng.opts.requestPermission(context.Background(), permissionReq)
-	if err != nil {
-		p.writeControlResponse(requestID, "deny", err.Error())
-		return
-	}
-	if decision.Outcome == "selected" && decision.OptionID == "allow" {
-		updated := map[string]any{}
-		_ = json.Unmarshal(req.Input, &updated)
-		p.writeControlResponseWithInput(requestID, "allow", "", updated)
-		return
-	}
-	p.writeControlResponse(requestID, "deny", "denied by host authority")
+	go func() {
+		defer func() { <-p.approvalSlots }()
+		ctx, cancel := context.WithTimeout(turn.permissionCtx, 2*time.Minute)
+		defer cancel()
+		decision := PermissionDecision{}
+		var permissionErr error
+		input, inputErr := parseConfigObject(req.Input, "native.claude.permission.input")
+		if p.eng.opts.requestPermission != nil && claudeKnownTool(req.ToolName) && inputErr == nil {
+			id := req.ToolUseID
+			if id == "" {
+				id = "can_use_tool-" + key
+			}
+			decision, permissionErr = p.eng.opts.requestPermission(ctx, PermissionRequest{
+				SessionID: p.acpSessionIDLocked(), ToolCallID: id, Title: req.ToolName, Name: strPtr(req.ToolName), Kind: claudeToolKind(req.ToolName),
+				RawInput: append(json.RawMessage(nil), req.Input...), Meta: map[string]any{"x-acp-runtime-native-request": raw},
+				Options: []PermissionOption{{ID: "allow", Name: "Allow", Kind: "allow_once"}, {ID: "deny", Name: "Deny", Kind: "reject_once"}},
+			})
+		}
+		p.mu.Lock()
+		valid := p.turn == turn && !turn.finished && !turn.cancelling && p.approvals[key] == token && !token.revoked && ctx.Err() == nil
+		if p.approvals[key] == token {
+			delete(p.approvals, key)
+		}
+		p.mu.Unlock()
+		if valid && permissionErr == nil && decision.Outcome == "selected" && decision.OptionID == "allow" {
+			p.writeControlResponseWithInput(requestID, "allow", "", input)
+		} else {
+			p.writeControlResponse(requestID, "deny", "denied by host authority")
+		}
+	}()
 }
 
 func (p *claudeProc) writeControlResponse(requestID any, behavior, message string) {
@@ -677,7 +789,9 @@ func (p *claudeProc) writeControlResponseWithInput(requestID any, behavior, mess
 	if err != nil {
 		return
 	}
-	p.writeLine(data)
+	if err := p.writeLine(data); err != nil {
+		p.failWrite(err)
+	}
 }
 
 func (p *claudeProc) handleAssistantBlocks(messageID string, raw json.RawMessage) {
@@ -711,8 +825,9 @@ func (p *claudeProc) handleAssistantBlocks(messageID string, raw json.RawMessage
 				SessionUpdate: "tool_call",
 				ToolCallID:    block.ID,
 				Title:         &title,
-				Kind:          strPtr(claudeToolKind(block.Name)),
-				Status:        &pending,
+				Name:          &title, RawInput: append(json.RawMessage(nil), block.Input...),
+				Kind:   strPtr(claudeToolKind(block.Name)),
+				Status: &pending,
 			})
 		}
 	}
@@ -760,6 +875,7 @@ func (p *claudeProc) acpSessionIDLocked() string {
 
 // kill terminates this session's process tree and temp files.
 func (p *claudeProc) kill(ctx context.Context) error {
+	p.cancelPermissions()
 	p.mu.Lock()
 	cmd, stdin, loopOn := p.cmd, p.stdin, p.loopOn
 	mcpFile, settingsFile := p.mcpFile, p.settingsFile
@@ -843,14 +959,14 @@ type claudeBlock struct {
 // claudeToolKind maps claude tool names onto ACP tool kinds (best-effort).
 func claudeToolKind(name string) string {
 	switch name {
-	case "Bash", "Task":
-		return "execute_command"
+	case "Bash":
+		return "execute"
 	case "Read":
-		return "read_file"
+		return "read"
 	case "Write", "Edit", "NotebookEdit":
-		return "write_file"
+		return "edit"
 	case "WebFetch":
-		return "network_request"
+		return "fetch"
 	case "WebSearch", "Grep", "Glob":
 		return "search"
 	default:
@@ -884,7 +1000,9 @@ func claudeUsageFromRaw(raw json.RawMessage) *Usage {
 }
 
 func stringSliceFromAny(v any) []string {
- if list,ok:=v.([]string);ok{return append([]string(nil),list...)}
+	if list, ok := v.([]string); ok {
+		return append([]string(nil), list...)
+	}
 	list, ok := v.([]any)
 	if !ok {
 		return nil
@@ -898,11 +1016,61 @@ func stringSliceFromAny(v any) []string {
 	return out
 }
 
-func (p *claudeProc) writeLine(data []byte) {
+// A single bounded writer keeps permission and cancellation frames from
+// blocking decoding or interleaving JSON. Closing stdin interrupts its Write.
+func (p *claudeProc) writeLine(data []byte) error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.stdin == nil {
-		return
+	stdin, queue, done := p.stdin, p.writeQueue, p.exitDone
+	p.mu.Unlock()
+	if stdin == nil {
+		return io.ErrClosedPipe
 	}
-	_, _ = p.stdin.Write(append(data, '\n'))
+	data = append([]byte(nil), data...)
+	if queue != nil {
+		select {
+		case <-done:
+			return io.ErrClosedPipe
+		default:
+		}
+		select {
+		case queue <- data:
+			return nil
+		default:
+			return wrapError(ErrorProcess, "native.claude.write", "native write queue is full", nil)
+		}
+	}
+	// Unit fixtures that do not spawn a process can provide a direct writer.
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	_, err := stdin.Write(append(data, '\n'))
+	return err
+}
+func (p *claudeProc) failWrite(err error) {
+	p.mu.Lock()
+	p.initErr = wrapError(ErrorProcess, "native.claude.write", "native transport write failed", err)
+	if p.turn != nil && !p.turn.finished {
+		p.turn.err = p.initErr
+		p.turn.finished = true
+		if p.turn.cancelPermission != nil {
+			p.turn.cancelPermission()
+		}
+		close(p.turn.done)
+	}
+	stdin := p.stdin
+	p.mu.Unlock()
+	if stdin != nil {
+		_ = stdin.Close()
+	}
+}
+
+func claudeKnownTool(name string) bool {
+	if claudeToolKind(name) != "other" {
+		return true
+	}
+	switch name {
+	case "Task", "Agent", "Skill", "TodoWrite", "AskUserQuestion":
+		return true
+	default:
+		return false
+	}
 }

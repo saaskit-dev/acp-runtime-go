@@ -572,7 +572,7 @@ func TestSimulatorWriteProducesOperation(t *testing.T) {
 		Command: simulatorBin,
 		Args:    []string{"--auth-mode", "none", "--storage-dir", storage},
 	}
-	runtime := NewRuntime(NewStdioConnectionFactory(StdioFactoryOptions{}), RuntimeOptions{})
+	runtime := NewRuntime(NewStdioConnectionFactory(StdioFactoryOptions{}), RuntimeOptions{AuthorityHandlers: AuthorityHandlers{Permission: allowFixturePermission}})
 	session, err := runtime.StartSession(ctx, StartSessionOptions{Agent: agent, CWD: cwd})
 	if err != nil {
 		t.Fatalf("StartSession() error = %v", err)
@@ -864,7 +864,7 @@ func TestSimulatorInvokesHostTerminal(t *testing.T) {
 	}
 	handler := &recordingTerminalHandlerForRuntime{}
 	runtime := NewRuntime(NewStdioConnectionFactory(StdioFactoryOptions{}), RuntimeOptions{
-		AuthorityHandlers: AuthorityHandlers{Terminal: handler},
+		AuthorityHandlers: AuthorityHandlers{Permission: allowFixturePermission, Terminal: handler},
 	})
 	session, err := runtime.StartSession(ctx, StartSessionOptions{
 		Agent:    agent,
@@ -967,7 +967,7 @@ func TestRuntimeExportsOrphanFollowUpWithStableUpdateID(t *testing.T) {
 			if event.UpdateID != id {
 				t.Fatalf("event[%d] UpdateID = %q, want %q", i, event.UpdateID, id)
 			}
-			text.WriteString(event.Update.Text)
+			text.WriteString(sessionUpdateText(event.Update))
 		}
 		last := result.events[len(result.events)-1]
 		if !last.Terminal {
@@ -1008,4 +1008,14 @@ func TestCommandsBuild(t *testing.T) {
 			t.Fatalf("go build %s failed: %v\n%s", item.pkg, err, string(output))
 		}
 	}
+}
+
+// Explicit opt-in for deterministic local tool fixtures; production stays deny-by-default.
+func allowFixturePermission(_ Context, req PermissionRequest) (PermissionDecision, error) {
+	for _, option := range req.Options {
+		if option.Kind == "allow_once" {
+			return PermissionDecision{Outcome: "selected", OptionID: option.ID}, nil
+		}
+	}
+	return PermissionDecision{Outcome: "cancelled"}, nil
 }

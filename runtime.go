@@ -2,6 +2,7 @@ package acpruntime
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"sync"
 )
@@ -10,8 +11,10 @@ type Runtime struct {
 	options RuntimeOptions
 	service *SessionService
 
-	mu       sync.Mutex
-	sessions map[string]*managedSession
+	mu         sync.Mutex
+	sessions   map[string]*managedSession
+	nextHandle uint64
+	closing    bool
 }
 
 type managedSession struct {
@@ -59,7 +62,7 @@ func (r *Runtime) StartSession(ctx context.Context, options StartSessionOptions)
 	if err != nil {
 		return nil, err
 	}
-	return r.register(driver), nil
+	return r.adopt(driver)
 }
 
 func (r *Runtime) LoadSession(ctx context.Context, options LoadSessionOptions) (*Session, error) {
@@ -72,7 +75,7 @@ func (r *Runtime) LoadSession(ctx context.Context, options LoadSessionOptions) (
 	if err != nil {
 		return nil, err
 	}
-	return r.register(driver), nil
+	return r.adopt(driver)
 }
 
 func (r *Runtime) ResumeSession(ctx context.Context, options ResumeSessionOptions) (*Session, error) {
@@ -85,7 +88,7 @@ func (r *Runtime) ResumeSession(ctx context.Context, options ResumeSessionOption
 	if err != nil {
 		return nil, err
 	}
-	return r.register(driver), nil
+	return r.adopt(driver)
 }
 
 func (r *Runtime) ForkSession(ctx context.Context, options ForkSessionOptions) (*Session, error) {
@@ -98,7 +101,7 @@ func (r *Runtime) ForkSession(ctx context.Context, options ForkSessionOptions) (
 	if err != nil {
 		return nil, err
 	}
-	return r.register(driver), nil
+	return r.adopt(driver)
 }
 
 func (r *Runtime) ListSessions(ctx context.Context, options ListSessionsOptions) (RuntimeSessionList, error) {
@@ -122,23 +125,47 @@ func (r *Runtime) Close(ctx context.Context) error {
 	for _, entry := range r.sessions {
 		sessions = append(sessions, entry.driver)
 	}
-	r.sessions = map[string]*managedSession{}
+	r.closing = true
 	r.mu.Unlock()
 	var firstErr error
 	for _, driver := range sessions {
-		if err := driver.Close(ctx); err != nil && firstErr == nil {
+		if err := driver.Close(ctx); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+		} else {
+			r.unregister(driver)
+		}
+	}
+	if r.service != nil {
+		if err := r.service.Close(ctx); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
 	return firstErr
 }
 
+func (r *Runtime) adopt(driver SessionDriver) (*Session, error) {
+	session := r.register(driver)
+	if session.Status() == "closed" {
+		return nil, sessionClosedError("runtime.start_session")
+	}
+	return session, nil
+}
+
 func (r *Runtime) register(driver SessionDriver) *Session {
-	snapshot := driver.Snapshot()
 	r.mu.Lock()
-	r.sessions[snapshot.Session.ID] = &managedSession{driver: driver, refs: 1}
+	r.nextHandle++
+	key := fmt.Sprintf("handle-%d", r.nextHandle)
+	// Every transport retains separate ownership even if provider IDs repeat.
+	r.sessions[key] = &managedSession{driver: driver, refs: 1}
+	closing := r.closing
 	r.mu.Unlock()
-	return newSession(r, driver)
+	session := newSession(r, driver)
+	if closing {
+		_ = session.Close(context.Background())
+	}
+	return session
 }
 
 func newSession(runtime *Runtime, driver SessionDriver) *Session {
@@ -152,13 +179,23 @@ func newSession(runtime *Runtime, driver SessionDriver) *Session {
 }
 
 func (r *Runtime) unregister(driver SessionDriver) {
-	id := driver.Snapshot().Session.ID
 	r.mu.Lock()
-	delete(r.sessions, id)
-	r.mu.Unlock()
+	defer r.mu.Unlock()
+	for id, entry := range r.sessions {
+		if entry.driver == driver {
+			delete(r.sessions, id)
+		}
+	}
 }
 
 func (r *Runtime) resolveStartOptions(ctx context.Context, options StartSessionOptions) (StartSessionOptions, error) {
+	r.mu.Lock()
+	closing := r.closing
+	r.mu.Unlock()
+	if closing {
+		return options, sessionClosedError("runtime.start_session")
+	}
+	options = cloneStartOptions(options)
 	if options.Agent.Command == "" {
 		agentID := firstNonEmpty(options.AgentID, options.Agent.Type)
 		if agentID == "" {

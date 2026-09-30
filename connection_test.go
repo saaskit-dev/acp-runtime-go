@@ -115,16 +115,16 @@ func (noopTerminalHandler) Release(ctx Context, terminalID string) error {
 // the wire params the agent sent and that the host's return value is encoded
 // back on the wire exactly per the ACP v1 schema.
 type recordingTerminalHandler struct {
-	mu          sync.Mutex
-	createReqs  []CreateTerminalRequest
-	outputIDs   []string
-	waitIDs     []string
-	killIDs     []string
-	releaseIDs  []string
-	terminalID  string
-	output      string
-	exitCode    uint32
-	exitSignal  string
+	mu         sync.Mutex
+	createReqs []CreateTerminalRequest
+	outputIDs  []string
+	waitIDs    []string
+	killIDs    []string
+	releaseIDs []string
+	terminalID string
+	output     string
+	exitCode   uint32
+	exitSignal string
 }
 
 func (h *recordingTerminalHandler) CreateTerminal(ctx Context, request CreateTerminalRequest) (CreateTerminalResult, error) {
@@ -384,7 +384,7 @@ func TestTerminalHandlerNotRegisteredWhenAbsent(t *testing.T) {
 
 // allowAllPermission is a minimal PermissionHandler that always allows.
 func allowAllPermission(_ Context, _ PermissionRequest) (PermissionDecision, error) {
-	return PermissionDecision{Outcome: "allow"}, nil
+	return PermissionDecision{Outcome: "selected", OptionID: "allow"}, nil
 }
 
 // TestPermissionObserverRecordsDecision verifies that the Connection invokes
@@ -418,23 +418,21 @@ func TestPermissionObserverRecordsDecision(t *testing.T) {
 	defer server.Close()
 	defer client.Close()
 
-	var resp permissionResponse
+	var resp PermissionDecision
 	if err := client.Call(ctx, "session/request_permission", map[string]any{
-		"sessionId":  "s1",
-		"toolCallId": "tool-7",
-		"title":      "Run pwd",
-		"kind":       "execute",
-		"options":    []map[string]string{{"id": "allow", "name": "Allow"}},
+		"sessionId": "s1",
+		"toolCall":  map[string]any{"toolCallId": "tool-7", "title": "Run pwd", "kind": "execute"},
+		"options":   []map[string]string{{"optionId": "allow", "name": "Allow", "kind": "allow_once"}},
 	}, &resp); err != nil {
 		t.Fatalf("request_permission error = %v", err)
 	}
-	if resp.Outcome != "allow" {
+	if resp.Outcome != "selected" {
 		t.Fatalf("response outcome = %q, want allow", resp.Outcome)
 	}
 	if observedReq.ToolCallID != "tool-7" || observedReq.Kind != "execute" {
 		t.Fatalf("observed request = %+v", observedReq)
 	}
-	if observedDecision.Outcome != "allow" {
+	if observedDecision.Outcome != "selected" {
 		t.Fatalf("observed decision = %+v", observedDecision)
 	}
 }
@@ -461,17 +459,16 @@ func TestPermissionObserverNotSetStillWorks(t *testing.T) {
 	defer server.Close()
 	defer client.Close()
 
-	var resp permissionResponse
+	var resp PermissionDecision
 	err := client.Call(ctx, "session/request_permission", map[string]any{
-		"sessionId":  "s1",
-		"toolCallId": "tool-1",
-		"title":      "x",
-		"kind":       "read",
+		"sessionId": "s1",
+		"toolCall":  map[string]any{"toolCallId": "tool-1", "title": "x", "kind": "read"},
+		"options":   []map[string]string{{"optionId": "allow", "name": "Allow", "kind": "allow_once"}},
 	}, &resp)
 	if err != nil {
 		t.Fatalf("request_permission error without observer = %v", err)
 	}
-	if resp.Outcome != "allow" {
+	if resp.Outcome != "selected" {
 		t.Fatalf("outcome = %q, want allow", resp.Outcome)
 	}
 }

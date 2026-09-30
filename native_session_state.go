@@ -18,7 +18,7 @@ func nativeCodexModel(agent Agent, meta map[string]any) string {
 
 func nativeModelOption(model string) SessionConfigOption {
 	category := "model"
-	return SessionConfigOption{Type: "string", ID: "model", Name: "Model", Category: &category, Value: model}
+	return SessionConfigOption{Type: "select", ID: "model", Name: "Model", Category: &category, Value: model, Options: []SessionConfigChoice{{Value: model, Name: firstNonEmpty(model, "Provider default")}}}
 }
 
 func (e *codexNativeEngine) SessionState(sessionID string) NewSessionResponse {
@@ -88,7 +88,15 @@ func (e *claudeNativeEngine) SessionState(sessionID string) NewSessionResponse {
 		},
 		ConfigOptions: []SessionConfigOption{
 			nativeModelOption(model),
-			{Type: "string", ID: "mode", Name: "Permission mode", Category: &category, Value: mode},
+			{Type: "select", ID: "mode", Name: "Permission mode", Category: &category, Value: mode, Options: claudeModeChoices()},
 		},
 	}
+}
+
+func claudeModeChoices() []SessionConfigChoice {
+	var choices []SessionConfigChoice
+	for _, mode := range []string{"default", "acceptEdits", "plan", "bypassPermissions", "dontAsk"} {
+		choices = append(choices, SessionConfigChoice{Value: mode, Name: mode})
+	}
+	return choices
 }

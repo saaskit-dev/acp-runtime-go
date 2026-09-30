@@ -25,6 +25,7 @@ func TestFakeCodexAppServer(t *testing.T) {
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	out := bufio.NewWriter(os.Stdout)
 	threadCounter := 0
+	turnCounter := 0
 	threadIDs := map[int]string{}
 	write := func(v any) {
 		data, err := json.Marshal(v)
@@ -83,10 +84,12 @@ func TestFakeCodexAppServer(t *testing.T) {
 			}
 			_ = json.Unmarshal(msg.Params, &tr)
 			tid := tr.ThreadID
+			turnCounter++
+			turnID := fmt.Sprintf("fake-turn-%d", turnCounter)
 			write(map[string]any{"jsonrpc": "2.0", "id": *msg.ID, "result": map[string]any{
-				"turn": map[string]any{"id": "fake-turn-1", "status": "inProgress"}}})
+				"turn": map[string]any{"id": turnID, "items": []any{}, "status": "inProgress"}}})
 			evt := func(method string, extra map[string]any) map[string]any {
-				p := map[string]any{"threadId": tid}
+				p := map[string]any{"threadId": tid, "turnId": turnID}
 				for k, v := range extra {
 					p[k] = v
 				}
@@ -99,7 +102,7 @@ func TestFakeCodexAppServer(t *testing.T) {
 			write(evt("item/completed", map[string]any{"item": map[string]any{"type": "commandExecution", "id": "cmd_1"}}))
 			write(evt("item/completed", map[string]any{"item": map[string]any{"type": "agentMessage", "id": "msg_1", "text": "FAKE_HELLO PID=" + fmt.Sprint(os.Getpid())}}))
 			write(evt("rawResponse/completed", map[string]any{"threadId": tid, "usage": map[string]any{"totalTokens": 100, "inputTokens": 90, "cachedInputTokens": 10, "cacheWriteInputTokens": 0, "outputTokens": 10, "reasoningOutputTokens": 2}}))
-			write(evt("turn/completed", map[string]any{"turn": map[string]any{"status": "completed"}}))
+			write(evt("turn/completed", map[string]any{"turn": map[string]any{"id": turnID, "items": []any{}, "status": "completed"}}))
 			// Fire the event stream exactly like the real app-server: message
 			// deltas, one tool execution, usage, then settle.
 			write(map[string]any{"jsonrpc": "2.0", "method": "item/started", "params": map[string]any{
@@ -118,7 +121,7 @@ func TestFakeCodexAppServer(t *testing.T) {
 				"usage": map[string]any{"totalTokens": 100, "inputTokens": 90, "cachedInputTokens": 10,
 					"cacheWriteInputTokens": 0, "outputTokens": 10, "reasoningOutputTokens": 2}}})
 			write(map[string]any{"jsonrpc": "2.0", "method": "turn/completed", "params": map[string]any{
-				"turn": map[string]any{"status": "completed"}}})
+				"turn": map[string]any{"id": turnID, "items": []any{}, "status": "completed"}}})
 		default:
 			write(map[string]any{"jsonrpc": "2.0", "id": *msg.ID,
 				"error": map[string]any{"code": -32601, "message": "method not found: " + msg.Method}})
@@ -199,8 +202,8 @@ func TestCodexNativeTransportEndToEnd(t *testing.T) {
 			}
 		}
 	}
-	if found.Title != "echo hi" || found.Kind != "execute_command" || found.Status != "completed" {
-		t.Fatalf("tool call = %+v, want title=echo hi kind=execute_command status=completed", found)
+	if found.Title != "echo hi" || found.Kind != "execute" || found.Status != "completed" {
+		t.Fatalf("tool call = %+v, want title=echo hi kind=execute status=completed", found)
 	}
 }
 

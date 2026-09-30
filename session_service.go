@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -21,8 +22,12 @@ func runSessionCleanup(cleanup func(context.Context) error) error {
 }
 
 type SessionService struct {
-	factory ConnectionFactory
-	options RuntimeOptions
+	factory   ConnectionFactory
+	options   RuntimeOptions
+	cleanupMu sync.Mutex
+	cleanupID uint64
+	cleanups  map[uint64]*connectionCleanup
+	closing   bool
 }
 
 func NewSessionService(factory ConnectionFactory, options RuntimeOptions) *SessionService {
@@ -30,6 +35,7 @@ func NewSessionService(factory ConnectionFactory, options RuntimeOptions) *Sessi
 }
 
 func (s *SessionService) Create(ctx context.Context, input StartSessionOptions) (SessionDriver, error) {
+	input = cloneStartOptions(input)
 	profile := ResolveAgentProfile(input.Agent)
 	agent, sessionMeta, err := prepareAgentSessionStart(profile, input)
 	if err != nil {
@@ -43,11 +49,14 @@ func (s *SessionService) Create(ctx context.Context, input StartSessionOptions) 
 	req := NewSessionRequest{CWD: input.CWD, MCPServers: normalizeMCPServers(input.MCPServers), AdditionalDirectories: input.AdditionalDirectories, Meta: sessionMeta}
 	resp, err := bootstrap.Connection.NewSession(ctx, req)
 	if err != nil {
-		_ = runSessionCleanup(bootstrap.Dispose)
-		return nil, wrapError(ErrorCreate, "session.new", "failed to create ACP session", err)
+		return nil, cleanupAfterFailure(wrapError(ErrorCreate, "session.new", "failed to create ACP session", err), bootstrap.Dispose)
 	}
 	bootstrap.SessionResponse = resp
 	driver := newACPSessionDriver(bootstrap)
+	if driver.Status() == "tainted" {
+		cleanupErr := runSessionCleanup(driver.Close)
+		return nil, &RuntimeError{Kind: ErrorProtocol, Op: "session.replay", Msg: "pre-response session history exceeded replay budget", SessionID: resp.SessionID, CleanupStatus: CleanupNotAttempted, CleanupError: cleanupErr}
+	}
 	if _, err := applyInitialConfig(ctx, driver, input.InitialConfig, profile); err != nil {
 		// session/new already created a durable provider session; delete it so a
 		// failed initial config does not leave an orphan behind.
@@ -77,20 +86,42 @@ func (s *SessionService) Create(ctx context.Context, input StartSessionOptions) 
 }
 
 func (s *SessionService) Load(ctx context.Context, input LoadSessionOptions) (SessionDriver, error) {
-	bootstrap, err := s.bootstrap(ctx, input.Agent, input.CWD, input.MCPServers, input.Handlers, ResolveAgentProfile(input.Agent))
+	input.StartSessionOptions = cloneStartOptions(input.StartSessionOptions)
+	if strings.TrimSpace(input.SessionID) == "" {
+		return nil, wrapError(ErrorLoad, "session.load", "session id is required", nil)
+	}
+	profile := ResolveAgentProfile(input.Agent)
+	agent, meta, err := prepareAgentSessionStart(profile, input.StartSessionOptions)
+	if err != nil {
+		return nil, err
+	}
+	bootstrap, err := s.bootstrap(ctx, agent, input.CWD, input.MCPServers, input.Handlers, profile)
 	if err != nil {
 		return nil, wrapError(ErrorLoad, "session.load", "failed to bootstrap ACP session", err)
 	}
-	resp, err := bootstrap.Connection.LoadSession(ctx, LoadSessionRequest{SessionID: input.SessionID, CWD: input.CWD, MCPServers: normalizeMCPServers(input.MCPServers), AdditionalDirectories: input.AdditionalDirectories})
+	resp, err := bootstrap.Connection.LoadSession(ctx, LoadSessionRequest{SessionID: input.SessionID, CWD: input.CWD, MCPServers: normalizeMCPServers(input.MCPServers), AdditionalDirectories: input.AdditionalDirectories, Meta: meta})
 	if err != nil {
-		_ = runSessionCleanup(bootstrap.Dispose)
-		return nil, wrapError(ErrorLoad, "session.load", "failed to load ACP session", err)
+		return nil, cleanupAfterFailure(wrapError(ErrorLoad, "session.load", "failed to load ACP session", err), bootstrap.Dispose)
 	}
 	bootstrap.SessionResponse = resp
-	return newACPSessionDriver(bootstrap), nil
+	bootstrap.QueuePolicy = resolveQueuePolicy(input.Queue)
+	driver := newACPSessionDriver(bootstrap)
+	if driver.Status() == "tainted" {
+		cleanupErr := runSessionCleanup(driver.Close)
+		return nil, &RuntimeError{Kind: ErrorProtocol, Op: "session.replay", Msg: "pre-response session history exceeded replay budget", SessionID: resp.SessionID, CleanupStatus: CleanupNotAttempted, CleanupError: cleanupErr}
+	}
+	if _, err := applyInitialConfig(ctx, driver, input.InitialConfig, profile); err != nil {
+		cleanupErr := runSessionCleanup(driver.Close)
+		return nil, &RuntimeError{Kind: ErrorInitialConfig, Op: "session.initial_config", Msg: "failed to apply initial config", Cause: err, SessionID: input.SessionID, CleanupStatus: CleanupNotAttempted, CleanupError: cleanupErr}
+	}
+	return driver, nil
 }
 
 func (s *SessionService) Resume(ctx context.Context, input ResumeSessionOptions) (SessionDriver, error) {
+	input.StartSessionOptions = cloneStartOptions(input.StartSessionOptions)
+	if strings.TrimSpace(input.SessionID) == "" {
+		return nil, wrapError(ErrorResume, "session.resume", "session id is required", nil)
+	}
 	profile := ResolveAgentProfile(input.Agent)
 	// Resume uses the same logical prompt / AgentConfig / Meta projection path
 	// as Create so hosts can reuse the same StartSessionOptions.
@@ -111,11 +142,14 @@ func (s *SessionService) Resume(ctx context.Context, input ResumeSessionOptions)
 		Meta:                  sessionMeta,
 	})
 	if err != nil {
-		_ = runSessionCleanup(bootstrap.Dispose)
-		return nil, wrapError(ErrorResume, "session.resume", "failed to resume ACP session", err)
+		return nil, cleanupAfterFailure(wrapError(ErrorResume, "session.resume", "failed to resume ACP session", err), bootstrap.Dispose)
 	}
 	bootstrap.SessionResponse = resp
 	driver := newACPSessionDriver(bootstrap)
+	if driver.Status() == "tainted" {
+		cleanupErr := runSessionCleanup(driver.Close)
+		return nil, &RuntimeError{Kind: ErrorProtocol, Op: "session.replay", Msg: "pre-response session history exceeded replay budget", SessionID: resp.SessionID, CleanupStatus: CleanupNotAttempted, CleanupError: cleanupErr}
+	}
 	if _, err := applyInitialConfig(ctx, driver, input.InitialConfig, bootstrap.Profile); err != nil {
 		// The durable provider session already existed before resume; only tear
 		// down this connection. Report SessionID so hosts can retry or inspect
@@ -142,17 +176,38 @@ func (s *SessionService) Resume(ctx context.Context, input ResumeSessionOptions)
 }
 
 func (s *SessionService) Fork(ctx context.Context, input ForkSessionOptions) (SessionDriver, error) {
-	bootstrap, err := s.bootstrap(ctx, input.Agent, input.CWD, input.MCPServers, input.Handlers, ResolveAgentProfile(input.Agent))
+	input.StartSessionOptions = cloneStartOptions(input.StartSessionOptions)
+	if !s.options.EnableExperimentalFeatures {
+		return nil, wrapError(ErrorProtocol, "session.fork", "session/fork is experimental and disabled", nil)
+	}
+	if strings.TrimSpace(input.SessionID) == "" {
+		return nil, wrapError(ErrorFork, "session.fork", "session id is required", nil)
+	}
+	profile := ResolveAgentProfile(input.Agent)
+	agent, meta, err := prepareAgentSessionStart(profile, input.StartSessionOptions)
+	if err != nil {
+		return nil, err
+	}
+	bootstrap, err := s.bootstrap(ctx, agent, input.CWD, input.MCPServers, input.Handlers, profile)
 	if err != nil {
 		return nil, wrapError(ErrorFork, "session.fork", "failed to bootstrap ACP session", err)
 	}
-	resp, err := bootstrap.Connection.ForkSession(ctx, ForkSessionRequest{SessionID: input.SessionID, CWD: input.CWD, MCPServers: normalizeMCPServers(input.MCPServers), AdditionalDirectories: input.AdditionalDirectories})
+	resp, err := bootstrap.Connection.ForkSession(ctx, ForkSessionRequest{SessionID: input.SessionID, CWD: input.CWD, MCPServers: normalizeMCPServers(input.MCPServers), AdditionalDirectories: input.AdditionalDirectories, Meta: meta})
 	if err != nil {
-		_ = runSessionCleanup(bootstrap.Dispose)
-		return nil, wrapError(ErrorFork, "session.fork", "failed to fork ACP session", err)
+		return nil, cleanupAfterFailure(wrapError(ErrorFork, "session.fork", "failed to fork ACP session", err), bootstrap.Dispose)
 	}
 	bootstrap.SessionResponse = resp
-	return newACPSessionDriver(bootstrap), nil
+	bootstrap.QueuePolicy = resolveQueuePolicy(input.Queue)
+	driver := newACPSessionDriver(bootstrap)
+	if driver.Status() == "tainted" {
+		cleanupErr := runSessionCleanup(driver.Close)
+		return nil, &RuntimeError{Kind: ErrorProtocol, Op: "session.replay", Msg: "pre-response session history exceeded replay budget", SessionID: resp.SessionID, CleanupStatus: CleanupNotAttempted, CleanupError: cleanupErr}
+	}
+	if _, err := applyInitialConfig(ctx, driver, input.InitialConfig, profile); err != nil {
+		cleanupErr := runSessionCleanup(driver.Close)
+		return nil, &RuntimeError{Kind: ErrorInitialConfig, Op: "session.initial_config", Msg: "failed to apply initial config", Cause: err, SessionID: resp.SessionID, CleanupStatus: CleanupNotAttempted, CleanupError: cleanupErr}
+	}
+	return driver, nil
 }
 
 func (s *SessionService) ListAgentSessions(ctx context.Context, input ListSessionsOptions) (RuntimeSessionList, error) {
@@ -192,14 +247,14 @@ func (s *SessionService) ListAgentSessions(ctx context.Context, input ListSessio
 func (s *SessionService) bootstrap(ctx context.Context, agent Agent, cwd string, mcp []MCPServer, handlers AuthorityHandlers, profile AgentProfile) (sessionBootstrap, error) {
 	agent = applyRuntimeEnvironment(agent, s.options)
 	client := defaultClient(s.options, handlers)
-	handle, err := s.factory(ctx, ConnectionFactoryInput{Agent: agent, Client: client, CWD: cwd, Observability: s.options.Observability, Authority: client.Authority})
+	client.runtimeManaged = true
+	handle, err := s.openConnection(ctx, ConnectionFactoryInput{Agent: agent, Client: client, CWD: cwd, Observability: s.options.Observability, Authority: client.Authority})
 	if err != nil {
 		return sessionBootstrap{}, err
 	}
 	resp, err := handle.Connection.Initialize(ctx, InitializeRequest{ProtocolVersion: ProtocolVersion, ClientInfo: &client.Info, ClientCapabilities: client.Capabilities})
 	if err != nil {
-		_ = runSessionCleanup(handle.Dispose)
-		return sessionBootstrap{}, err
+		return sessionBootstrap{}, cleanupAfterFailure(err, handle.Dispose)
 	}
 	// The agent answers with the protocol version it will actually speak. A
 	// NEWER version than this runtime understands means the wire format may
@@ -207,45 +262,31 @@ func (s *SessionService) bootstrap(ctx context.Context, agent Agent, cwd string,
 	// absent (0) versions are tolerated for compatibility with agents that
 	// predate or omit strict negotiation.
 	if resp.ProtocolVersion > ProtocolVersion {
-		_ = runSessionCleanup(handle.Dispose)
-		return sessionBootstrap{}, wrapError(ErrorProtocol, "initialize",
-			fmt.Sprintf("agent speaks ACP protocol version %d; this runtime supports up to %d", resp.ProtocolVersion, ProtocolVersion), nil)
+		return sessionBootstrap{}, cleanupAfterFailure(wrapError(ErrorProtocol, "initialize",
+			fmt.Sprintf("agent speaks ACP protocol version %d; this runtime supports up to %d", resp.ProtocolVersion, ProtocolVersion), nil), handle.Dispose)
 	}
-	methods := profile.NormalizeInitializeAuthMethods(agent, resp.AuthMethods)
-	runtimeMethods := profile.NormalizeRuntimeAuthMethods(agent, runtimeAuthMethodsFromACP(methods))
-	if len(runtimeMethods) > 0 {
-		method, ok := selectRuntimeAuthenticationMethod(runtimeMethods)
-		if ok && (method.Type == "agent" || method.Type == "") && s.options.AuthenticationHandler == nil {
-			_, err := handle.Connection.Authenticate(ctx, AuthenticateRequest{MethodID: method.ID})
-			if err != nil && !isAuthenticationNotImplemented(err) {
-				_ = runSessionCleanup(handle.Dispose)
-				return sessionBootstrap{}, wrapError(ErrorAuthentication, "authenticate", "agent authentication failed", err)
-			}
-		} else if s.options.AuthenticationHandler != nil {
-			decision, err := s.options.AuthenticationHandler(ctx, runtimeMethods)
-			if err != nil {
-				_ = runSessionCleanup(handle.Dispose)
-				return sessionBootstrap{}, err
-			}
-			if decision.MethodID != "" {
-				_, err = handle.Connection.Authenticate(ctx, AuthenticateRequest{MethodID: decision.MethodID})
-				if err != nil && !isAuthenticationNotImplemented(err) {
-					_ = runSessionCleanup(handle.Dispose)
-					return sessionBootstrap{}, wrapError(ErrorAuthentication, "authenticate", "agent authentication failed", err)
-				}
-			}
-		}
+	handle, resp, err = authenticateBootstrap(ctx, s.options, s.openConnection, ConnectionFactoryInput{Agent: agent, Client: client, CWD: cwd, Observability: s.options.Observability, Authority: client.Authority}, handle, resp, profile)
+	if err != nil {
+		return sessionBootstrap{}, cleanupAfterFailure(err, handle.Dispose)
 	}
+	if !s.options.EnableExperimentalFeatures {
+		resp.AgentCapabilities.SessionCapabilities.Fork = nil
+	}
+
+	replay := &sessionReplayBuffer{}
+	handle.Connection.SetSessionUpdateHandler(func(_ context.Context, notification SessionNotification) { replay.receive(notification) })
 	return sessionBootstrap{
-		Agent:              agent,
-		CWD:                cwd,
-		MCPServers:         mcp,
-		Connection:         handle.Connection,
-		Dispose:            handle.Dispose,
-		InitializeResponse: resp,
-		Profile:            profile,
-		Hooks:              s.options.Hooks,
-		ReadModelLimits:    s.options.ReadModelLimits,
+		Replay:                 replay,
+		FreshConnectionPerTurn: s.options.RequireFreshConnectionPerTurn,
+		Agent:                  agent,
+		CWD:                    cwd,
+		MCPServers:             mcp,
+		Connection:             handle.Connection,
+		Dispose:                handle.Dispose,
+		InitializeResponse:     resp,
+		Profile:                profile,
+		Hooks:                  s.options.Hooks,
+		ReadModelLimits:        s.options.ReadModelLimits,
 	}, nil
 }
 
@@ -410,7 +451,7 @@ func systemPromptError(message string) error {
 func mergeSessionMeta(base, extra map[string]any) map[string]any {
 	out := make(map[string]any, len(base)+len(extra))
 	for k, v := range base {
-		out[k] = v
+		out[k] = cloneOwned(v)
 	}
 	for k, v := range extra {
 		if existing, ok := out[k]; ok {
@@ -421,7 +462,7 @@ func mergeSessionMeta(base, extra map[string]any) map[string]any {
 				}
 			}
 		}
-		out[k] = v
+		out[k] = cloneOwned(v)
 	}
 	return out
 }
@@ -439,10 +480,17 @@ func resolveQueuePolicy(input QueuePolicyInput) QueuePolicy {
 	return QueuePolicy{Delivery: delivery}
 }
 
-func applyInitialConfig(ctx context.Context, driver *acpSessionDriver, config InitialConfig, profile AgentProfile) (InitialConfigReport, error) {
-	var report InitialConfigReport
+func applyInitialConfig(ctx context.Context, driver *acpSessionDriver, config InitialConfig, profile AgentProfile) (report InitialConfigReport, resultErr error) {
+	defer func() {
+		driver.mu.Lock()
+		driver.metadata.ConfigApplication = configurationReport(config, report, resultErr, driver.metadata, driver.configOptionsCurrent)
+		driver.mu.Unlock()
+	}()
 	if config.Mode != nil {
 		mode, ok := config.Mode.(string)
+		if !ok || strings.TrimSpace(mode) == "" {
+			return report, configError("InitialConfig", "mode", "expected a nonempty string")
+		}
 		if ok {
 			appliedMode, err := applyInitialConfigMode(ctx, driver, mode, profile)
 			if err != nil {
@@ -471,7 +519,30 @@ func applyInitialConfig(ctx context.Context, driver *acpSessionDriver, config In
 				return report, err
 			}
 		}
+		if err := initialConfigReadbackError(driver, id, value); err != nil {
+			return report, err
+		}
 		report.Applied = append(report.Applied, InitialConfigReportItem{Key: id, ID: id, Value: value})
+	}
+	// Later setters may reset earlier options. Validate the final authoritative
+	// snapshot, with an explicit Raw override taking precedence for the same ID.
+	final := map[string]InitialConfigReportItem{}
+	for _, item := range report.Applied {
+		final[item.ID] = item
+	}
+	for id, item := range final {
+		if item.Key == "mode" {
+			driver.mu.RLock()
+			equal := driver.metadata.CurrentModeID == item.Value
+			driver.mu.RUnlock()
+			if !equal {
+				return report, configError("InitialConfig", "mode", "final provider state changed the selected mode")
+			}
+			continue
+		}
+		if err := initialConfigReadbackError(driver, id, item.Value); err != nil {
+			return report, err
+		}
 	}
 	return report, nil
 }
@@ -481,7 +552,7 @@ func applyInitialConfigOption(ctx context.Context, driver *acpSessionDriver, pro
 	optionID := selectInitialConfigOption(driver.metadata.AgentConfigOptions, profile, key)
 	driver.mu.RUnlock()
 	if optionID == "" {
-		return InitialConfigReportItem{Key: key, Value: value, Reason: "option_not_found"}, nil
+		return InitialConfigReportItem{Key: key, Value: value, Reason: "option_not_found"}, configError("InitialConfig", key, "provider did not advertise this option")
 	}
 	var lastErr error
 	for _, alias := range initialConfigAliases(profile, key, value) {
@@ -490,6 +561,9 @@ func applyInitialConfigOption(ctx context.Context, driver *acpSessionDriver, pro
 				lastErr = err
 				continue
 			}
+		}
+		if err := initialConfigReadbackError(driver, optionID, alias); err != nil {
+			return InitialConfigReportItem{}, err
 		}
 		return InitialConfigReportItem{Key: key, ID: optionID, Value: alias}, nil
 	}
@@ -571,4 +645,21 @@ func initialConfigAliases(profile AgentProfile, key string, value any) []any {
 		return []any{value}
 	}
 	return aliases
+}
+
+func initialConfigReadbackError(driver *acpSessionDriver, id string, value any) error {
+	driver.mu.RLock()
+	defer driver.mu.RUnlock()
+	if !driver.configOptionsCurrent {
+		return nil
+	} // legacy acknowledgement, no authoritative readback
+	for _, option := range driver.metadata.AgentConfigOptions {
+		if option.ID == id {
+			if reflect.DeepEqual(option.Value, value) {
+				return nil
+			}
+			return configError("InitialConfig", id, "provider readback differs from requested value")
+		}
+	}
+	return configError("InitialConfig", id, "provider removed requested option from authoritative readback")
 }

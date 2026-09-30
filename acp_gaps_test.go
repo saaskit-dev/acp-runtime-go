@@ -53,11 +53,11 @@ func TestPermissionRequestWithoutAuthoritySelectsRejectOption(t *testing.T) {
 	peer := NewPeer(bytes.NewReader(nil), w, PeerOptions{})
 	_ = NewConnection(peer, Client{}) // Authority.Permission == nil
 
-	msg := handlePermissionRequest(t, nil, peer, `{"sessionId":"s1","toolCallId":"tc1","title":"rm -rf","kind":"execute","options":[{"id":"allow","name":"Allow","kind":"allow_once"},{"id":"deny","name":"Deny","kind":"reject_once"}]}`)
+	msg := handlePermissionRequest(t, nil, peer, `{"sessionId":"s1","toolCall":{"toolCallId":"tc1","title":"rm -rf","kind":"execute"},"options":[{"optionId":"allow","name":"Allow","kind":"allow_once"},{"optionId":"deny","name":"Deny","kind":"reject_once"}]}`)
 	if msg.Error != nil {
 		t.Fatalf("got JSON-RPC error %v, want deny decision", msg.Error)
 	}
-	var resp permissionResponse
+	var resp PermissionDecision
 	if err := json.Unmarshal(msg.Result, &resp); err != nil {
 		t.Fatalf("unmarshal result: %v", err)
 	}
@@ -71,11 +71,11 @@ func TestPermissionRequestWithoutAuthorityCancelsWithoutRejectOption(t *testing.
 	peer := NewPeer(bytes.NewReader(nil), w, PeerOptions{})
 	_ = NewConnection(peer, Client{})
 
-	msg := handlePermissionRequest(t, nil, peer, `{"sessionId":"s1","toolCallId":"tc1","title":"fetch","kind":"fetch","options":[{"id":"allow","name":"Allow","kind":"allow_once"}]}`)
+	msg := handlePermissionRequest(t, nil, peer, `{"sessionId":"s1","toolCall":{"toolCallId":"tc1","title":"fetch","kind":"fetch"},"options":[{"optionId":"allow","name":"Allow","kind":"allow_once"}]}`)
 	if msg.Error != nil {
 		t.Fatalf("got JSON-RPC error %v, want cancel outcome", msg.Error)
 	}
-	var resp permissionResponse
+	var resp PermissionDecision
 	if err := json.Unmarshal(msg.Result, &resp); err != nil {
 		t.Fatalf("unmarshal result: %v", err)
 	}
@@ -97,11 +97,11 @@ func TestPermissionRequestWithAuthorityStillConsulted(t *testing.T) {
 	}})
 	_ = conn
 
-	msg := handlePermissionRequest(t, conn, peer, `{"sessionId":"s1","toolCallId":"tc1","kind":"execute","options":[{"id":"allow","kind":"allow_once"},{"id":"deny","kind":"reject_once"}]}`)
+	msg := handlePermissionRequest(t, conn, peer, `{"sessionId":"s1","toolCall":{"toolCallId":"tc1","kind":"execute"},"options":[{"optionId":"allow","name":"Allow","kind":"allow_once"},{"optionId":"deny","name":"Deny","kind":"reject_once"}]}`)
 	if msg.Error != nil {
 		t.Fatalf("got JSON-RPC error %v", msg.Error)
 	}
-	var resp permissionResponse
+	var resp PermissionDecision
 	if err := json.Unmarshal(msg.Result, &resp); err != nil {
 		t.Fatalf("unmarshal result: %v", err)
 	}

@@ -41,6 +41,7 @@ type Agent struct {
 	mu                 sync.Mutex
 	sessions           map[string]*Session
 	clientCapabilities acp.ClientCapabilities
+	turns              map[string]context.CancelFunc
 }
 
 type Session struct {
@@ -72,7 +73,7 @@ func New(options Options) *Agent {
 	if options.StorageDir == "" {
 		options.StorageDir = filepath.Join(os.TempDir(), "acp-simulator-agent")
 	}
-	return &Agent{options: options, sessions: map[string]*Session{}}
+	return &Agent{options: options, sessions: map[string]*Session{}, turns: map[string]context.CancelFunc{}}
 }
 
 func RunStdio(ctx context.Context, stdin io.Reader, stdout io.Writer, options Options) error {
@@ -97,7 +98,20 @@ func (a *Agent) register(peer *acp.Peer) {
 	peer.RegisterRequest("session/close", a.handleCloseSession)
 	peer.RegisterRequest("session/delete", a.handleDeleteSession)
 	peer.RegisterRequest("logout", a.handleLogout)
-	peer.RegisterNotification("session/cancel", func(context.Context, json.RawMessage) {})
+	peer.RegisterNotification("session/cancel", func(_ context.Context, raw json.RawMessage) {
+		var req struct {
+			SessionID string `json:"sessionId"`
+		}
+		if json.Unmarshal(raw, &req) != nil {
+			return
+		}
+		a.mu.Lock()
+		cancel := a.turns[req.SessionID]
+		a.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+	})
 }
 
 func (a *Agent) handleInitialize(ctx context.Context, raw json.RawMessage) (any, error) {
@@ -116,11 +130,12 @@ func (a *Agent) handleInitialize(ctx context.Context, raw json.RawMessage) (any,
 		AgentInfo:       &acp.Implementation{Name: a.options.Name, Version: a.options.Version},
 		AgentCapabilities: acp.AgentCapabilities{
 			LoadSession:        true,
+			Auth:               map[string]any{"logout": map[string]any{}},
 			PromptCapabilities: acp.PromptCapabilities{EmbeddedContext: true, Image: false, Audio: false},
 			MCPCapabilities:    acp.MCPCapabilities{HTTP: true, SSE: true},
 			SessionCapabilities: acp.SessionCapabilities{
 				Close:                 map[string]any{},
-				Fork:                  map[string]any{},
+				Delete:                map[string]any{},
 				List:                  map[string]any{},
 				Resume:                map[string]any{},
 				AdditionalDirectories: map[string]any{},
@@ -157,6 +172,9 @@ func (a *Agent) handleNewSession(ctx context.Context, raw json.RawMessage) (any,
 	}
 	session := a.createSession(req.CWD, req.AdditionalDirectories, req.MCPServers)
 	a.save(session)
+	if err := a.notify(ctx, session.ID, acp.SessionUpdate{SessionUpdate: "available_commands_update", AvailableCommands: defaultCommands()}); err != nil {
+		return nil, err
+	}
 	return a.sessionResponse(session), nil
 }
 
@@ -169,7 +187,7 @@ func (a *Agent) handleLoadSession(ctx context.Context, raw json.RawMessage) (any
 	if err != nil {
 		return nil, err
 	}
-	return a.sessionResponse(session), nil
+	return map[string]any{"modes": session.Modes, "configOptions": session.ConfigOptions}, nil
 }
 
 func (a *Agent) handleResumeSession(ctx context.Context, raw json.RawMessage) (any, error) {
@@ -181,7 +199,7 @@ func (a *Agent) handleResumeSession(ctx context.Context, raw json.RawMessage) (a
 	if err != nil {
 		return nil, err
 	}
-	return a.sessionResponse(session), nil
+	return map[string]any{"modes": session.Modes, "configOptions": session.ConfigOptions}, nil
 }
 
 func (a *Agent) handleForkSession(ctx context.Context, raw json.RawMessage) (any, error) {
@@ -228,15 +246,32 @@ func (a *Agent) handlePrompt(ctx context.Context, raw json.RawMessage) (any, err
 	if err != nil {
 		return nil, err
 	}
+	turnCtx, cancel := context.WithCancel(ctx)
+	a.mu.Lock()
+	if _, busy := a.turns[session.ID]; busy {
+		a.mu.Unlock()
+		cancel()
+		return nil, invalidParams("session busy")
+	}
+	a.turns[session.ID] = cancel
+	a.mu.Unlock()
+	defer func() { cancel(); a.mu.Lock(); delete(a.turns, session.ID); a.mu.Unlock() }()
 	text := promptText(req.Prompt)
 	action := parseAction(text)
-	if err := a.executeAction(ctx, session, action); err != nil {
+	if err := a.executeAction(turnCtx, session, action); err != nil {
+		if turnCtx.Err() != nil {
+			return acp.PromptResponse{StopReason: "cancelled"}, nil
+		}
 		return nil, err
+	}
+	if turnCtx.Err() != nil {
+		return acp.PromptResponse{StopReason: "cancelled"}, nil
 	}
 	session.UpdatedAt = now()
 	a.save(session)
 	usage := &acp.Usage{TotalTokens: uint64(len(text) + 2), InputTokens: uint64(len(text)), OutputTokens: 2}
-	_ = a.notify(ctx, session.ID, acp.SessionUpdate{SessionUpdate: "usage_update", Usage: usage})
+	used, size := uint64(len(text)), uint64(8192)
+	_ = a.notify(ctx, session.ID, acp.SessionUpdate{SessionUpdate: "usage_update", Used: &used, Size: &size})
 	return acp.PromptResponse{StopReason: "end_turn", Usage: usage, UserMessageID: req.MessageID}, nil
 }
 
@@ -295,7 +330,6 @@ func (a *Agent) handleCloseSession(ctx context.Context, raw json.RawMessage) (an
 	a.mu.Lock()
 	delete(a.sessions, req.SessionID)
 	a.mu.Unlock()
-	_ = os.Remove(filepath.Join(a.options.StorageDir, req.SessionID+".json"))
 	return acp.CloseSessionResponse{}, nil
 }
 
@@ -373,6 +407,13 @@ func (a *Agent) findSession(id string) (*Session, error) {
 }
 
 func (a *Agent) notify(ctx context.Context, sessionID string, update acp.SessionUpdate) error {
+	if update.SessionUpdate == "agent_message_chunk" || update.SessionUpdate == "agent_thought_chunk" || update.SessionUpdate == "user_message_chunk" {
+		wire := map[string]any{"sessionUpdate": update.SessionUpdate, "content": map[string]any{"type": "text", "text": update.Text}}
+		if update.MessageID != "" {
+			wire["messageId"] = update.MessageID
+		}
+		return a.peer.Notify(ctx, "session/update", map[string]any{"sessionId": sessionID, "update": wire})
+	}
 	return a.peer.Notify(ctx, "session/update", acp.SessionNotification{SessionID: sessionID, Update: update})
 }
 
@@ -380,89 +421,39 @@ func (a *Agent) notify(ctx context.Context, sessionID string, update acp.Session
 // terminal/create -> terminal/wait_for_exit -> terminal/release. It returns
 // the command's combined output and true on success, or "" / false if any RPC
 // failed (caller falls back to a synthetic result).
-func (a *Agent) runViaTerminal(ctx context.Context, sessionID, command string, args []string) (string, bool) {
-	var createResp struct {
+func (a *Agent) runViaTerminal(ctx context.Context, sessionID, cwd, command string, args []string) (string, error) {
+	var created struct {
 		TerminalID string `json:"terminalId"`
 	}
-	if err := a.peer.Call(ctx, "terminal/create", map[string]any{
-		"sessionId": sessionID,
-		"command":   command,
-		"args":      args,
-		"cwd":       nil,
-	}, &createResp); err != nil {
-		return "", false
+	if err := a.peer.Call(ctx, "terminal/create", map[string]any{"sessionId": sessionID, "command": command, "args": args, "cwd": cwd}, &created); err != nil {
+		return "", err
 	}
-	if createResp.TerminalID == "" {
-		return "", false
+	if created.TerminalID == "" {
+		return "", fmt.Errorf("terminal/create returned no ID")
 	}
+	params := map[string]any{"sessionId": sessionID, "terminalId": created.TerminalID}
 	defer func() {
-		_ = a.peer.Call(ctx, "terminal/release", map[string]any{
-			"sessionId":  sessionID,
-			"terminalId": createResp.TerminalID,
-		}, nil)
+		cleanup, stop := context.WithTimeout(context.Background(), time.Second)
+		defer stop()
+		_ = a.peer.Call(cleanup, "terminal/release", params, nil)
 	}()
-
-	var outputResp struct {
-		Output     string `json:"output"`
-		Truncated  bool   `json:"truncated"`
-		ExitStatus *struct {
-			ExitCode *uint32 `json:"exitCode"`
-			Signal   *string `json:"signal"`
-		} `json:"exitStatus"`
+	var exit struct {
+		ExitCode *uint32 `json:"exitCode"`
+		Signal   *string `json:"signal"`
 	}
-	// Poll terminal/output a bounded number of times until exit, then a final
-	// wait_for_exit to guarantee completion. For the simulator's short-lived
-	// commands a single output poll + wait is sufficient; the loop handles
-	// slower hosts.
-	var combined strings.Builder
-	for i := 0; i < 10; i++ {
-		outputResp = struct {
-			Output     string `json:"output"`
-			Truncated  bool   `json:"truncated"`
-			ExitStatus *struct {
-				ExitCode *uint32 `json:"exitCode"`
-				Signal   *string `json:"signal"`
-			} `json:"exitStatus"`
-		}{}
-		if err := a.peer.Call(ctx, "terminal/output", map[string]any{
-			"sessionId":  sessionID,
-			"terminalId": createResp.TerminalID,
-		}, &outputResp); err != nil {
-			return "", false
-		}
-		combined.WriteString(outputResp.Output)
-		if outputResp.ExitStatus != nil {
-			return strings.TrimSpace(combined.String()), true
-		}
-		select {
-		case <-ctx.Done():
-			return strings.TrimSpace(combined.String()), true
-		case <-time.After(50 * time.Millisecond):
-		}
+	if err := a.peer.Call(ctx, "terminal/wait_for_exit", params, &exit); err != nil {
+		return "", err
 	}
-	// Final blocking wait for exit.
-	if err := a.peer.Call(ctx, "terminal/wait_for_exit", map[string]any{
-		"sessionId":  sessionID,
-		"terminalId": createResp.TerminalID,
-	}, nil); err != nil {
-		return strings.TrimSpace(combined.String()), true
+	if exit.ExitCode == nil || *exit.ExitCode != 0 {
+		return "", fmt.Errorf("terminal exited unsuccessfully")
 	}
-	// One more output fetch for the tail.
-	outputResp = struct {
-		Output     string `json:"output"`
-		Truncated  bool   `json:"truncated"`
-		ExitStatus *struct {
-			ExitCode *uint32 `json:"exitCode"`
-			Signal   *string `json:"signal"`
-		} `json:"exitStatus"`
-	}{}
-	if err := a.peer.Call(ctx, "terminal/output", map[string]any{
-		"sessionId":  sessionID,
-		"terminalId": createResp.TerminalID,
-	}, &outputResp); err == nil {
-		combined.WriteString(outputResp.Output)
+	var output struct {
+		Output string `json:"output"`
 	}
-	return strings.TrimSpace(combined.String()), true
+	if err := a.peer.Call(ctx, "terminal/output", params, &output); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(output.Output), nil
 }
 
 type action struct {
@@ -494,6 +485,15 @@ func parseAction(text string) action {
 		if len(fields) > 0 {
 			return action{kind: "run", command: fields[0], args: fields[1:]}
 		}
+	case strings.HasPrefix(lower, "/plan "):
+		return action{kind: "plan", content: strings.TrimSpace(trimmed[len("/plan "):])}
+	case strings.HasPrefix(lower, "/read "):
+		return action{kind: "read", path: strings.TrimSpace(trimmed[len("/read "):])}
+	case strings.HasPrefix(lower, "/write "):
+		parts := strings.SplitN(strings.TrimSpace(trimmed[len("/write "):]), " ", 2)
+		if len(parts) == 2 {
+			return action{kind: "write", path: parts[0], content: parts[1]}
+		}
 	case strings.HasPrefix(lower, "plan:"):
 		return action{kind: "plan", content: strings.TrimSpace(trimmed[len("plan:"):])}
 	case strings.Contains(lower, "emit a plan"):
@@ -516,7 +516,7 @@ func parseAction(text string) action {
 		}
 	case strings.Contains(lower, "create ./.tmp/tmp-output.txt"):
 		return action{kind: "write", path: ".tmp/tmp-output.txt", content: "READY"}
-	case strings.HasPrefix(lower, "run "):
+	case strings.HasPrefix(lower, "run ") && !strings.Contains(lower, "run `"):
 		fields := strings.Fields(trimmed[len("run "):])
 		if len(fields) > 0 {
 			return action{kind: "run", command: fields[0], args: fields[1:]}
@@ -536,8 +536,8 @@ func parseAction(text string) action {
 	return action{kind: "describe", content: trimmed}
 }
 
-func (a *Agent) executeAction(ctx context.Context, session *Session, action action) error {
-	switch action.kind {
+func (a *Agent) executeAction(ctx context.Context, session *Session, act action) error {
+	switch act.kind {
 	case "followup":
 		if err := a.streamText(ctx, session.ID, "STARTED"); err != nil {
 			return err
@@ -546,90 +546,115 @@ func (a *Agent) executeAction(ctx context.Context, session *Session, action acti
 		go a.emitBackgroundFollowUp(sessionID)
 		return nil
 	case "plan":
-		entries := []acp.PlanEntry{{Content: action.content, Status: "in_progress", Priority: "medium"}}
+		entries := []acp.PlanEntry{{Content: act.content, Status: "in_progress", Priority: "medium"}}
 		_ = a.notify(ctx, session.ID, acp.SessionUpdate{SessionUpdate: "plan", Entries: entries})
 		return a.streamText(ctx, session.ID, "Plan updated.")
-	case "read":
-		path := resolvePath(session.CWD, action.path)
-		data, err := os.ReadFile(path)
+	case "read", "write", "run":
+		toolID := newID()
+		kind := "read"
+		title := "Read " + act.path
+		if act.kind == "write" {
+			kind = "edit"
+			title = "Write " + act.path
+		}
+		if act.kind == "run" {
+			kind = "execute"
+			title = "Run " + act.command
+		}
+		path := resolvePath(session.CWD, act.path)
+		raw, _ := json.Marshal(map[string]any{"path": path, "command": act.command, "args": act.args})
+		status := "pending"
+		if err := a.notify(ctx, session.ID, acp.SessionUpdate{SessionUpdate: "tool_call", ToolCallID: toolID, Title: &title, Kind: &kind, Status: &status, RawInput: raw}); err != nil {
+			return err
+		}
+		if act.kind != "read" {
+			allowed, err := a.permission(ctx, session, toolID, title, kind, raw)
+			if err != nil {
+				return err
+			}
+			if !allowed {
+				status = "failed"
+				_ = a.toolUpdate(ctx, session, acp.SessionUpdate{SessionUpdate: "tool_call_update", ToolCallID: toolID, Title: &title, Kind: &kind, Status: &status})
+				return a.streamText(ctx, session.ID, "Permission denied.")
+			}
+		}
+		status = "in_progress"
+		if err := a.toolUpdate(ctx, session, acp.SessionUpdate{SessionUpdate: "tool_call_update", ToolCallID: toolID, Title: &title, Kind: &kind, Status: &status}); err != nil {
+			return err
+		}
+		a.mu.Lock()
+		caps := a.clientCapabilities
+		a.mu.Unlock()
+		var output string
+		var err error
+		switch act.kind {
+		case "read":
+			if caps.FS.ReadTextFile {
+				var response struct {
+					Content string `json:"content"`
+				}
+				err = a.peer.Call(ctx, "fs/read_text_file", map[string]any{"sessionId": session.ID, "path": path}, &response)
+				output = response.Content
+			} else {
+				var data []byte
+				data, err = os.ReadFile(path)
+				output = string(data)
+			}
+		case "write":
+			if caps.FS.WriteTextFile {
+				err = a.peer.Call(ctx, "fs/write_text_file", map[string]any{"sessionId": session.ID, "path": path, "content": act.content}, nil)
+			} else {
+				err = os.MkdirAll(filepath.Dir(path), 0700)
+				if err == nil {
+					err = os.WriteFile(path, []byte(act.content), 0600)
+				}
+			}
+			output = "Wrote " + act.path
+		case "run":
+			if !caps.Terminal {
+				err = fmt.Errorf("host does not support terminal execution")
+			} else {
+				output, err = a.runViaTerminal(ctx, session.ID, session.CWD, act.command, act.args)
+			}
+		}
+		status = "completed"
+		if err != nil {
+			status = "failed"
+			output = err.Error()
+		}
+		rawOutput, _ := json.Marshal(output)
+		if notifyErr := a.toolUpdate(ctx, session, acp.SessionUpdate{SessionUpdate: "tool_call_update", ToolCallID: toolID, Title: &title, Kind: &kind, Status: &status, RawInput: raw, RawOutput: rawOutput}); notifyErr != nil {
+			return notifyErr
+		}
 		if err != nil {
 			return err
 		}
-		title := "Read " + action.path
-		kind := "read"
-		status := "completed"
-		toolID := newID()
-		raw, _ := json.Marshal(map[string]any{"path": path})
-		_ = a.notify(ctx, session.ID, acp.SessionUpdate{SessionUpdate: "tool_call", ToolCallID: toolID, Title: &title, Kind: &kind, Status: &status, Locations: []acp.ToolLocation{{Path: path}}, RawInput: raw})
-		return a.streamText(ctx, session.ID, string(data))
-	case "write":
-		path := resolvePath(session.CWD, action.path)
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			return err
-		}
-		if err := os.WriteFile(path, []byte(action.content), 0o644); err != nil {
-			return err
-		}
-		title := "Write " + action.path
-		kind := "edit"
-		status := "completed"
-		toolID := newID()
-		raw, _ := json.Marshal(map[string]any{"path": path})
-		_ = a.notify(ctx, session.ID, acp.SessionUpdate{SessionUpdate: "tool_call", ToolCallID: toolID, Title: &title, Kind: &kind, Status: &status, Locations: []acp.ToolLocation{{Path: path}}, RawInput: raw})
-		return a.streamText(ctx, session.ID, "Wrote "+action.path+".")
-	case "run":
-		title := "Run " + action.command
-		kind := "execute"
-		status := "completed"
-		toolID := newID()
-		raw, _ := json.Marshal(map[string]any{"command": action.command, "args": action.args})
-		pendingStatus := runPendingStatus
-		_ = a.notify(ctx, session.ID, acp.SessionUpdate{SessionUpdate: "tool_call", ToolCallID: toolID, Title: &title, Kind: &kind, Status: &pendingStatus, RawInput: raw})
-		// If the host advertises terminal capability, perform a real terminal
-		// round-trip (terminal/create -> terminal/wait_for_exit -> terminal/release)
-		// so the simulator exercises the host's TerminalHandler end-to-end. When
-		// the host lacks terminal support, fall back to a synthetic tool result.
-		output := "Ran " + action.command + "."
-		a.mu.Lock()
-		terminalSupported := a.clientCapabilities.Terminal
-		a.mu.Unlock()
-		if terminalSupported {
-			if runOutput, ok := a.runViaTerminal(ctx, session.ID, action.command, action.args); ok {
-				output = runOutput
-			}
-		}
-		_ = a.notify(ctx, session.ID, acp.SessionUpdate{SessionUpdate: "tool_call_update", ToolCallID: toolID, Title: &title, Kind: &kind, Status: &status, RawInput: raw, RawOutput: []byte(output)})
 		return a.streamText(ctx, session.ID, output)
 	case "rename":
-		session.Title = action.title
+		session.Title = act.title
 		updated := now()
 		session.UpdatedAt = updated
-		_ = a.notify(ctx, session.ID, acp.SessionUpdate{SessionUpdate: "session_info_update", SessionInfoUpdate: acp.SessionInfoUpdate{Title: &session.Title, UpdatedAt: &updated}})
+		_ = a.notify(ctx, session.ID, acp.SessionUpdate{SessionUpdate: "session_info_update", Title: &session.Title, SessionInfoUpdate: acp.SessionInfoUpdate{Title: &session.Title, UpdatedAt: &updated}})
 		return a.streamText(ctx, session.ID, "Renamed session.")
 	case "scenario":
-		path := resolvePath(session.CWD, action.path)
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		if err := a.executeAction(ctx, session, actionType("plan", "Inspect fixture and perform host operations")); err != nil {
 			return err
 		}
-		if err := os.WriteFile(path, []byte("READY\n"), 0o644); err != nil {
+		if err := a.executeAction(ctx, session, action{kind: "write", path: act.path, content: "READY\n"}); err != nil {
 			return err
 		}
-		writeTitle := "Write " + action.path
-		writeKind := "edit"
-		status := "completed"
-		writeID := newID()
-		rawWrite, _ := json.Marshal(map[string]any{"path": path})
-		_ = a.notify(ctx, session.ID, acp.SessionUpdate{SessionUpdate: "tool_call", ToolCallID: writeID, Title: &writeTitle, Kind: &writeKind, Status: &status, Locations: []acp.ToolLocation{{Path: path}}, RawInput: rawWrite})
-		if action.command != "" {
-			runTitle := "Run " + action.command
-			runKind := "execute"
-			runID := newID()
-			rawRun, _ := json.Marshal(map[string]any{"command": action.command})
-			_ = a.notify(ctx, session.ID, acp.SessionUpdate{SessionUpdate: "tool_call", ToolCallID: runID, Title: &runTitle, Kind: &runKind, Status: &status, RawInput: rawRun})
+		if err := a.executeAction(ctx, session, action{kind: "read", path: act.path}); err != nil {
+			return err
 		}
-		return a.streamText(ctx, session.ID, "Scenario completed.")
+		fields := strings.Fields(act.command)
+		if len(fields) > 0 {
+			if err := a.executeAction(ctx, session, action{kind: "run", command: fields[0], args: fields[1:]}); err != nil {
+				return err
+			}
+		}
+		return a.executeAction(ctx, session, actionType("plan", "Verified host operations"))
 	case "simulate":
-		session.PendingFaults = append(session.PendingFaults, action.content)
+		session.PendingFaults = append(session.PendingFaults, act.content)
 		return a.streamText(ctx, session.ID, "Fault scheduled.")
 	default:
 		return a.streamText(ctx, session.ID, "OK")
@@ -737,4 +762,41 @@ func newID() string {
 
 func invalidParams(message string) error {
 	return &acp.RPCError{Code: -32602, Message: message}
+}
+
+func actionType(kind, content string) action { return action{kind: kind, content: content} }
+func (a *Agent) toolUpdate(ctx context.Context, session *Session, update acp.SessionUpdate) error {
+	if err := a.notify(ctx, session.ID, update); err != nil {
+		return err
+	}
+	for i, fault := range session.PendingFaults {
+		if fault == "duplicate-next-tool-update" {
+			session.PendingFaults = append(session.PendingFaults[:i], session.PendingFaults[i+1:]...)
+			return a.notify(ctx, session.ID, update)
+		}
+	}
+	return nil
+}
+func (a *Agent) permission(ctx context.Context, session *Session, id, title, kind string, raw json.RawMessage) (bool, error) {
+	if session.Modes.CurrentModeID == "deny" {
+		return false, nil
+	}
+	if session.Modes.CurrentModeID == "yolo" {
+		return true, nil
+	}
+	// Literal wire shape is independent from runtime permission DTOs.
+	var response struct {
+		Outcome struct {
+			Outcome  string `json:"outcome"`
+			OptionID string `json:"optionId"`
+		} `json:"outcome"`
+	}
+	err := a.peer.Call(ctx, "session/request_permission", map[string]any{"sessionId": session.ID, "toolCall": map[string]any{"toolCallId": id, "title": title, "kind": kind, "rawInput": raw}, "options": []map[string]string{{"optionId": "allow-once", "name": "Allow once", "kind": "allow_once"}, {"optionId": "reject-once", "name": "Reject once", "kind": "reject_once"}}}, &response)
+	if err != nil {
+		return false, err
+	}
+	return response.Outcome.Outcome == "selected" && response.Outcome.OptionID == "allow-once", nil
+}
+func defaultCommands() []acp.AvailableCommand {
+	return []acp.AvailableCommand{{Name: "help", Description: "List commands"}, {Name: "read", Description: "Read a file"}, {Name: "write", Description: "Write a file"}, {Name: "bash", Description: "Execute a command"}, {Name: "plan", Description: "Publish a plan"}, {Name: "rename", Description: "Rename session"}}
 }

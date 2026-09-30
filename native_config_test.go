@@ -10,8 +10,8 @@ import (
 )
 
 // TestClaudeNativeInitialConfigFlags: InitialConfig mode/model ride the
-// standard set_mode/set_config_option RPCs and land on the deferred spawn's
-// flags (the fake engine echoes them into its reply).
+// resolved startup configuration and land on the spawn flags (the fake
+// engine echoes them into its reply).
 func TestClaudeNativeInitialConfigFlags(t *testing.T) {
 	if os.Getenv("GO_WANT_HELPER_PROCESS") == "1" {
 		return
@@ -127,5 +127,27 @@ func TestCodexNativeMCPOverrideArgs(t *testing.T) {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("args = %q, want %q", joined, want)
 		}
+	}
+}
+
+func TestClaudeNativeResumeInitialConfigFlags(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	runtime := NewRuntime(nil, RuntimeOptions{})
+	defer runtime.Close(context.Background())
+	agent := CreateClaudeCodeNativeAgent(Agent{Command: os.Args[0], Args: []string{"-test.run=^TestFakeClaudeStreamJSON$", "--"}, Env: map[string]string{"GO_WANT_HELPER_PROCESS": "1"}})
+	session, err := runtime.ResumeSession(ctx, ResumeSessionOptions{SessionID: "existing-session", StartSessionOptions: StartSessionOptions{Agent: agent, CWD: t.TempDir(), InitialConfig: InitialConfig{Model: "resume-selected-model", Mode: "plan"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completion, err := session.Run(ctx, "continue")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(completion.OutputText, "MODEL=resume-selected-model") || !strings.Contains(completion.OutputText, "MODE=plan") {
+		t.Fatalf("resume spawn flags missing: %q", completion.OutputText)
+	}
+	if session.Snapshot().Session.ID != "existing-session" {
+		t.Fatal("resume public identity changed")
 	}
 }

@@ -54,10 +54,9 @@ type nativeEngine interface {
 	// issues thread/resume on its persistent app-server process. Returns the
 	// ACP session id (normally the requested one).
 	LoadSession(ctx context.Context, opts nativeEngineOptions, req LoadSessionRequest) (string, error)
-	// SessionConfigOptions advertises spawn-time knobs (model/mode) so
-	// InitialConfig reaches them via set_config_option/set_mode. Engines
-	// without spawn-time knobs return nil (those RPCs then fail with a clear
-	// unsupported error).
+	// SessionConfigOptions advertises supported startup knobs. InitialConfig is
+	// resolved before launching a session; subsequent assignments are readback
+	// checks or explicit requires-new-session errors, never pretend hot updates.
 	SessionConfigOptions() []SessionConfigOption
 	// Cancel best-effort interrupts the in-flight Prompt.
 	Cancel(ctx context.Context, opts nativeEngineOptions, sessionID string)
@@ -87,16 +86,6 @@ func (b *nativeBridge) nativeInfoMeta(ctx context.Context) map[string]any {
 		}
 	}
 	return map[string]any{"x-acp-runtime-native": info}
-}
-
-// nativePermissionRequest mirrors the ACP session/request_permission wire
-// params (connection.go parses the same shape on the host side).
-type nativePermissionRequest struct {
-	SessionID  string             `json:"sessionId"`
-	ToolCallID string             `json:"toolCallId"`
-	Title      string             `json:"title"`
-	Kind       string             `json:"kind"`
-	Options    []PermissionOption `json:"options"`
 }
 
 // errNativeUnsupported is returned for ACP methods the native transport does
@@ -137,18 +126,12 @@ func newNativeBridgeConnection(ctx context.Context, input ConnectionFactoryInput
 			_ = bridge.peer.Notify(bridgeCtx, "session/update", SessionNotification{SessionID: sessionID, Update: update})
 		},
 		requestPermission: func(ctx context.Context, req PermissionRequest) (PermissionDecision, error) {
-			var resp permissionResponse
-			err := bridge.peer.Call(ctx, "session/request_permission", nativePermissionRequest{
-				SessionID:  req.SessionID,
-				ToolCallID: req.ToolCallID,
-				Title:      req.Title,
-				Kind:       req.Kind,
-				Options:    req.Options,
-			}, &resp)
+			var resp PermissionDecision
+			err := bridge.peer.Call(ctx, "session/request_permission", req, &resp)
 			if err != nil {
 				return PermissionDecision{}, err
 			}
-			return PermissionDecision{Outcome: resp.Outcome, OptionID: resp.OptionID}, nil
+			return resp, nil
 		},
 	}
 
@@ -246,7 +229,11 @@ func registerNativeBridgeHandlers(b *nativeBridge) {
 		if err := setter.SetSpawnOption(req.SessionID, req.OptionID, req.Value); err != nil {
 			return nil, err
 		}
-		return SetSessionConfigOptionResponse{}, nil
+		options := nativeSessionResponse(b.engine, req.SessionID).ConfigOptions
+		if options == nil {
+			options = []SessionConfigOption{}
+		}
+		return SetSessionConfigOptionResponse{ConfigOptions: &options}, nil
 	}
 	p.RegisterRequest("session/set_config_option", setConfigOption)
 	p.RegisterRequest("session/set_mode", func(ctx context.Context, raw json.RawMessage) (any, error) {

@@ -9,10 +9,10 @@ const (
 	ProtocolVersion = 1
 
 	ACPProtocolSourceRepo        = "https://github.com/agentclientprotocol/agent-client-protocol"
-	ACPProtocolSourceRef         = "schema-v1.17.0"
+	ACPProtocolSourceRef         = "schema-v1.23.0"
 	ACPProtocolDocsURL           = "https://agentclientprotocol.com/protocol/v1/overview"
 	ACPProtocolDocsSchemaURL     = "https://agentclientprotocol.com/protocol/v1/schema"
-	ACPProtocolAlignmentVerified = "2026-07-05"
+	ACPProtocolAlignmentVerified = "2026-09-30"
 
 	RuntimeSnapshotVersion = 1
 
@@ -139,9 +139,12 @@ func (s MCPServer) isRemoteMCPServer() bool {
 }
 
 type ClientCapabilities struct {
-	Terminal bool                       `json:"terminal"`
-	FS       FilesystemCapabilities     `json:"fs"`
-	Meta     map[string]json.RawMessage `json:"_meta,omitempty"`
+	Session     *ClientSessionCapabilities `json:"session,omitempty"`
+	Auth        *AuthCapabilities          `json:"auth,omitempty"`
+	Elicitation *ElicitationCapabilities   `json:"elicitation,omitempty"`
+	Terminal    bool                       `json:"terminal"`
+	FS          FilesystemCapabilities     `json:"fs"`
+	Meta        map[string]json.RawMessage `json:"_meta,omitempty"`
 }
 
 type FilesystemCapabilities struct {
@@ -171,6 +174,8 @@ type MCPCapabilities struct {
 }
 
 type SessionCapabilities struct {
+	Delete                map[string]any `json:"delete,omitempty"`
+	Meta                  map[string]any `json:"_meta,omitempty"`
 	Close                 map[string]any `json:"close,omitempty"`
 	Fork                  map[string]any `json:"fork,omitempty"`
 	List                  map[string]any `json:"list,omitempty"`
@@ -257,10 +262,11 @@ type ResumeSessionRequest struct {
 type ResumeSessionResponse = NewSessionResponse
 
 type ForkSessionRequest struct {
-	SessionID             string      `json:"sessionId"`
-	CWD                   string      `json:"cwd"`
-	MCPServers            []MCPServer `json:"mcpServers"`
-	AdditionalDirectories []string    `json:"additionalDirectories,omitempty"`
+	Meta                  map[string]any `json:"_meta,omitempty"`
+	SessionID             string         `json:"sessionId"`
+	CWD                   string         `json:"cwd"`
+	MCPServers            []MCPServer    `json:"mcpServers"`
+	AdditionalDirectories []string       `json:"additionalDirectories,omitempty"`
 }
 
 type ForkSessionResponse = NewSessionResponse
@@ -317,32 +323,11 @@ type SetSessionModeRequest struct {
 type SetSessionModeResponse struct{}
 
 type SetSessionConfigOptionRequest struct {
+	Type      string         `json:"type,omitempty"`
 	SessionID string         `json:"sessionId"`
 	OptionID  string         `json:"configId"`
 	Value     any            `json:"value"`
 	Meta      map[string]any `json:"_meta,omitempty"`
-}
-
-func (r *SetSessionConfigOptionRequest) UnmarshalJSON(data []byte) error {
-	type wire struct {
-		SessionID string         `json:"sessionId"`
-		ConfigID  string         `json:"configId"`
-		OptionID  string         `json:"optionId"`
-		Value     any            `json:"value"`
-		Meta      map[string]any `json:"_meta,omitempty"`
-	}
-	var out wire
-	if err := json.Unmarshal(data, &out); err != nil {
-		return err
-	}
-	r.SessionID = out.SessionID
-	r.OptionID = out.ConfigID
-	if r.OptionID == "" {
-		r.OptionID = out.OptionID
-	}
-	r.Value = out.Value
-	r.Meta = out.Meta
-	return nil
 }
 
 type SetSessionConfigOptionResponse struct {
@@ -367,6 +352,12 @@ type PromptResponse struct {
 }
 
 type ContentBlock struct {
+	// Tool-call content variants preserve their nested content, diff, and terminal data.
+	Content     *ContentBlock   `json:"content,omitempty"`
+	Path        string          `json:"path,omitempty"`
+	OldText     *string         `json:"oldText,omitempty"`
+	NewText     string          `json:"newText,omitempty"`
+	TerminalID  string          `json:"terminalId,omitempty"`
 	Type        string          `json:"type"`
 	Text        string          `json:"text,omitempty"`
 	MimeType    string          `json:"mimeType,omitempty"`
@@ -431,13 +422,15 @@ type SessionConfigOption struct {
 }
 
 type SessionConfigChoice struct {
-	Value       any    `json:"value"`
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
+	Meta        map[string]any `json:"_meta,omitempty"`
+	Value       any            `json:"value"`
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
 }
 
 type SessionConfigGroup struct {
-	ID      string                `json:"id"`
+	Meta    map[string]any        `json:"_meta,omitempty"`
+	ID      string                `json:"group"`
 	Name    string                `json:"name"`
 	Options []SessionConfigChoice `json:"options"`
 }
@@ -456,6 +449,10 @@ type SessionNotification struct {
 }
 
 type SessionUpdate struct {
+	Name              *string               `json:"name,omitempty"`
+	Used              *uint64               `json:"used,omitempty"`
+	Size              *uint64               `json:"size,omitempty"`
+	Cost              *UsageCost            `json:"cost,omitempty"`
 	SessionUpdate     string                `json:"sessionUpdate"`
 	MessageID         string                `json:"messageId,omitempty"`
 	Type              string                `json:"type,omitempty"`
@@ -505,16 +502,23 @@ type Usage struct {
 }
 
 type RuntimeOptions struct {
-	ClientInfo Implementation
+	// RequireFreshConnectionPerTurn closes the transport after each completed turn.
+	// Use for nonconforming agents that emit late same-session updates after terminal.
+	// The caller must open/resume a fresh session handle for the next turn.
+	RequireFreshConnectionPerTurn bool
+	// EnableExperimentalFeatures explicitly opts into existing non-stable methods such as fork.
+	EnableExperimentalFeatures bool
+	ClientInfo                 Implementation
 	// HomeDir is the authoritative HOME for provider child processes. Hosts
 	// should place it on storage whose lifecycle matches stored sessions.
 	HomeDir string
 	// CacheDir is the disposable cache root exposed to provider child processes.
-	CacheDir              string
-	StoredSessionsEnabled bool
-	AuthenticationHandler AuthenticationHandler
-	AuthorityHandlers     AuthorityHandlers
-	Observability         ObservabilityOptions
+	CacheDir                      string
+	StoredSessionsEnabled         bool
+	AuthenticationHandler         AuthenticationHandler
+	TerminalAuthenticationHandler TerminalAuthenticationHandler
+	AuthorityHandlers             AuthorityHandlers
+	Observability                 ObservabilityOptions
 	// Hooks is an optional lightweight observability surface for hosts that want
 	// session/turn/process lifecycle signals without pulling in a full metrics
 	// stack. Nil fields are ignored.
@@ -583,26 +587,39 @@ type RuntimeAuthenticationDecision struct {
 }
 
 type AuthorityHandlers struct {
-	Permission PermissionHandler
-	Filesystem FilesystemHandler
-	Terminal   TerminalHandler
+	PermissionTimeout time.Duration
+	Elicitation       ElicitationHandlers
+	Permission        PermissionHandler
+	Filesystem        FilesystemHandler
+	Terminal          TerminalHandler
 }
 
 type PermissionHandler func(ctx Context, request PermissionRequest) (PermissionDecision, error)
 
 type PermissionRequest struct {
-	SessionID  string
-	ToolCallID string
-	Title      string
-	Kind       string
-	Target     string
-	Options    []PermissionOption
+	Name          *string
+	Status        *string
+	RawInput      json.RawMessage
+	RawOutput     json.RawMessage
+	Content       ContentBlocks
+	Locations     []ToolLocation
+	Meta          map[string]any
+	ToolCallMeta  map[string]any
+	Extra         map[string]json.RawMessage
+	ToolCallExtra map[string]json.RawMessage
+	SessionID     string
+	ToolCallID    string
+	Title         string
+	Kind          string
+	Target        string
+	Options       []PermissionOption
 }
 
 type PermissionOption struct {
-	ID   string `json:"id"`
-	Name string `json:"name,omitempty"`
-	Kind string `json:"kind,omitempty"`
+	ID   string         `json:"optionId"`
+	Name string         `json:"name"`
+	Kind string         `json:"kind"`
+	Meta map[string]any `json:"_meta,omitempty"`
 }
 
 type PermissionDecision struct {
@@ -747,7 +764,7 @@ type PermissionConfig struct {
 type CodexConfig struct {
 	Model          string         // e.g. "deepseek-chat", "gpt-5.5"
 	SandboxMode    string         // read-only / workspace-write / danger-full-access
-	ApprovalPolicy string         // never / on-request / untrusted / unless-trusted
+	ApprovalPolicy string         // never / on-request / untrusted / on-failure
 	WritableRoots  []string       // additional writable paths in workspace-write mode
 	NetworkAccess  *bool          // network access in workspace-write sandbox (nil = default)
 	Extra          map[string]any // additional native fields merged into CODEX_CONFIG JSON
@@ -786,11 +803,11 @@ type StartSessionOptions struct {
 	// applies them for every supported agent; callers must not set both to
 	// non-empty values, and must not inject prompts via Agent.Args, Agent.Env,
 	// or provider-specific config. Other Meta keys are merged with
-	// AgentConfig-derived metadata. Load/Fork do not send session _meta.
+	// AgentConfig-derived metadata. Load/Resume/Fork use the same validated startup projection.
 	Meta map[string]any
 	// AgentConfig is a unified, cross-agent configuration abstraction. When set,
 	// the profile layer translates it into the agent's native format (env,
-	// _meta, CLI flags) automatically for Create and Resume. It is additive to
+	// _meta, CLI flags) automatically for Create, Load, Resume and experimental Fork. It is additive to
 	// InitialConfig and Meta: model/sandbox/tool settings from AgentConfig are
 	// applied in addition to (not instead of) InitialConfig. Precedence on
 	// _meta: projected system prompt < AgentConfig < remaining explicit Meta.
@@ -896,6 +913,7 @@ type RuntimeDiagnostics struct {
 }
 
 type RuntimeSessionMetadata struct {
+	ConfigApplication  ConfigApplicationReport
 	SessionID          string
 	Title              string
 	UpdatedAt          string
@@ -982,17 +1000,18 @@ type TurnCompletion struct {
 }
 
 type TurnEvent struct {
-	Type       string
-	TurnID     string
-	Text       string
-	Thinking   string
-	Plan       []PlanEntry
-	ToolCall   *ToolCallSnapshot
-	Operation  *Operation
-	Permission *PermissionRequestSnapshot
-	Usage      *Usage
-	Error      error
-	Completion *TurnCompletion
+	ContextUsage *ContextUsage
+	Type         string
+	TurnID       string
+	Text         string
+	Thinking     string
+	Plan         []PlanEntry
+	ToolCall     *ToolCallSnapshot
+	Operation    *Operation
+	Permission   *PermissionRequestSnapshot
+	Usage        *Usage
+	Error        error
+	Completion   *TurnCompletion
 }
 
 type ThreadEntry struct {
@@ -1012,6 +1031,7 @@ type DiffSnapshot struct {
 }
 
 type ToolCallSnapshot struct {
+	Name      string
 	ID        string
 	Title     string
 	Kind      string

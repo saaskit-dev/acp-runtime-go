@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // codexNativeEngine drives codex app-server DAEMONS, pooled by config
@@ -38,6 +39,9 @@ func (e *codexNativeEngine) Name() string { return "codex" }
 
 func (e *codexNativeEngine) Start(ctx context.Context, opts nativeEngineOptions) error {
 	e.opts = opts
+	if err := validateAgentStartConfig(opts.Agent, nil, nil); err != nil {
+		return err
+	}
 	if _, err := exec.LookPath(opts.Agent.Command); err != nil {
 		return wrapError(ErrorProcess, "native.codex.spawn", "codex binary not found on PATH", err)
 	}
@@ -52,15 +56,16 @@ func (e *codexNativeEngine) Start(ctx context.Context, opts nativeEngineOptions)
 // codexDaemon is one long-lived app-server process shared by every session
 // with the same configuration fingerprint.
 type codexDaemon struct {
-	key    string
-	eng    *codexNativeEngine
-	mu     sync.Mutex
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	peer   *Peer
-	loopOn context.CancelFunc
-	turns  map[string]*codexTurn // threadID -> in-flight turn
-	wait   nativeProcessWait
+	key     string
+	eng     *codexNativeEngine
+	mu      sync.Mutex
+	eventMu sync.Mutex // serializes native notification admission and start-ID binding
+	cmd     *exec.Cmd
+	stdin   io.WriteCloser
+	peer    *Peer
+	loopOn  context.CancelFunc
+	turns   map[string]*codexTurn // threadID -> in-flight turn
+	wait    nativeProcessWait
 }
 
 // codexSession ties an ACP session id to its daemon + thread.
@@ -116,8 +121,8 @@ func (e *codexNativeEngine) NewSession(ctx context.Context, opts nativeEngineOpt
 	if res.Thread.ID == "" {
 		return "", &RuntimeError{Kind: ErrorProcess, Op: "native.codex.thread", Msg: "thread/start returned no thread id"}
 	}
-	if model != "" && res.Model == "" {
-		return "", wrapError(ErrorProtocol, "native.codex.thread", "thread/start did not report the selected model", nil)
+	if model != "" && res.Model != model {
+		return "", wrapError(ErrorProtocol, "native.codex.thread", "thread/start did not confirm the selected model", nil)
 	}
 	e.mu.Lock()
 	e.sessions[res.Thread.ID] = &codexSession{daemon: daemon, threadID: res.Thread.ID, model: res.Model}
@@ -128,11 +133,16 @@ func (e *codexNativeEngine) NewSession(ctx context.Context, opts nativeEngineOpt
 func (e *codexNativeEngine) LoadSession(ctx context.Context, opts nativeEngineOptions, req LoadSessionRequest) (string, error) {
 	e.mu.Lock()
 	if s, ok := e.sessions[req.SessionID]; ok && s.daemon.alive() {
+		requested := nativeCodexModel(opts.Agent, req.Meta)
+		if requested != "" && requested != s.model {
+			e.mu.Unlock()
+			return "", configError("native.codex.resume", "model", "existing thread model differs; create a new connection")
+		}
 		e.mu.Unlock()
 		return req.SessionID, nil
 	}
 	e.mu.Unlock()
-	key := e.daemonKey(nil, req.MCPServers)
+	key := e.daemonKey(req.Meta, req.MCPServers)
 	daemon, err := e.ensureDaemon(ctx, key, req.MCPServers)
 	if err != nil {
 		return "", err
@@ -150,6 +160,12 @@ func (e *codexNativeEngine) LoadSession(ctx context.Context, opts nativeEngineOp
 		"experimentalRawEvents": true,
 	}, &res); err != nil {
 		return "", wrapError(ErrorProcess, "native.codex.resume", "thread/resume failed", err)
+	}
+	if res.Thread.ID != "" && res.Thread.ID != req.SessionID {
+		return "", wrapError(ErrorProtocol, "native.codex.resume", "thread/resume returned a conflicting identity", nil)
+	}
+	if model := nativeCodexModel(opts.Agent, req.Meta); model != "" && res.Model != model {
+		return "", wrapError(ErrorProtocol, "native.codex.resume", "thread/resume did not confirm the selected model", nil)
 	}
 	e.mu.Lock()
 	e.sessions[req.SessionID] = &codexSession{daemon: daemon, threadID: req.SessionID, model: res.Model}
@@ -169,14 +185,20 @@ func (e *codexNativeEngine) ensureDaemon(ctx context.Context, key string, server
 		e.daemons = map[string]*codexDaemon{}
 	}
 	if d, ok := e.daemons[key]; ok {
+		if !d.alive() {
+			return nil, wrapError(ErrorSessionClosed, "native.codex.spawn", "daemon transport is closed; create a new connection", nil)
+		}
 		return d, nil
 	}
 	// ponytail: serialize cold daemon admission per engine; narrow only if
 	// concurrent cold starts on one connection become a measured bottleneck.
 	d := &codexDaemon{key: key, eng: e, turns: map[string]*codexTurn{}}
 	if err := d.spawn(ctx, codexSpawnExtras(e.opts, servers)); err != nil {
-		_ = d.kill(context.Background())
-		return nil, err
+		cleanupErr := d.kill(context.Background())
+		if cleanupErr != nil {
+			e.daemons[key] = d
+		}
+		return nil, errors.Join(err, cleanupErr)
 	}
 	e.daemons[key] = d
 	return d, nil
@@ -237,7 +259,15 @@ type codexProc = codexDaemon
 func (d *codexDaemon) alive() bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.cmd != nil && d.cmd.Process != nil
+	if d.cmd == nil || d.cmd.Process == nil || d.peer == nil {
+		return false
+	}
+	select {
+	case <-d.peer.Done():
+		return false
+	default:
+		return true
+	}
 }
 
 // spawn launches the app-server with config/-c overrides and completes the
@@ -285,7 +315,14 @@ func (d *codexDaemon) spawn(ctx context.Context, extraArgs []string) error {
 
 func (d *codexDaemon) registerHandlers() {
 	peer := d.peer
-	peer.RegisterNotification("item/agentMessage/delta", func(ctx context.Context, raw json.RawMessage) {
+	registerNotification := func(method string, handler RPCNotificationHandler) {
+		peer.RegisterNotification(method, func(ctx context.Context, raw json.RawMessage) {
+			d.eventMu.Lock()
+			defer d.eventMu.Unlock()
+			d.admitNotification(ctx, method, raw, handler)
+		})
+	}
+	registerNotification("item/agentMessage/delta", func(ctx context.Context, raw json.RawMessage) {
 		var ev struct {
 			ThreadID string `json:"threadId"`
 			ItemID   string `json:"itemId"`
@@ -305,7 +342,7 @@ func (d *codexDaemon) registerHandlers() {
 		}
 	})
 	for _, method := range []string{"item/reasoning/textDelta", "item/reasoning/summaryTextDelta"} {
-		peer.RegisterNotification(method, func(ctx context.Context, raw json.RawMessage) {
+		registerNotification(method, func(ctx context.Context, raw json.RawMessage) {
 			var ev struct {
 				ThreadID string `json:"threadId"`
 				Delta    string `json:"delta"`
@@ -316,7 +353,7 @@ func (d *codexDaemon) registerHandlers() {
 			d.emit(ev.ThreadID, SessionUpdate{SessionUpdate: "agent_thought_chunk", Text: ev.Delta})
 		})
 	}
-	peer.RegisterNotification("item/started", func(ctx context.Context, raw json.RawMessage) {
+	registerNotification("item/started", func(ctx context.Context, raw json.RawMessage) {
 		var ev struct {
 			ThreadID string `json:"threadId"`
 			Item     struct {
@@ -337,9 +374,9 @@ func (d *codexDaemon) registerHandlers() {
 		}
 		pending := "pending"
 		d.emit(ev.ThreadID, SessionUpdate{SessionUpdate: "tool_call", ToolCallID: ev.Item.ID,
-			Title: &title, Kind: strPtr("execute_command"), Status: &pending})
+			Title: &title, Kind: strPtr("execute"), Status: &pending})
 	})
-	peer.RegisterNotification("item/completed", func(ctx context.Context, raw json.RawMessage) {
+	registerNotification("item/completed", func(ctx context.Context, raw json.RawMessage) {
 		var ev struct {
 			ThreadID string `json:"threadId"`
 			Item     struct {
@@ -365,10 +402,10 @@ func (d *codexDaemon) registerHandlers() {
 			}
 		}
 	})
-	peer.RegisterNotification("rawResponse/completed", func(ctx context.Context, raw json.RawMessage) {
+	registerNotification("rawResponse/completed", func(ctx context.Context, raw json.RawMessage) {
 		var ev struct {
 			ThreadID string `json:"threadId"`
-			Usage    struct {
+			Usage    *struct {
 				TotalTokens           uint64 `json:"totalTokens"`
 				InputTokens           uint64 `json:"inputTokens"`
 				CachedInputTokens     uint64 `json:"cachedInputTokens"`
@@ -377,7 +414,7 @@ func (d *codexDaemon) registerHandlers() {
 				ReasoningOutputTokens uint64 `json:"reasoningOutputTokens"`
 			} `json:"usage"`
 		}
-		if err := json.Unmarshal(raw, &ev); err != nil {
+		if err := json.Unmarshal(raw, &ev); err != nil || ev.Usage == nil {
 			return
 		}
 		cached := ev.Usage.CachedInputTokens
@@ -397,7 +434,7 @@ func (d *codexDaemon) registerHandlers() {
 		}
 		d.mu.Unlock()
 	})
-	peer.RegisterNotification("turn/completed", func(ctx context.Context, raw json.RawMessage) {
+	registerNotification("turn/completed", func(ctx context.Context, raw json.RawMessage) {
 		var ev struct {
 			ThreadID string `json:"threadId"`
 			Turn     struct {
@@ -410,20 +447,27 @@ func (d *codexDaemon) registerHandlers() {
 		if err := json.Unmarshal(raw, &ev); err != nil {
 			return
 		}
-		d.settleTurn(ev.ThreadID, "end_turn", nil)
-		if ev.Turn.Status == "failed" {
+		switch ev.Turn.Status {
+		case "completed":
+			d.settleTurn(ev.ThreadID, "end_turn", nil)
+		case "interrupted":
+			d.settleTurn(ev.ThreadID, "cancelled", &RuntimeError{Kind: ErrorTurnCancelled, Op: "native.codex.turn", Msg: "Codex turn interrupted", Cause: context.Canceled})
+		case "failed":
 			msg := "codex turn failed"
 			if ev.Turn.Error != nil && ev.Turn.Error.Message != "" {
 				msg = ev.Turn.Error.Message
 			}
-			d.settleTurn(ev.ThreadID, "end_turn", fmt.Errorf("%s", msg))
+			d.settleTurn(ev.ThreadID, "end_turn", &NativeCodexTurnError{Message: msg, Details: append(json.RawMessage(nil), raw...)})
+		default:
+			d.settleTurn(ev.ThreadID, "end_turn", &NativeCodexTurnError{Message: "unrecognized Codex terminal status", Details: append(json.RawMessage(nil), raw...)})
 		}
 	})
-	peer.RegisterNotification("error", func(ctx context.Context, raw json.RawMessage) {
+	registerNotification("error", func(ctx context.Context, raw json.RawMessage) {
 		var ev struct {
-			ThreadID string `json:"threadId"`
-			Message  string `json:"message"`
-			Error    *struct {
+			ThreadID  string `json:"threadId"`
+			Message   string `json:"message"`
+			WillRetry bool   `json:"willRetry"`
+			Error     *struct {
 				Message string `json:"message"`
 			} `json:"error"`
 		}
@@ -434,18 +478,72 @@ func (d *codexDaemon) registerHandlers() {
 		if msg == "" && ev.Error != nil {
 			msg = ev.Error.Message
 		}
-		if msg == "" || codexTransientError(msg) {
+		if msg == "" || ev.WillRetry {
 			return
 		}
 		d.mu.Lock()
 		if turn := d.turns[ev.ThreadID]; turn != nil && !turn.finished {
-			turn.finished = true
-			turn.err = fmt.Errorf("%s", msg)
-			close(turn.done)
+			turn.err = &NativeCodexTurnError{Message: msg, Details: append(json.RawMessage(nil), raw...)}
 		}
 		d.mu.Unlock()
 	})
 	d.registerApprovals(peer)
+}
+
+// NativeCodexTurnError retains the provider's structured code/cause as raw
+// protocol details for hosts that need diagnostics beyond its message.
+type NativeCodexTurnError struct {
+	Message string
+	Details json.RawMessage
+}
+
+func (e *NativeCodexTurnError) Error() string { return e.Message }
+
+type codexQueuedNotification struct {
+	ctx     context.Context
+	method  string
+	raw     json.RawMessage
+	handler RPCNotificationHandler
+}
+
+// admitNotification requires both native identities. Notifications preceding
+// the start response are bounded and replayed only after its true ID is known.
+func (d *codexDaemon) admitNotification(ctx context.Context, method string, raw json.RawMessage, handler RPCNotificationHandler) {
+	var identity struct {
+		ThreadID string `json:"threadId"`
+		TurnID   string `json:"turnId"`
+		Turn     struct {
+			ID string `json:"id"`
+		} `json:"turn"`
+	}
+	if json.Unmarshal(raw, &identity) != nil {
+		return
+	}
+	if identity.TurnID == "" {
+		identity.TurnID = identity.Turn.ID
+	}
+	d.mu.Lock()
+	turn := d.turns[identity.ThreadID]
+	if turn == nil || turn.finished || identity.TurnID == "" {
+		d.mu.Unlock()
+		return
+	}
+	if turn.id == "" {
+		if len(turn.queued) >= 128 || turn.queuedBytes+len(raw) > 1024*1024 {
+			d.mu.Unlock()
+			d.peer.Close()
+			return
+		}
+		turn.queued = append(turn.queued, codexQueuedNotification{ctx, method, append(json.RawMessage(nil), raw...), handler})
+		turn.queuedBytes += len(raw)
+		d.mu.Unlock()
+		return
+	}
+	match := turn.id == identity.TurnID
+	d.mu.Unlock()
+	if match {
+		handler(ctx, raw)
+	}
 }
 
 // settleTurn resolves the in-flight turn. A non-nil err marks it failed;
@@ -459,9 +557,15 @@ func (d *codexDaemon) settleTurn(threadID, stop string, err error) {
 	}
 	turn.finished = true
 	if err != nil {
-		turn.err = err
-	} else {
-		turn.stop = stop
+		if turn.err != nil {
+			turn.err = errors.Join(turn.err, err)
+		} else {
+			turn.err = err
+		}
+	}
+	turn.stop = stop
+	if turn.cancelPermission != nil {
+		turn.cancelPermission()
 	}
 	close(turn.done)
 }
@@ -476,28 +580,53 @@ func (d *codexDaemon) prompt(ctx context.Context, threadID string, blocks []Cont
 		d.mu.Unlock()
 		return nativeTurnResult{}, &RuntimeError{Kind: ErrorProcess, Op: "native.codex.turn", Msg: "a turn is already in flight"}
 	}
-	turn := &codexTurn{done: make(chan struct{}), stop: "end_turn", deltas: map[string]bool{}}
+	permissionCtx, cancelPermission := context.WithCancel(context.Background())
+	turn := &codexTurn{done: make(chan struct{}), stop: "end_turn", deltas: map[string]bool{}, permissionCtx: permissionCtx, cancelPermission: cancelPermission}
 	d.turns[threadID] = turn
 	d.mu.Unlock()
 
+	stopCancel := context.AfterFunc(ctx, func() { d.interrupt(threadID) })
+	defer stopCancel()
+	startCtx, cancelStart := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancelStart()
 	var startRes struct {
 		Turn struct {
 			ID string `json:"id"`
 		} `json:"turn"`
 	}
-	if err := d.peer.Call(ctx, "turn/start", map[string]any{
+	if err := d.peer.Call(startCtx, "turn/start", map[string]any{
 		"threadId": threadID,
 		"input":    codexInputFromBlocks(blocks),
 	}, &startRes); err != nil {
 		d.mu.Lock()
-		delete(d.turns, threadID)
+		if d.turns[threadID] == turn {
+			delete(d.turns, threadID)
+		}
+		cancelPermission()
 		d.mu.Unlock()
 		return nativeTurnResult{}, wrapError(ErrorProcess, "native.codex.turn", "turn/start failed", err)
 	}
-	_ = startRes
+	if startRes.Turn.ID == "" {
+		d.peer.Close()
+		return nativeTurnResult{}, wrapError(ErrorProtocol, "native.codex.turn", "turn/start returned no turn id", nil)
+	}
+	d.eventMu.Lock()
+	d.mu.Lock()
+	turn.id = startRes.Turn.ID
+	queued := turn.queued
+	turn.queued = nil
+	cancelRequested := turn.cancelRequested
+	d.mu.Unlock()
+	for _, notification := range queued {
+		d.admitNotification(notification.ctx, notification.method, notification.raw, notification.handler)
+	}
+	d.eventMu.Unlock()
+	if cancelRequested {
+		d.interrupt(threadID)
+	}
 
 	select {
-	case <-turnDone(d, threadID):
+	case <-turn.done:
 	case <-d.peer.Done():
 		select {
 		case <-turn.done:
@@ -511,7 +640,7 @@ func (d *codexDaemon) prompt(ctx context.Context, threadID string, blocks []Cont
 	err, stop, usage := turn.err, turn.stop, turn.usage
 	d.mu.Unlock()
 	if err != nil {
-		return nativeTurnResult{}, &RuntimeError{Kind: ErrorProcess, Op: "native.codex.turn", Msg: err.Error()}
+		return nativeTurnResult{}, err
 	}
 	return nativeTurnResult{StopReason: stop, Usage: usage}, nil
 }
@@ -527,17 +656,44 @@ func turnDone(d *codexDaemon, threadID string) <-chan struct{} {
 	return closed
 }
 
-// interrupt best-effort stops the in-flight turn. turn/interrupt is not in
-// any public schema; failures are ignored — the turn settles via
-// turn/completed (or the caller's context).
+// interrupt retains cancel intent until turn/start returns the provider ID.
+// The acknowledgement is only delivery confirmation; terminal ownership stays
+// with turn/completed (or connection teardown).
 func (d *codexDaemon) interrupt(threadID string) {
 	d.mu.Lock()
 	turn := d.turns[threadID]
-	d.mu.Unlock()
 	if turn == nil || turn.finished {
+		d.mu.Unlock()
 		return
 	}
-	_ = d.peer.Notify(context.Background(), "turn/interrupt", map[string]any{"threadId": threadID, "turnId": turn.id})
+	turn.cancelRequested = true
+	if turn.cancelPermission != nil {
+		turn.cancelPermission()
+	}
+	if turn.id == "" || turn.interruptSent {
+		d.mu.Unlock()
+		return
+	}
+	turn.interruptSent = true
+	id := turn.id
+	d.mu.Unlock()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		var response struct{}
+		err := d.peer.Call(ctx, "turn/interrupt", map[string]any{"threadId": threadID, "turnId": id}, &response)
+		d.mu.Lock()
+		if d.turns[threadID] == turn {
+			turn.interruptErr = err
+			turn.interruptAck = err == nil
+		}
+		d.mu.Unlock()
+		// An unconfirmed interrupt cannot release this thread for another turn.
+		// Closing the transport makes the failure observable to its prompt owner.
+		if err != nil {
+			d.peer.Close()
+		}
+	}()
 }
 
 // registerApprovals maps codex's server-initiated approval requests (naming
@@ -545,55 +701,111 @@ func (d *codexDaemon) interrupt(threadID string) {
 // {"decision": ...}, verify on major upgrades) onto the ACP
 // session/request_permission round-trip. Failure to answer fails CLOSED.
 func (d *codexDaemon) registerApprovals(peer *Peer) {
-	for _, method := range []string{"execCommandApproval", "exec_approval_request", "applyPatchApproval"} {
+	for _, method := range []string{"item/commandExecution/requestApproval", "item/fileChange/requestApproval"} {
+		method := method
 		peer.RegisterRequest(method, func(ctx context.Context, raw json.RawMessage) (any, error) {
-			return d.handleApproval(ctx, raw)
+			kind := "execute"
+			if method == "item/fileChange/requestApproval" {
+				kind = "edit"
+			}
+			return d.handleApprovalKind(ctx, raw, kind, true)
+		})
+	}
+	// Legacy requests are parsed only for fail-closed interoperability. They
+	// still require an explicit, matching native turn identity.
+	for _, method := range []string{"execCommandApproval", "exec_approval_request", "applyPatchApproval"} {
+		method := method
+		peer.RegisterRequest(method, func(ctx context.Context, raw json.RawMessage) (any, error) {
+			kind := "execute"
+			if method == "applyPatchApproval" {
+				kind = "edit"
+			}
+			return d.handleApprovalKind(ctx, raw, kind, false)
 		})
 	}
 }
-
 func (d *codexDaemon) handleApproval(ctx context.Context, raw json.RawMessage) (any, error) {
+	return d.handleApprovalKind(ctx, raw, "execute", false)
+}
+func (d *codexDaemon) handleApprovalKind(ctx context.Context, raw json.RawMessage, kind string, modern bool) (any, error) {
+	allow, deny := "approved", "denied"
+	if modern {
+		allow, deny = "accept", "decline"
+	}
+	rejected := map[string]any{"decision": deny}
 	var req struct {
-		ThreadID string   `json:"threadId"`
-		CallID   string   `json:"callId"`
-		Command  []string `json:"command"`
-		Reason   string   `json:"reason"`
-		Title    string   `json:"title"`
+		ThreadID           string            `json:"threadId"`
+		TurnID             string            `json:"turnId"`
+		CallID             string            `json:"callId"`
+		ItemID             string            `json:"itemId"`
+		Command            json.RawMessage   `json:"command"`
+		Reason             string            `json:"reason"`
+		Title              string            `json:"title"`
+		AvailableDecisions []json.RawMessage `json:"availableDecisions"`
 	}
-	_ = json.Unmarshal(raw, &req)
-	if d.eng.opts.requestPermission == nil {
-		return map[string]any{"decision": "denied"}, nil
+	if len(raw) > 64*1024 || json.Unmarshal(raw, &req) != nil || d.eng.opts.requestPermission == nil {
+		return rejected, nil
 	}
-	title := strings.Join(req.Command, " ")
+	d.mu.Lock()
+	turn := d.turns[req.ThreadID]
+	if turn == nil || turn.finished || turn.cancelRequested || turn.id == "" || turn.id != req.TurnID || turn.permissionCtx == nil {
+		d.mu.Unlock()
+		return rejected, nil
+	}
+	permissionCtx := turn.permissionCtx
+	d.mu.Unlock()
+	permissionCtx, cancel := context.WithTimeout(permissionCtx, 2*time.Minute)
+	defer cancel()
+	stopCancel := context.AfterFunc(ctx, cancel)
+	defer stopCancel()
+	// A provider may offer only a restricted subset of decisions.
+	if len(req.AvailableDecisions) > 0 {
+		offered := false
+		for _, v := range req.AvailableDecisions {
+			var name string
+			if json.Unmarshal(v, &name) == nil && name == allow {
+				offered = true
+			}
+		}
+		if !offered {
+			return rejected, nil
+		}
+	}
+	title := req.Title
 	if title == "" {
-		title = req.Title
+		_ = json.Unmarshal(req.Command, &title)
+		if title == "" {
+			var command []string
+			_ = json.Unmarshal(req.Command, &command)
+			title = strings.Join(command, " ")
+		}
 	}
 	if title == "" {
 		title = req.Reason
 	}
-	decision, err := d.eng.opts.requestPermission(ctx, PermissionRequest{
-		SessionID:  req.ThreadID,
-		ToolCallID: req.CallID,
-		Title:      title,
-		Kind:       "execute_command",
-		Options: []PermissionOption{
-			{ID: "approve", Name: "Approve", Kind: "allow_once"},
-			{ID: "deny", Name: "Deny", Kind: "reject_once"},
-		},
-	})
-	if err != nil {
-		return map[string]any{"decision": "denied"}, nil
+	id := req.ItemID
+	if id == "" {
+		id = req.CallID
 	}
-	if decision.Outcome == "selected" && decision.OptionID == "approve" {
-		return map[string]any{"decision": "approved"}, nil
+	decision, err := d.eng.opts.requestPermission(permissionCtx, PermissionRequest{SessionID: req.ThreadID, ToolCallID: id, Title: title, Kind: kind, RawInput: append(json.RawMessage(nil), raw...), Meta: map[string]any{"x-acp-runtime-native-request": append(json.RawMessage(nil), raw...)}, Options: []PermissionOption{{ID: "approve", Name: "Approve", Kind: "allow_once"}, {ID: "deny", Name: "Deny", Kind: "reject_once"}}})
+	d.mu.Lock()
+	valid := d.turns[req.ThreadID] == turn && !turn.finished && !turn.cancelRequested
+	d.mu.Unlock()
+	if err == nil && permissionCtx.Err() == nil && valid && decision.Outcome == "selected" && decision.OptionID == "approve" {
+		return map[string]any{"decision": allow}, nil
 	}
-	return map[string]any{"decision": "denied"}, nil
+	return rejected, nil
 }
 
 // kill terminates the daemon process tree.
 func (d *codexDaemon) kill(ctx context.Context) error {
 	d.mu.Lock()
 	cmd, stdin, loopOn := d.cmd, d.stdin, d.loopOn
+	for _, turn := range d.turns {
+		if turn.cancelPermission != nil {
+			turn.cancelPermission()
+		}
+	}
 	d.mu.Unlock()
 	if loopOn != nil {
 		defer loopOn()
@@ -628,13 +840,19 @@ func codexTransientError(msg string) bool {
 
 // codexTurn tracks one in-flight turn on a thread.
 type codexTurn struct {
-	id       string
-	done     chan struct{}
-	stop     string
-	usage    *Usage
-	err      error
-	deltas   map[string]bool // item ids whose text deltas were already emitted
-	finished bool
+	id                                           string
+	done                                         chan struct{}
+	stop                                         string
+	usage                                        *Usage
+	err                                          error
+	deltas                                       map[string]bool // item ids whose text deltas were already emitted
+	finished                                     bool
+	permissionCtx                                context.Context
+	cancelPermission                             context.CancelFunc
+	cancelRequested, interruptSent, interruptAck bool
+	interruptErr                                 error
+	queued                                       []codexQueuedNotification
+	queuedBytes                                  int
 }
 
 // metaString extracts a string value from session metadata.
@@ -655,10 +873,10 @@ func codexConfigOverrideArgs(env map[string]string) []string {
 	if strings.TrimSpace(configJSON) == "" {
 		return nil
 	}
-	var cfg map[string]any
-	if err := json.Unmarshal([]byte(configJSON), &cfg); err != nil {
-		return nil // invalid JSON: leave the CLI with its default config
-	}
+	cfg, err := parseConfigObject([]byte(configJSON), "CODEX_CONFIG")
+	if err != nil {
+		return nil
+	} // Launch validation reports this before spawning.
 	var args []string
 	flattenCodexConfig("", cfg, &args)
 	return args

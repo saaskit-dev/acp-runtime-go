@@ -3,6 +3,8 @@ package acpruntime
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -14,6 +16,19 @@ type Connection struct {
 
 	permissionObserverMu sync.RWMutex
 	permissionObserver   func(PermissionRequest, PermissionDecision)
+	permissionGuard      func(PermissionRequest) bool
+	permissionLease      func(PermissionRequest) func() bool
+	elicitationLease     func(ElicitationRequest) func() bool
+	authoritySlots       chan struct{}
+	authorityCancels     map[uint64]authorityCancellation
+	nextAuthorityID      uint64
+	client               Client
+	stateMu              sync.RWMutex
+	initialized          bool
+	agentCapabilities    AgentCapabilities
+	authMethods          map[string]string
+	configTypes          map[string]map[string]string
+	elicitation          *elicitationState
 }
 
 // SetPermissionObserver registers a callback invoked whenever the agent sends
@@ -34,6 +49,38 @@ func (c *Connection) SetPermissionObserver(handler func(PermissionRequest, Permi
 	c.permissionObserver = handler
 }
 
+// SetPermissionGuard binds approval to the active session/turn lifecycle. It is
+// checked both before and after the host handler; false always cancels.
+func (c *Connection) SetPermissionGuard(guard func(PermissionRequest) bool) {
+	c.permissionObserverMu.Lock()
+	defer c.permissionObserverMu.Unlock()
+	c.permissionGuard = guard
+}
+func (c *Connection) SetPermissionLease(lease func(PermissionRequest) func() bool) {
+	c.permissionObserverMu.Lock()
+	defer c.permissionObserverMu.Unlock()
+	c.permissionLease = lease
+}
+func (c *Connection) permissionLeaseFor(req PermissionRequest) func() bool {
+	c.permissionObserverMu.RLock()
+	factory := c.permissionLease
+	c.permissionObserverMu.RUnlock()
+	if factory == nil {
+		return func() bool { return true }
+	}
+	lease := factory(req)
+	if lease == nil {
+		return func() bool { return false }
+	}
+	return lease
+}
+func (c *Connection) permissionAllowed(req PermissionRequest) bool {
+	c.permissionObserverMu.RLock()
+	guard := c.permissionGuard
+	c.permissionObserverMu.RUnlock()
+	return guard == nil || guard(req)
+}
+
 type ConnectionHandle struct {
 	Connection *Connection
 	Dispose    func(context.Context) error
@@ -50,9 +97,12 @@ type ConnectionFactoryInput struct {
 type ConnectionFactory func(context.Context, ConnectionFactoryInput) (ConnectionHandle, error)
 
 type Client struct {
-	Info         Implementation
-	Capabilities ClientCapabilities
-	Authority    AuthorityHandlers
+	runtimeManaged                bool
+	EnableExperimentalFeatures    bool
+	Info                          Implementation
+	Capabilities                  ClientCapabilities
+	Authority                     AuthorityHandlers
+	TerminalAuthenticationHandler TerminalAuthenticationHandler
 }
 
 // AfterReadIdle runs fn once inbound JSON-RPC has no complete line left.
@@ -73,7 +123,10 @@ func NewConnection(peer *Peer, client Client) *Connection {
 }
 
 func NewConnectionWithObservability(peer *Peer, client Client, observability ObservabilityOptions) *Connection {
-	conn := &Connection{peer: peer, observability: observability}
+	conn := &Connection{peer: peer, observability: observability, client: client, configTypes: make(map[string]map[string]string), authoritySlots: make(chan struct{}, maxConcurrentAuthorityCalls), authorityCancels: make(map[uint64]authorityCancellation)}
+	if client.runtimeManaged {
+		conn.installStartupLeases()
+	}
 	// session/request_permission is ALWAYS answered, even when the host did
 	// not register a permission authority. The ACP spec requires the client to
 	// respond; leaving it unregistered would surface as JSON-RPC -32601
@@ -81,40 +134,41 @@ func NewConnectionWithObservability(peer *Peer, client Client, observability Obs
 	// Without an authority the runtime fails closed via
 	// defaultDenyPermissionDecision.
 	peer.RegisterRequest("session/request_permission", func(ctx context.Context, raw json.RawMessage) (any, error) {
-		var req struct {
-			SessionID  string             `json:"sessionId"`
-			ToolCallID string             `json:"toolCallId"`
-			Title      string             `json:"title"`
-			Kind       string             `json:"kind"`
-			Options    []PermissionOption `json:"options"`
+		var permissionReq PermissionRequest
+		if err := json.Unmarshal(raw, &permissionReq); err != nil {
+			return nil, &RPCError{Code: -32602, Message: err.Error()}
 		}
-		if err := json.Unmarshal(raw, &req); err != nil {
-			return nil, err
-		}
-		permissionReq := PermissionRequest{
-			SessionID:  req.SessionID,
-			ToolCallID: req.ToolCallID,
-			Title:      req.Title,
-			Kind:       req.Kind,
-			Options:    req.Options,
-		}
+		lease := conn.permissionLeaseFor(permissionReq)
 		var decision PermissionDecision
-		if client.Authority.Permission != nil {
-			created, err := client.Authority.Permission(ctx, permissionReq)
+		if client.Authority.Permission != nil && conn.permissionAllowed(permissionReq) && lease() {
+			created, err := runAuthority(conn, ctx, permissionReq.SessionID, client.Authority.PermissionTimeout, func(callCtx Context) (PermissionDecision, error) {
+				return client.Authority.Permission(callCtx, cloneOwned(permissionReq))
+			})
 			if err != nil {
-				return nil, err
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					decision = PermissionDecision{Outcome: "cancelled"}
+				} else {
+					decision = defaultDenyPermissionDecision(permissionReq)
+				}
+			} else {
+				decision = validatedPermissionDecision(permissionReq, created)
 			}
-			decision = created
 		} else {
 			decision = defaultDenyPermissionDecision(permissionReq)
+		}
+		if ctx.Err() != nil || !conn.permissionAllowed(permissionReq) || !lease() {
+			decision = PermissionDecision{Outcome: "cancelled"}
 		}
 		conn.permissionObserverMu.RLock()
 		observer := conn.permissionObserver
 		conn.permissionObserverMu.RUnlock()
 		if observer != nil {
-			observer(permissionReq, decision)
+			observer(cloneOwned(permissionReq), decision)
 		}
-		return permissionResponse{Outcome: decision.Outcome, OptionID: decision.OptionID}, nil
+		if ctx.Err() != nil || !conn.permissionAllowed(permissionReq) || !lease() {
+			decision = PermissionDecision{Outcome: "cancelled"}
+		}
+		return decision, nil
 	})
 	if client.Authority.Filesystem != nil {
 		peer.RegisterRequest("fs/read_text_file", func(ctx context.Context, raw json.RawMessage) (any, error) {
@@ -144,6 +198,7 @@ func NewConnectionWithObservability(peer *Peer, client Client, observability Obs
 	if client.Authority.Terminal != nil {
 		registerTerminalHandlers(peer, client.Authority.Terminal)
 	}
+	conn.registerElicitationHandlers(client.Authority.Elicitation)
 	return conn
 }
 
@@ -249,6 +304,9 @@ func (c *Connection) SetSessionUpdateHandler(handler func(context.Context, Sessi
 			c.emitProtocolError(ctx, "session/update", raw, err)
 			return
 		}
+		if notification.Update.SessionUpdate == "config_option_update" {
+			c.rememberConfigOptions(notification.SessionID, notification.Update.ConfigOptions)
+		}
 		handler(ctx, notification)
 	})
 }
@@ -260,7 +318,7 @@ func (c *Connection) SetSessionUpdateHandler(handler func(context.Context, Sessi
 // agent no option was chosen. Both are spec-valid responses, and both deny.
 func defaultDenyPermissionDecision(req PermissionRequest) PermissionDecision {
 	for _, option := range req.Options {
-		if strings.HasPrefix(option.Kind, "reject") {
+		if option.ID != "" && (option.Kind == "reject_once" || option.Kind == "reject_always") {
 			return PermissionDecision{Outcome: "selected", OptionID: option.ID}
 		}
 	}
@@ -268,13 +326,38 @@ func defaultDenyPermissionDecision(req PermissionRequest) PermissionDecision {
 }
 
 func (c *Connection) Initialize(ctx context.Context, req InitializeRequest) (InitializeResponse, error) {
+	req.ClientCapabilities.Elicitation = elicitationCapabilities(c.client.Authority.Elicitation)
+	req.ClientCapabilities.Auth = nil
+	if c.client.TerminalAuthenticationHandler != nil {
+		req.ClientCapabilities.Auth = &AuthCapabilities{Terminal: true}
+	}
 	var resp InitializeResponse
 	err := c.peer.Call(ctx, "initialize", req, &resp)
+	if err == nil {
+		c.stateMu.Lock()
+		c.initialized = true
+		c.agentCapabilities = resp.AgentCapabilities
+		c.authMethods = make(map[string]string)
+		for _, m := range resp.AuthMethods {
+			c.authMethods[m.ID] = m.Type
+		}
+		c.stateMu.Unlock()
+	}
 	return resp, err
 }
 
 func (c *Connection) Authenticate(ctx context.Context, req AuthenticateRequest) (AuthenticateResponse, error) {
 	var resp AuthenticateResponse
+	c.stateMu.RLock()
+	kind, known := c.authMethods[req.MethodID]
+	initialized := c.initialized
+	c.stateMu.RUnlock()
+	if kind == "terminal" {
+		return resp, fmt.Errorf("terminal authentication method cannot be sent to authenticate")
+	}
+	if initialized && !known {
+		return resp, fmt.Errorf("authentication method was not advertised")
+	}
 	err := c.peer.Call(ctx, "authenticate", req, &resp)
 	return resp, err
 }
@@ -282,40 +365,90 @@ func (c *Connection) Authenticate(ctx context.Context, req AuthenticateRequest) 
 func (c *Connection) NewSession(ctx context.Context, req NewSessionRequest) (NewSessionResponse, error) {
 	var resp NewSessionResponse
 	err := c.peer.Call(ctx, "session/new", req, &resp)
+	if err == nil && strings.TrimSpace(resp.SessionID) == "" {
+		return resp, &RPCError{Code: -32603, Message: "session/new omitted required sessionId"}
+	}
+	if err == nil {
+		if resp.ConfigOptions != nil {
+			c.rememberConfigOptions(resp.SessionID, resp.ConfigOptions)
+		}
+	}
 	return resp, err
 }
 
 func (c *Connection) LoadSession(ctx context.Context, req LoadSessionRequest) (LoadSessionResponse, error) {
-	var resp LoadSessionResponse
-	err := c.peer.Call(ctx, "session/load", req, &resp)
-	return resp, err
+	if err := c.requireCapability("session/load"); err != nil {
+		return LoadSessionResponse{}, err
+	}
+	if req.SessionID == "" {
+		return LoadSessionResponse{}, fmt.Errorf("session/load requires nonempty sessionId")
+	}
+	var wire existingSessionWireResponse
+	if err := c.peer.Call(ctx, "session/load", req, &wire); err != nil {
+		return LoadSessionResponse{}, err
+	}
+	if wire.ConfigOptions != nil {
+		c.rememberConfigOptions(req.SessionID, wire.ConfigOptions)
+	}
+	return wire.normalized(req.SessionID)
 }
 
 func (c *Connection) ResumeSession(ctx context.Context, req ResumeSessionRequest) (ResumeSessionResponse, error) {
-	var resp ResumeSessionResponse
-	err := c.peer.Call(ctx, "session/resume", req, &resp)
-	return resp, err
+	if err := c.requireCapability("session/resume"); err != nil {
+		return ResumeSessionResponse{}, err
+	}
+	if req.SessionID == "" {
+		return ResumeSessionResponse{}, fmt.Errorf("session/resume requires nonempty sessionId")
+	}
+	var wire existingSessionWireResponse
+	if err := c.peer.Call(ctx, "session/resume", req, &wire); err != nil {
+		return ResumeSessionResponse{}, err
+	}
+	if wire.ConfigOptions != nil {
+		c.rememberConfigOptions(req.SessionID, wire.ConfigOptions)
+	}
+	return wire.normalized(req.SessionID)
 }
 
 func (c *Connection) ForkSession(ctx context.Context, req ForkSessionRequest) (ForkSessionResponse, error) {
+	if !c.client.EnableExperimentalFeatures {
+		return ForkSessionResponse{}, fmt.Errorf("session/fork is experimental; enable explicitly")
+	}
 	var resp ForkSessionResponse
 	err := c.peer.Call(ctx, "session/fork", req, &resp)
 	return resp, err
 }
 
 func (c *Connection) ListSessions(ctx context.Context, req ListSessionsRequest) (ListSessionsResponse, error) {
+	if err := c.requireCapability("session/list"); err != nil {
+		return ListSessionsResponse{}, err
+	}
 	var resp ListSessionsResponse
 	err := c.peer.Call(ctx, "session/list", req, &resp)
 	return resp, err
 }
 
 func (c *Connection) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, error) {
-	var resp PromptResponse
-	err := c.peer.Call(ctx, "session/prompt", req, &resp)
-	return resp, err
+	return c.promptWithBoundary(ctx, req, nil)
+}
+func (c *Connection) promptWithBoundary(ctx context.Context, req PromptRequest, boundary func()) (PromptResponse, error) {
+	var response PromptResponse
+	params, err := json.Marshal(req)
+	if err != nil {
+		return response, err
+	}
+	raw, err := c.peer.callRawBoundary(ctx, "session/prompt", params, boundary)
+	if err != nil {
+		return response, err
+	}
+	if err = json.Unmarshal(raw, &response); err != nil {
+		return response, err
+	}
+	return response, nil
 }
 
 func (c *Connection) Cancel(ctx context.Context, req CancelRequest) error {
+	c.cancelSessionAuthorities(req.SessionID)
 	return c.peer.Notify(ctx, "session/cancel", req)
 }
 
@@ -326,11 +459,25 @@ func (c *Connection) SetSessionMode(ctx context.Context, req SetSessionModeReque
 
 func (c *Connection) SetSessionConfigOption(ctx context.Context, req SetSessionConfigOptionRequest) (SetSessionConfigOptionResponse, error) {
 	var resp SetSessionConfigOptionResponse
+	if _, boolean := req.Value.(bool); boolean {
+		c.stateMu.RLock()
+		kind := c.configTypes[req.SessionID][req.OptionID]
+		c.stateMu.RUnlock()
+		if kind != "boolean" {
+			return resp, fmt.Errorf("boolean config option was not advertised")
+		}
+	}
 	err := c.peer.Call(ctx, "session/set_config_option", req, &resp)
+	if err == nil && resp.ConfigOptions != nil {
+		c.rememberConfigOptions(req.SessionID, *resp.ConfigOptions)
+	}
 	return resp, err
 }
 
 func (c *Connection) CloseSession(ctx context.Context, req CloseSessionRequest) error {
+	if err := c.requireCapability("session/close"); err != nil {
+		return err
+	}
 	var resp CloseSessionResponse
 	return c.peer.Call(ctx, "session/close", req, &resp)
 }
@@ -338,12 +485,18 @@ func (c *Connection) CloseSession(ctx context.Context, req CloseSessionRequest) 
 // DeleteSession deletes a session's persistent history (session/delete). Unlike
 // CloseSession, this removes the session from the agent's storage entirely.
 func (c *Connection) DeleteSession(ctx context.Context, req DeleteSessionRequest) error {
+	if err := c.requireCapability("session/delete"); err != nil {
+		return err
+	}
 	var resp DeleteSessionResponse
 	return c.peer.Call(ctx, "session/delete", req, &resp)
 }
 
 // Logout asks the agent to discard cached credentials (logout).
 func (c *Connection) Logout(ctx context.Context, req LogoutRequest) error {
+	if err := c.requireCapability("logout"); err != nil {
+		return err
+	}
 	var resp LogoutResponse
 	return c.peer.Call(ctx, "logout", req, &resp)
 }
@@ -352,6 +505,9 @@ func defaultClient(options RuntimeOptions, handlers AuthorityHandlers) Client {
 	info := options.ClientInfo
 	if info.Name == "" {
 		info = Implementation{Name: "acp-runtime-go", Version: "0.1.0"}
+	}
+	if handlers.PermissionTimeout == 0 {
+		handlers.PermissionTimeout = options.AuthorityHandlers.PermissionTimeout
 	}
 	if handlers.Permission == nil {
 		handlers.Permission = options.AuthorityHandlers.Permission
@@ -362,10 +518,16 @@ func defaultClient(options RuntimeOptions, handlers AuthorityHandlers) Client {
 	if handlers.Terminal == nil {
 		handlers.Terminal = options.AuthorityHandlers.Terminal
 	}
+	handlers.Elicitation = mergeElicitationHandlers(handlers.Elicitation, options.AuthorityHandlers.Elicitation)
 	return Client{
-		Info: info,
+		Info:                          info,
+		TerminalAuthenticationHandler: options.TerminalAuthenticationHandler,
+		EnableExperimentalFeatures:    options.EnableExperimentalFeatures,
 		Capabilities: ClientCapabilities{
-			Terminal: handlers.Terminal != nil,
+			Session:     &ClientSessionCapabilities{ConfigOptions: &SessionConfigOptionsCapabilities{Boolean: &EmptyCapability{}}},
+			Auth:        terminalAuthenticationCapabilities(options.TerminalAuthenticationHandler),
+			Elicitation: elicitationCapabilities(handlers.Elicitation),
+			Terminal:    handlers.Terminal != nil,
 			FS: FilesystemCapabilities{
 				ReadTextFile:  handlers.Filesystem != nil,
 				WriteTextFile: handlers.Filesystem != nil,
@@ -396,11 +558,6 @@ func envSlice(env map[string]string) []string {
 		out = append(out, key+"="+value)
 	}
 	return out
-}
-
-type permissionResponse struct {
-	Outcome  string `json:"outcome"`
-	OptionID string `json:"optionId,omitempty"`
 }
 
 type readTextFileResponse struct {
@@ -449,4 +606,9 @@ func shouldCaptureProtocolErrorRaw(mode string) bool {
 	default:
 		return false
 	}
+}
+
+func (c *Connection) installStartupLeases() {
+	c.SetPermissionLease(func(PermissionRequest) func() bool { return func() bool { return false } })
+	c.SetElicitationLease(func(req ElicitationRequest) func() bool { return func() bool { return req.SessionID == "" } })
 }

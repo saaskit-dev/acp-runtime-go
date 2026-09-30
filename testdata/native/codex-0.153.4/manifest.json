@@ -1,0 +1,21 @@
+{
+  "provider": "codex-cli",
+  "version": "0.153.4",
+  "package": "@openai/codex@0.153.4",
+  "source": "https://registry.npmjs.org/@openai/codex/-/codex-0.153.4.tgz",
+  "package_integrity": "sha512-wbHDmit7S/YvBGVX1DQmk13xtWblZ2cApeJ/pB7xDZ10Cna+DZc5ij7f0F4OxdsXN4FW1oLT48OpogUI1+8Y2w==",
+  "binary_sha256": "56ef98ab4032d317ab26e9b5e5a175650717351edb16ed9cde0cb6d1734d62da",
+  "generation": "app-server generate-json-schema (without --experimental)",
+  "files_sha256": {
+    "TurnInterruptParams.json": "6dff382dae73d1dbc58406ed045605f647e7a49660e2540fbd2c6c24d60c5f2b",
+    "TurnInterruptResponse.json": "531de6be06fe979b5963f249bab82498a175e614bf65ac12fb2e849dfe60bcf1",
+    "TurnStartResponse.json": "6fc49c3e5d0ce11a3a109ae194619b04d6e3ff98fa29bac683fdb754608958be",
+    "TurnCompletedNotification.json": "78af2a37391e8e669a4020cb58593e4d3e378756ced79d5fec72374fa69fb94b",
+    "ErrorNotification.json": "d77732536ef8864799e4fbb5bf6965a9f1970a6195e523f144252a82287c08e7",
+    "RawResponseCompletedNotification.json": "aba140e87952c900f96e0308a8849d3e313d985de1f1aa2b77f193884a76357c",
+    "CommandExecutionRequestApprovalParams.json": "16a71816c2d66e319c2c4aa83dd636dfdc43c61e72b6d5475e421ce08d8e6558",
+    "CommandExecutionRequestApprovalResponse.json": "6d0767113e22f311381809b6b236b0dde2b99b01992879c26bf7b1ea0e003cb7",
+    "FileChangeRequestApprovalParams.json": "13848b26814c286ad6425a20d01c1691c86790e1f9e2529399677a8a22fe0d18",
+    "FileChangeRequestApprovalResponse.json": "b95b03ee6be674e25cee2e863cc135a28620e1070addd2f34685aadee27cde08"
+  }
+}

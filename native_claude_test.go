@@ -201,8 +201,8 @@ func TestClaudeNativeTransportEndToEnd(t *testing.T) {
 	if found == nil {
 		t.Fatalf("tool call toolu_1 missing; got %+v", toolCalls)
 	}
-	if found.Title != "Bash" || found.Kind != "execute_command" || found.Status != "completed" {
-		t.Fatalf("tool call = %+v, want title=Bash kind=execute_command status=completed", found)
+	if found.Title != "Bash" || found.Kind != "execute" || found.Status != "completed" {
+		t.Fatalf("tool call = %+v, want title=Bash kind=execute status=completed", found)
 	}
 }
 

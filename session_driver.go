@@ -41,23 +41,31 @@ type acpSessionDriver struct {
 
 	sessionID string
 
-	mu            sync.RWMutex
-	status        string
-	capabilities  RuntimeCapabilities
-	diagnostics   RuntimeDiagnostics
-	metadata      RuntimeSessionMetadata
-	thread        []ThreadEntry
-	toolCalls     map[string]ToolCallSnapshot
-	operations    map[string]Operation
-	permissions   map[string]PermissionRequestSnapshot
-	currentTurn   *activeTurn
-	turnSeq       int
-	orphanGen     uint64
-	orphanID      string
-	orphanMessage string
-	rawConfig     map[string]any
-	queuePolicy   QueuePolicy
-	updates       chan SessionNotification
+	mu                     sync.RWMutex
+	status                 string
+	capabilities           RuntimeCapabilities
+	diagnostics            RuntimeDiagnostics
+	metadata               RuntimeSessionMetadata
+	thread                 []ThreadEntry
+	toolCalls              map[string]ToolCallSnapshot
+	operations             map[string]Operation
+	permissions            map[string]PermissionRequestSnapshot
+	currentTurn            *activeTurn
+	turnSeq                int
+	orphanGen              uint64
+	replaySeq              uint64
+	replayMessageID        string
+	orphanID               string
+	orphanMessage          string
+	freshConnectionPerTurn bool
+	rawConfig              map[string]any
+	queuePolicy            QueuePolicy
+	updates                chan SessionNotification
+	cleanupMu              contextLock
+	disposed               bool
+	hookMu                 sync.Mutex
+	hookQueue              []func()
+	hookRunning            bool
 
 	// Only authoritative snapshots outside overlapping config changes may
 	// suppress initial-config RPCs. All fields are protected by mu.
@@ -88,49 +96,58 @@ type activeTurn struct {
 	dropIntermediate bool
 	// finishOnce ensures Close/Delete racing with runPrompt only terminalizes
 	// the turn once, so completion/events channels are closed exactly once.
-	finishOnce sync.Once
-	startedAt  time.Time
+	finishOnce     sync.Once
+	eventMu        sync.Mutex
+	terminal       bool
+	remoteTerminal bool
+	startedAt      time.Time
 	// cancelTimer is set by CancelTurn; stopped in finishTurn.
 	cancelTimer *time.Timer
 }
 
 type sessionBootstrap struct {
-	Agent              Agent
-	CWD                string
-	MCPServers         []MCPServer
-	Connection         *Connection
-	Dispose            func(context.Context) error
-	InitializeResponse InitializeResponse
-	SessionResponse    NewSessionResponse
-	Profile            AgentProfile
-	QueuePolicy        QueuePolicy
-	Hooks              RuntimeHooks
-	ReadModelLimits    ReadModelLimits
+	Agent                  Agent
+	CWD                    string
+	MCPServers             []MCPServer
+	Connection             *Connection
+	Dispose                func(context.Context) error
+	InitializeResponse     InitializeResponse
+	SessionResponse        NewSessionResponse
+	Profile                AgentProfile
+	QueuePolicy            QueuePolicy
+	Hooks                  RuntimeHooks
+	ReadModelLimits        ReadModelLimits
+	Replay                 *sessionReplayBuffer
+	FreshConnectionPerTurn bool
 }
 
 func newACPSessionDriver(bootstrap sessionBootstrap) *acpSessionDriver {
+	bootstrap.Agent = cloneOwned(bootstrap.Agent)
+	bootstrap.MCPServers = cloneOwned(bootstrap.MCPServers)
+	bootstrap.SessionResponse = cloneOwned(bootstrap.SessionResponse)
 	maxThread, maxToolCalls, maxPermissions := resolveReadModelLimits(bootstrap.ReadModelLimits)
 	driver := &acpSessionDriver{
-		connection:     bootstrap.Connection,
-		dispose:        bootstrap.Dispose,
-		agent:          bootstrap.Agent,
-		cwd:            bootstrap.CWD,
-		mcpServers:     append([]MCPServer(nil), bootstrap.MCPServers...),
-		profile:        bootstrap.Profile,
-		hooks:          bootstrap.Hooks,
-		sessionID:      bootstrap.SessionResponse.SessionID,
-		status:         "ready",
-		capabilities:   capabilitiesFromInitialize(bootstrap.InitializeResponse),
-		metadata:       metadataFromSessionResponse(bootstrap.SessionResponse),
-		toolCalls:      map[string]ToolCallSnapshot{},
-		operations:     map[string]Operation{},
-		permissions:    map[string]PermissionRequestSnapshot{},
-		rawConfig:      rawConfigFromMetadata(metadataFromSessionResponse(bootstrap.SessionResponse)),
-		queuePolicy:    bootstrap.QueuePolicy,
-		updates:        make(chan SessionNotification, orphanUpdatesBuffer),
-		maxThread:      maxThread,
-		maxToolCalls:   maxToolCalls,
-		maxPermissions: maxPermissions,
+		connection:             bootstrap.Connection,
+		freshConnectionPerTurn: bootstrap.FreshConnectionPerTurn,
+		dispose:                bootstrap.Dispose,
+		agent:                  bootstrap.Agent,
+		cwd:                    bootstrap.CWD,
+		mcpServers:             append([]MCPServer(nil), bootstrap.MCPServers...),
+		profile:                bootstrap.Profile,
+		hooks:                  bootstrap.Hooks,
+		sessionID:              bootstrap.SessionResponse.SessionID,
+		status:                 "ready",
+		capabilities:           capabilitiesFromInitialize(bootstrap.InitializeResponse),
+		metadata:               metadataFromSessionResponse(bootstrap.SessionResponse),
+		toolCalls:              map[string]ToolCallSnapshot{},
+		operations:             map[string]Operation{},
+		permissions:            map[string]PermissionRequestSnapshot{},
+		rawConfig:              rawConfigFromMetadata(metadataFromSessionResponse(bootstrap.SessionResponse)),
+		queuePolicy:            bootstrap.QueuePolicy,
+		updates:                make(chan SessionNotification, orphanUpdatesBuffer),
+		maxThread:              maxThread,
+		maxToolCalls:           maxToolCalls,
+		maxPermissions:         maxPermissions,
 	}
 	driver.metadata.SessionID = bootstrap.SessionResponse.SessionID
 	driver.configOptionsCurrent = bootstrap.SessionResponse.ConfigOptions != nil
@@ -149,8 +166,17 @@ func newACPSessionDriver(bootstrap sessionBootstrap) *acpSessionDriver {
 				fmt.Sprintf("native %s engine version %s is below the verified floor %s", engine, version, floor))
 		}
 	}
-	bootstrap.Connection.SetSessionUpdateHandler(func(ctx context.Context, notification SessionNotification) {
-		driver.handleSessionUpdate(notification)
+	if bootstrap.Replay != nil {
+		if err := bootstrap.Replay.attach(driver, bootstrap.SessionResponse); err != nil {
+			driver.status = "tainted"
+			driver.diagnostics.Warnings = append(driver.diagnostics.Warnings, err.Error())
+		}
+	} else {
+		bootstrap.Connection.SetSessionUpdateHandler(func(ctx context.Context, notification SessionNotification) { driver.handleSessionUpdate(notification) })
+	}
+	bootstrap.Connection.SetPermissionLease(func(req PermissionRequest) func() bool { return driver.interactionLease(req.SessionID, false, true) })
+	bootstrap.Connection.SetElicitationLease(func(req ElicitationRequest) func() bool {
+		return driver.interactionLease(req.SessionID, req.SessionID == "", false)
 	})
 	bootstrap.Connection.SetPermissionObserver(func(req PermissionRequest, decision PermissionDecision) {
 		driver.recordPermission(req, decision)
@@ -182,6 +208,10 @@ func resolveReadModelLimits(limits ReadModelLimits) (thread, tools, permissions 
 func (d *acpSessionDriver) recordPermission(req PermissionRequest, decision PermissionDecision) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.status == "closed" || d.status == "tainted" {
+		return
+	}
+	req = cloneOwned(req)
 	id := req.ToolCallID
 	if id == "" {
 		d.turnSeq++
@@ -268,7 +298,7 @@ func (d *acpSessionDriver) replaceConfigOptionsLocked(options []SessionConfigOpt
 	for _, option := range options {
 		next = append(next, runtimeConfigOptionFromACP(option))
 	}
-	d.metadata.AgentConfigOptions = next
+	d.metadata.AgentConfigOptions = cloneOwned(next)
 	d.rawConfig = rawConfigFromMetadata(d.metadata)
 	// ponytail: uncorrelated in-flight notifications stay untrusted; provider
 	// revisions could allow reuse without an idle notification/full response.
@@ -276,16 +306,31 @@ func (d *acpSessionDriver) replaceConfigOptionsLocked(options []SessionConfigOpt
 }
 
 func (d *acpSessionDriver) Close(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, sessionCleanupTimeout)
+	defer cancel()
+	if err := d.cleanupMu.LockContext(ctx); err != nil {
+		return err
+	}
+	defer d.cleanupMu.Unlock()
+	if d.disposed {
+		return nil
+	}
 	active, orphan := d.beginClose()
 	if orphan != nil {
 		d.sendOrphanUpdate(*orphan)
 	}
 	d.finishInFlightTurn(ctx, active, "session.close")
-	_ = d.connection.CloseSession(ctx, CloseSessionRequest{SessionID: d.sessionID})
+	if d.capabilities.CanCloseSession {
+		_ = d.connection.CloseSession(ctx, CloseSessionRequest{SessionID: d.sessionID})
+	}
 	var disposeErr error
 	if d.dispose != nil {
 		disposeErr = d.dispose(ctx)
 	}
+	if disposeErr == nil {
+		d.disposed = true
+	}
+	d.recordCleanupResult(disposeErr)
 	d.emitHookSession(RuntimeSessionEvent{Type: "closed", SessionID: d.sessionID, AgentType: d.agent.Type, Err: disposeErr})
 	return disposeErr
 }
@@ -295,6 +340,15 @@ func (d *acpSessionDriver) Close(ctx context.Context) error {
 // implement session/delete will return an error, which the caller may treat as
 // non-fatal (the session is still closed locally).
 func (d *acpSessionDriver) Delete(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, sessionCleanupTimeout)
+	defer cancel()
+	if err := d.cleanupMu.LockContext(ctx); err != nil {
+		return err
+	}
+	defer d.cleanupMu.Unlock()
+	if d.disposed {
+		return nil
+	}
 	active, orphan := d.beginClose()
 	if orphan != nil {
 		d.sendOrphanUpdate(*orphan)
@@ -305,6 +359,10 @@ func (d *acpSessionDriver) Delete(ctx context.Context) error {
 	if d.dispose != nil {
 		disposeErr = d.dispose(ctx)
 	}
+	if disposeErr == nil {
+		d.disposed = true
+	}
+	d.recordCleanupResult(disposeErr)
 	err := errors.Join(deleteErr, disposeErr)
 	d.emitHookSession(RuntimeSessionEvent{Type: "deleted", SessionID: d.sessionID, AgentType: d.agent.Type, Err: err})
 	return err
@@ -328,12 +386,14 @@ func (d *acpSessionDriver) finishInFlightTurn(ctx context.Context, active *activ
 	}
 	// Best-effort cooperative cancel before local terminalization. Agents may
 	// ignore session/cancel; finishTurn still unblocks host consumers.
-	_ = d.connection.Cancel(ctx, CancelRequest{SessionID: d.sessionID})
 	d.finishTurn(active, TurnCompletion{}, &RuntimeError{
 		Kind: ErrorSessionClosed,
 		Op:   op,
 		Msg:  "session closed during turn",
 	})
+	if d.connection != nil {
+		_ = d.connection.Cancel(ctx, CancelRequest{SessionID: d.sessionID})
+	}
 }
 
 // Logout asks the agent to discard cached credentials (logout). Unlike
@@ -354,20 +414,30 @@ const cancelTurnLocalTimeout = 15 * time.Second
 
 func (d *acpSessionDriver) CancelTurn(ctx context.Context, turnID string) (bool, error) {
 	d.mu.Lock()
+	if d.status == "closed" || d.status == "tainted" {
+		d.mu.Unlock()
+		return false, sessionClosedError("session.cancel_turn")
+	}
 	active := d.currentTurn
 	if active == nil || active.id != turnID {
 		d.mu.Unlock()
 		return false, nil
 	}
+	if d.status == "cancelling" {
+		d.mu.Unlock()
+		return true, nil
+	}
+	d.status = "cancelling"
 	// Arm a local timeout once per cancel so repeated CancelTurn calls do not
 	// stack timers. The timer is cleared in finishTurn.
 	if active.cancelTimer == nil {
 		turn := active
 		active.cancelTimer = time.AfterFunc(cancelTurnLocalTimeout, func() {
+			d.quarantineTurn(turn)
 			d.finishTurn(turn, TurnCompletion{}, &RuntimeError{
 				Kind: ErrorTurnCancelled,
 				Op:   "session.cancel_turn",
-				Msg:  "turn cancelled locally after agent did not stop",
+				Msg:  "turn cancelled locally; transport discarded because remote stop was unconfirmed",
 			})
 		})
 	}
@@ -375,7 +445,7 @@ func (d *acpSessionDriver) CancelTurn(ctx context.Context, turnID string) (bool,
 	if err := d.connection.Cancel(ctx, CancelRequest{SessionID: d.sessionID}); err != nil {
 		return false, err
 	}
-	d.emitHookTurn(RuntimeTurnEvent{Type: "cancelled", SessionID: d.sessionID, TurnID: turnID})
+	d.emitHookTurn(RuntimeTurnEvent{Type: "cancel_requested", SessionID: d.sessionID, TurnID: turnID})
 	return true, nil
 }
 
@@ -415,7 +485,7 @@ func (d *acpSessionDriver) SetAgentConfigOption(ctx context.Context, id string, 
 		return err
 	}
 	d.mu.Lock()
-	d.rawConfig[id] = value
+	d.rawConfig[id] = cloneOwned(value)
 	if resp.ConfigOptions != nil {
 		d.replaceConfigOptionsLocked(*resp.ConfigOptions)
 		// Local response order cannot prove freshness after overlap or a
@@ -436,7 +506,7 @@ func (d *acpSessionDriver) SetAgentConfigOption(ctx context.Context, id string, 
 
 func (d *acpSessionDriver) StartTurn(ctx context.Context, prompt RuntimePrompt) TurnHandle {
 	d.mu.Lock()
-	if d.status == "closed" {
+	if d.status == "closed" || d.status == "tainted" {
 		d.mu.Unlock()
 		return closedTurnHandle(&RuntimeError{Kind: ErrorSessionClosed, Op: "session.start_turn", Msg: "session is closed"})
 	}
@@ -472,13 +542,20 @@ func (d *acpSessionDriver) StartTurn(ctx context.Context, prompt RuntimePrompt) 
 	}
 	d.emitTurnEvent(active, TurnEvent{Type: "started", TurnID: turnID})
 	d.emitHookTurn(RuntimeTurnEvent{Type: "started", SessionID: d.sessionID, TurnID: turnID})
-	go d.runPrompt(ctx, active, prompt)
+	go d.runPrompt(ctx, active, cloneOwned(prompt))
 	return TurnHandle{TurnID: turnID, Events: active.events, Completion: active.completion}
 }
 
 func (d *acpSessionDriver) runPrompt(ctx context.Context, active *activeTurn, prompt RuntimePrompt) {
-	resp, err := d.connection.Prompt(ctx, PromptRequest{SessionID: d.sessionID, Prompt: mapPrompt(prompt)})
+	resp, err := d.connection.promptWithBoundary(ctx, PromptRequest{SessionID: d.sessionID, Prompt: mapPrompt(prompt)}, func() {
+		d.mu.Lock()
+		active.remoteTerminal = true
+		d.mu.Unlock()
+	})
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, io.ErrClosedPipe) {
+			d.quarantineTurn(active)
+		}
 		// A closed pipe mid-turn almost always means the agent process died
 		// (crash, OOM kill, stray signal). Surface that as an explicit
 		// process-kind error instead of a bare io.ErrClosedPipe, so hosts can
@@ -491,22 +568,16 @@ func (d *acpSessionDriver) runPrompt(ctx context.Context, active *activeTurn, pr
 		d.finishTurn(active, TurnCompletion{}, err)
 		return
 	}
-	// session/prompt returning is not the end of inbound JSON. Claude may have
-	// already written agent_message_chunk lines after the result; snapshot
-	// OutputText only after the read loop has no complete line left. No timer:
-	// a grace period still drops slower chunks. Keep currentTurn until then so
-	// those lines fold into outputText instead of becoming orphans.
-	settle := func() {
-		d.mu.RLock()
-		outputText := active.outputText.String()
-		d.mu.RUnlock()
-		d.finishTurn(active, TurnCompletion{TurnID: active.id, OutputText: outputText, StopReason: resp.StopReason, Usage: resp.Usage}, nil)
+	// A protocol terminal response is the barrier. The peer already processed
+	// preceding notifications and reverse requests. Read-idle is not proof of a
+	// remote operation ending, and post-terminal turn updates are nonconforming.
+	d.mu.RLock()
+	outputText := active.outputText.String()
+	d.mu.RUnlock()
+	if d.freshConnectionPerTurn {
+		d.retireTurnTransport(active, "closed")
 	}
-	if d.connection != nil {
-		d.connection.AfterReadIdle(settle)
-		return
-	}
-	settle()
+	d.finishTurn(active, TurnCompletion{TurnID: active.id, OutputText: outputText, StopReason: resp.StopReason, Usage: resp.Usage}, nil)
 }
 
 // emitTurnEvent non-blockingly delivers an intermediate event. A full buffer
@@ -516,12 +587,22 @@ func (d *acpSessionDriver) emitTurnEvent(active *activeTurn, event TurnEvent) {
 	if active == nil {
 		return
 	}
+	active.eventMu.Lock()
+	if active.terminal {
+		active.eventMu.Unlock()
+		return
+	}
+	dropped := false
 	select {
-	case active.events <- event:
+	case active.events <- cloneOwned(event):
 	default:
-		if d.hooks.OnEventDrop != nil {
+		dropped = true
+	}
+	active.eventMu.Unlock()
+	if dropped && d.hooks.OnEventDrop != nil {
+		d.enqueueHook(func() {
 			d.hooks.OnEventDrop(RuntimeEventDrop{SessionID: d.sessionID, TurnID: active.id, EventType: event.Type})
-		}
+		})
 	}
 }
 
@@ -537,7 +618,7 @@ func (d *acpSessionDriver) finishTurn(active *activeTurn, completion TurnComplet
 		}
 		if d.currentTurn == active {
 			d.currentTurn = nil
-			if d.status != "closed" {
+			if d.status != "closed" && d.status != "tainted" {
 				d.status = "ready"
 			}
 		}
@@ -548,6 +629,8 @@ func (d *acpSessionDriver) finishTurn(active *activeTurn, completion TurnComplet
 		}
 		d.mu.Unlock()
 
+		active.eventMu.Lock()
+		active.terminal = true
 		// Completion first: Session.Run only waits on Completion and may never
 		// drain Events. Delivering completion before the terminal event keeps
 		// Run unblocked even when the events buffer is full of intermediates.
@@ -572,6 +655,7 @@ func (d *acpSessionDriver) finishTurn(active *activeTurn, completion TurnComplet
 		}
 		close(active.events)
 		close(active.completion)
+		active.eventMu.Unlock()
 
 		eventType := "completed"
 		if err != nil {
@@ -597,13 +681,13 @@ func (d *acpSessionDriver) finishTurn(active *activeTurn, completion TurnComplet
 
 func (d *acpSessionDriver) emitHookTurn(event RuntimeTurnEvent) {
 	if d.hooks.OnTurnEvent != nil {
-		d.hooks.OnTurnEvent(event)
+		d.enqueueHook(func() { d.hooks.OnTurnEvent(event) })
 	}
 }
 
 func (d *acpSessionDriver) emitHookSession(event RuntimeSessionEvent) {
 	if d.hooks.OnSessionEvent != nil {
-		d.hooks.OnSessionEvent(event)
+		d.enqueueHook(func() { d.hooks.OnSessionEvent(event) })
 	}
 }
 
@@ -670,9 +754,17 @@ func (d *acpSessionDriver) handleSessionUpdate(notification SessionNotification)
 	if notification.SessionID != "" && notification.SessionID != d.sessionID {
 		return
 	}
+	notification = cloneOwned(notification)
 	update := notification.Update
 	d.mu.Lock()
+	if d.status == "closed" || d.status == "tainted" {
+		d.mu.Unlock()
+		return
+	}
 	active := d.currentTurn
+	if active != nil && active.remoteTerminal {
+		active = nil
+	}
 	switch update.SessionUpdate {
 	case "agent_message_chunk", "agent_message", "message":
 		if active != nil {
@@ -712,7 +804,11 @@ func (d *acpSessionDriver) handleSessionUpdate(notification SessionNotification)
 			if update.Status != nil {
 				status = *update.Status
 			}
-			snapshot := ToolCallSnapshot{ID: id, Title: title, Kind: kind, Status: status, Content: []ContentBlock(update.Content), RawInput: update.RawInput, RawOutput: update.RawOutput, UpdatedAt: time.Now()}
+			name := ""
+			if update.Name != nil {
+				name = *update.Name
+			}
+			snapshot := ToolCallSnapshot{Name: name, ID: id, Title: title, Kind: kind, Status: status, Content: []ContentBlock(update.Content), RawInput: update.RawInput, RawOutput: update.RawOutput, UpdatedAt: time.Now()}
 			d.toolCalls[id] = snapshot
 			d.operations[id] = Operation{ID: id, Kind: d.profile.MapOperationKind(kind), Phase: operationPhase(status), Title: title, Target: inferOperationTarget(update), UpdatedAt: time.Now()}
 			d.pruneToolCallsLocked()
@@ -721,6 +817,9 @@ func (d *acpSessionDriver) handleSessionUpdate(notification SessionNotification)
 		id := update.ToolCallID
 		if id != "" {
 			snapshot := d.toolCalls[id]
+			if update.Name != nil {
+				snapshot.Name = *update.Name
+			}
 			if update.Title != nil {
 				snapshot.Title = *update.Title
 			}
@@ -767,7 +866,11 @@ func (d *acpSessionDriver) handleSessionUpdate(notification SessionNotification)
 	case "plan":
 		d.emitTurnEvent(active, TurnEvent{Type: "plan_updated", TurnID: active.id, Plan: update.Entries})
 	case "usage_update":
-		d.emitTurnEvent(active, TurnEvent{Type: "usage_updated", TurnID: active.id, Usage: update.Usage})
+		var contextUsage *ContextUsage
+		if update.Used != nil && update.Size != nil {
+			contextUsage = &ContextUsage{Used: *update.Used, Size: *update.Size, Cost: cloneOwned(update.Cost)}
+		}
+		d.emitTurnEvent(active, TurnEvent{Type: "usage_updated", TurnID: active.id, Usage: update.Usage, ContextUsage: contextUsage})
 	case "session_info_update", "available_commands_update":
 		d.emitTurnEvent(active, TurnEvent{Type: "metadata_updated", TurnID: active.id})
 	case "tool_call", "tool_call_update":
@@ -797,13 +900,11 @@ func (d *acpSessionDriver) sendOrphanUpdate(notification SessionNotification) {
 		return
 	}
 	select {
-	case d.updates <- notification:
+	case d.updates <- cloneOwned(notification):
 	default:
 		if d.hooks.OnEventDrop != nil {
-			d.hooks.OnEventDrop(RuntimeEventDrop{
-				SessionID: d.sessionID,
-				TurnID:    notification.UpdateID,
-				EventType: firstNonEmpty(notification.Update.SessionUpdate, "orphan_terminal"),
+			d.enqueueHook(func() {
+				d.hooks.OnEventDrop(RuntimeEventDrop{SessionID: d.sessionID, TurnID: notification.UpdateID, EventType: firstNonEmpty(notification.Update.SessionUpdate, "orphan_terminal")})
 			})
 		}
 	}
@@ -963,15 +1064,12 @@ func promptText(prompt RuntimePrompt) string {
 func (d *acpSessionDriver) Snapshot() RuntimeSnapshot {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	rawConfig := map[string]any{}
-	for key, value := range d.rawConfig {
-		rawConfig[key] = value
-	}
+	rawConfig := cloneOwned(d.rawConfig)
 	return RuntimeSnapshot{
 		Version:       RuntimeSnapshotVersion,
-		Agent:         d.agent,
+		Agent:         cloneOwned(d.agent),
 		CWD:           d.cwd,
-		MCPServers:    append([]MCPServer(nil), d.mcpServers...),
+		MCPServers:    cloneOwned(d.mcpServers),
 		Session:       RuntimeSnapshotSession{ID: d.sessionID},
 		CurrentModeID: d.metadata.CurrentModeID,
 		RawConfig:     rawConfig,
@@ -987,25 +1085,25 @@ func (d *acpSessionDriver) Status() string {
 func (d *acpSessionDriver) Capabilities() RuntimeCapabilities {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	return d.capabilities
+	return cloneOwned(d.capabilities)
 }
 
 func (d *acpSessionDriver) Diagnostics() RuntimeDiagnostics {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	return d.diagnostics
+	return cloneOwned(d.diagnostics)
 }
 
 func (d *acpSessionDriver) Metadata() RuntimeSessionMetadata {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	return d.metadata
+	return cloneOwned(d.metadata)
 }
 
 func (d *acpSessionDriver) ThreadEntries() []ThreadEntry {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	return append([]ThreadEntry(nil), d.thread...)
+	return cloneOwned(d.thread)
 }
 
 func (d *acpSessionDriver) ToolCalls() []ToolCallSnapshot {
@@ -1013,7 +1111,7 @@ func (d *acpSessionDriver) ToolCalls() []ToolCallSnapshot {
 	defer d.mu.RUnlock()
 	out := make([]ToolCallSnapshot, 0, len(d.toolCalls))
 	for _, item := range d.toolCalls {
-		out = append(out, item)
+		out = append(out, cloneOwned(item))
 	}
 	return out
 }
@@ -1023,7 +1121,7 @@ func (d *acpSessionDriver) Operations() []Operation {
 	defer d.mu.RUnlock()
 	out := make([]Operation, 0, len(d.operations))
 	for _, item := range d.operations {
-		out = append(out, item)
+		out = append(out, cloneOwned(item))
 	}
 	return out
 }
@@ -1033,7 +1131,7 @@ func (d *acpSessionDriver) PermissionRequests() []PermissionRequestSnapshot {
 	defer d.mu.RUnlock()
 	out := make([]PermissionRequestSnapshot, 0, len(d.permissions))
 	for _, item := range d.permissions {
-		out = append(out, item)
+		out = append(out, cloneOwned(item))
 	}
 	return out
 }
