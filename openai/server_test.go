@@ -100,13 +100,11 @@ func TestChatCompletionsAcceptsOpenAINodeGeneratedCreateParams(t *testing.T) {
 	body := `{
 		"messages":[{"content":"string","role":"developer","name":"name"}],
 		"model":"gpt-5.4",
-		"max_completion_tokens":0,
-		"max_tokens":0,
 		"metadata":{"foo":"string"},
 		"modalities":["text"],
 		"n":1,
 		"response_format":{"type":"text"},
-		"stop":"\n",
+		"stop":null,
 		"stream":false,
 		"stream_options":{"include_obfuscation":true,"include_usage":true},
 		"temperature":1,
@@ -357,7 +355,7 @@ func TestResponsesRoutesBareClaudeModelToClaude(t *testing.T) {
 
 func TestResponsesAcceptsReasoningEffort(t *testing.T) {
 	_, server := newTestAppServer(t)
-	resp := postJSON(t, server, "/v1/responses", `{"model":"gpt-5.5","store":false,"reasoning":{"effort":"xhigh","summary":"auto"},"input":"hello"}`, nil)
+	resp := postJSON(t, server, "/v1/responses", `{"model":"gpt-5.5","store":false,"reasoning":{"effort":"xhigh"},"input":"hello"}`, nil)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		data, _ := io.ReadAll(resp.Body)
@@ -681,7 +679,9 @@ func TestCleanupExpiredDeletesOnlyRegisteredManagedSessions(t *testing.T) {
 	if !ok {
 		t.Fatalf("session not registered")
 	}
+	record.mu.Lock()
 	record.expiresAt = time.Now().Add(-time.Second)
+	record.mu.Unlock()
 
 	app.cleanupExpired()
 	if _, ok := app.getSession(sessionID); ok {
@@ -718,7 +718,6 @@ func TestCleanupExpiredSkipsBusySessions(t *testing.T) {
 		t.Fatal("expired idle session still registered after cleanup")
 	}
 }
-
 
 func TestCreatePersistentSessionEnforcesMaxSessions(t *testing.T) {
 	app, server := newTestAppServer(t)

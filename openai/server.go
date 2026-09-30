@@ -6,8 +6,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -41,7 +41,18 @@ type Config struct {
 	SessionTTL                 time.Duration
 	// MaxSessions caps concurrent managed persistent sessions. Zero uses
 	// defaultMaxSessions; negative disables the cap.
-	MaxSessions        int
+	MaxSessions int
+	// MaxConcurrentSessions caps all live sessions and in-flight starts, including
+	// temporary requests and discovery. Zero uses 256; negative disables the cap.
+	MaxConcurrentSessions int
+	// MaxOutputBytes bounds text delivered by one HTTP turn. Zero uses 8 MiB.
+	// This is not a provider token, memory, or billing limit.
+	MaxOutputBytes int
+	// MaxResponseAliases bounds previous_response_id history. Zero uses 4096.
+	MaxResponseAliases int
+	// StreamWriteTimeout bounds each SSE write on writers supporting deadlines.
+	// Zero uses 30 seconds; negative disables the deadline.
+	StreamWriteTimeout time.Duration
 	APIKey             string
 	AllowHeaderCWD     bool
 	Models             []string
@@ -65,30 +76,40 @@ type AccessLogEntry struct {
 }
 
 type Server struct {
-	runtime              *acp.Runtime
-	discoveryRuntime     *acp.Runtime
-	ownsRuntime          bool
-	ownsDiscoveryRuntime bool
-	ctx                  context.Context
-	cancel               context.CancelFunc
-	defaultAgentID       string
-	cwd                  string
-	sessionTTL           time.Duration
-	maxSessions          int
-	apiKey               string
-	allowHeaderCWD       bool
-	models               []string
-	agents               []string
-	discoverModels       bool
-	discoveryTTL         time.Duration
-	resolveAgent         func(context.Context, string) (acp.Agent, error)
-	accessLog            func(AccessLogEntry)
+	runtime               *acp.Runtime
+	discoveryRuntime      *acp.Runtime
+	ownsRuntime           bool
+	ownsDiscoveryRuntime  bool
+	ctx                   context.Context
+	cancel                context.CancelFunc
+	defaultAgentID        string
+	cwd                   string
+	sessionTTL            time.Duration
+	maxSessions           int
+	maxConcurrentSessions int
+	maxOutputBytes        int
+	maxResponseAliases    int
+	streamWriteTimeout    time.Duration
+	apiKey                string
+	allowHeaderCWD        bool
+	models                []string
+	agents                []string
+	discoverModels        bool
+	discoveryTTL          time.Duration
+	resolveAgent          func(context.Context, string) (acp.Agent, error)
+	accessLog             func(AccessLogEntry)
 
-	mu        sync.Mutex
-	sessions  map[string]*sessionRecord
-	responses map[string]string
-	done      chan struct{}
-	closeOnce sync.Once
+	mu                sync.Mutex
+	sessions          map[string]*sessionRecord
+	responses         map[string]string
+	done              chan struct{}
+	closeOnce         sync.Once
+	cleanupMu         sync.Mutex
+	closed            bool
+	pendingPersistent int
+	pendingStarts     int
+	liveSessions      map[*acp.Session]struct{}
+	responseOrder     []string
 
 	modelMu          sync.Mutex
 	modelCache       []string
@@ -113,6 +134,7 @@ type sessionRecord struct {
 	mu      sync.Mutex
 	busy    bool
 	tainted bool
+	closed  bool
 }
 
 type requestContext struct {
@@ -182,27 +204,44 @@ func NewServer(config Config) *Server {
 	}
 	serverCtx, cancel := context.WithCancel(context.Background())
 	server := &Server{
-		runtime:              runtime,
-		discoveryRuntime:     discoveryRuntime,
-		ownsRuntime:          ownsRuntime,
-		ownsDiscoveryRuntime: ownsDiscoveryRuntime,
-		ctx:                  serverCtx,
-		cancel:               cancel,
-		defaultAgentID:       defaultAgentID,
-		cwd:                  cwd,
-		sessionTTL:           ttl,
-		maxSessions:          maxSessions,
-		apiKey:               config.APIKey,
-		allowHeaderCWD:       config.AllowHeaderCWD,
-		models:               models,
-		agents:               agents,
-		discoverModels:       config.DiscoverModels,
-		discoveryTTL:         discoveryTTL,
-		resolveAgent:         config.ResolveAgent,
-		accessLog:            config.AccessLog,
-		sessions:             map[string]*sessionRecord{},
-		responses:            map[string]string{},
-		done:                 make(chan struct{}),
+		runtime:               runtime,
+		discoveryRuntime:      discoveryRuntime,
+		ownsRuntime:           ownsRuntime,
+		ownsDiscoveryRuntime:  ownsDiscoveryRuntime,
+		ctx:                   serverCtx,
+		cancel:                cancel,
+		defaultAgentID:        defaultAgentID,
+		cwd:                   cwd,
+		sessionTTL:            ttl,
+		maxSessions:           maxSessions,
+		maxConcurrentSessions: config.MaxConcurrentSessions,
+		maxOutputBytes:        config.MaxOutputBytes,
+		maxResponseAliases:    config.MaxResponseAliases,
+		streamWriteTimeout:    config.StreamWriteTimeout,
+		liveSessions:          map[*acp.Session]struct{}{},
+		apiKey:                config.APIKey,
+		allowHeaderCWD:        config.AllowHeaderCWD,
+		models:                models,
+		agents:                agents,
+		discoverModels:        config.DiscoverModels,
+		discoveryTTL:          discoveryTTL,
+		resolveAgent:          config.ResolveAgent,
+		accessLog:             config.AccessLog,
+		sessions:              map[string]*sessionRecord{},
+		responses:             map[string]string{},
+		done:                  make(chan struct{}),
+	}
+	if server.maxConcurrentSessions == 0 {
+		server.maxConcurrentSessions = defaultMaxSessions
+	}
+	if server.maxOutputBytes <= 0 {
+		server.maxOutputBytes = 8 * 1024 * 1024
+	}
+	if server.maxResponseAliases <= 0 {
+		server.maxResponseAliases = 4096
+	}
+	if server.streamWriteTimeout == 0 {
+		server.streamWriteTimeout = 30 * time.Second
 	}
 	if server.resolveAgent == nil {
 		server.resolveAgent = acp.ResolveRuntimeAgentFromRegistry
@@ -213,29 +252,46 @@ func NewServer(config Config) *Server {
 }
 
 func (s *Server) Close(ctx context.Context) error {
-	var firstErr error
 	s.closeOnce.Do(func() {
-		close(s.done)
+		s.mu.Lock()
+		s.closed = true
+		s.mu.Unlock()
+		if s.done != nil {
+			close(s.done)
+		}
 		if s.cancel != nil {
 			s.cancel()
 		}
-		records := s.drainSessions()
-		for _, record := range records {
-			if err := s.closeManagedSession(ctx, record); err != nil && firstErr == nil {
-				firstErr = err
-			}
-		}
-		if s.ownsRuntime && s.runtime != nil {
-			if err := s.runtime.Close(ctx); err != nil && firstErr == nil {
-				firstErr = err
-			}
-		}
-		if s.ownsDiscoveryRuntime && s.discoveryRuntime != nil {
-			if err := s.discoveryRuntime.Close(ctx); err != nil && firstErr == nil {
-				firstErr = err
-			}
-		}
 	})
+	s.cleanupMu.Lock()
+	defer s.cleanupMu.Unlock()
+	var firstErr error
+	for _, record := range s.drainSessions() {
+		if err := s.closeManagedSession(ctx, record); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	s.mu.Lock()
+	live := make([]*acp.Session, 0, len(s.liveSessions))
+	for session := range s.liveSessions {
+		live = append(live, session)
+	}
+	s.mu.Unlock()
+	for _, session := range live {
+		if err := s.closeSession(ctx, session); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if s.ownsRuntime && s.runtime != nil {
+		if err := s.runtime.Close(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if s.ownsDiscoveryRuntime && s.discoveryRuntime != nil {
+		if err := s.discoveryRuntime.Close(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
 	return firstErr
 }
 
@@ -267,11 +323,11 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	}
 	sessions, busy := s.sessionStats()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":       "ready",
-		"sessions":     sessions,
-		"busy":         busy,
-		"max_sessions": s.maxSessions,
-		"session_ttl":  s.sessionTTL.String(),
+		"status":        "ready",
+		"sessions":      sessions,
+		"busy":          busy,
+		"max_sessions":  s.maxSessions,
+		"session_ttl":   s.sessionTTL.String(),
 		"default_agent": s.defaultAgentID,
 	})
 }
@@ -313,17 +369,20 @@ type statusRecorder struct {
 	status int
 }
 
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
 func (r *statusRecorder) WriteHeader(code int) {
 	r.status = code
 	r.ResponseWriter.WriteHeader(code)
 }
 
-// Flush preserves streaming when the underlying writer supports it.
-func (r *statusRecorder) Flush() {
-	if flusher, ok := r.ResponseWriter.(http.Flusher); ok {
-		flusher.Flush()
-	}
+// FlushError lets ResponseController retain network/flush errors through the
+// access-log wrapper; Unwrap preserves write-deadline support.
+func (r *statusRecorder) FlushError() error {
+	return http.NewResponseController(r.ResponseWriter).Flush()
 }
+
+func (r *statusRecorder) Flush() { _ = r.FlushError() }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -403,11 +462,11 @@ func (s *Server) discoverAgentModels(ctx context.Context, agentID string) ([]str
 	if runtime == nil {
 		runtime = s.runtime
 	}
-	session, err := runtime.StartSession(ctx, acp.StartSessionOptions{Agent: agent, CWD: s.cwd})
+	session, err := s.startTrackedSession(ctx, runtime, acp.StartSessionOptions{Agent: agent, CWD: s.cwd})
 	if err != nil {
 		return nil, err
 	}
-	defer session.Close(context.Background())
+	defer s.closeSession(context.Background(), session)
 	return modelIDsFromMetadata(session.Metadata()), nil
 }
 
@@ -487,7 +546,7 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "not_found", "session not found", "")
 			return
 		}
-		s.removeSession(id)
+		s.removeSession(record)
 		_ = s.closeManagedSession(context.Background(), record)
 		w.WriteHeader(http.StatusNoContent)
 	default:
@@ -504,6 +563,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8*1024*1024))
 	if err := decoder.Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON request: "+err.Error(), "")
+		return
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "request body must contain one JSON object", "")
 		return
 	}
 	if err := validateChatCompletionRequest(req); err != nil {
@@ -544,10 +607,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	} else {
 		temporary, err = s.startSession(ctx, rc)
 		if err != nil {
-			writeError(w, http.StatusBadGateway, "acp_session_error", err.Error(), "")
+			s.writeSessionError(w, err)
 			return
 		}
-		defer temporary.Close(context.Background())
+		defer s.closeSession(context.Background(), temporary)
 	}
 
 	incremental := sessionID != "" && strings.ToLower(strings.TrimSpace(r.Header.Get(headerInputMode))) != "replay"
@@ -568,7 +631,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		completion, err = temporary.Run(ctx, prompt)
 	}
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "acp_turn_error", err.Error(), "")
+		s.writeTurnError(w, err)
+		return
+	}
+	if err := s.checkOutput(completion.OutputText); err != nil {
+		s.writeTurnError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, completionResponse(req, rc.responseModel(), completion))
@@ -583,6 +650,10 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8*1024*1024))
 	if err := decoder.Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON request: "+err.Error(), "")
+		return
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "request body must contain one JSON object", "")
 		return
 	}
 	if err := validateResponseRequest(req); err != nil {
@@ -632,15 +703,15 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	} else {
 		temporary, err = s.startSession(ctx, rc)
 		if err != nil {
-			writeError(w, http.StatusBadGateway, "acp_session_error", err.Error(), "")
+			s.writeSessionError(w, err)
 			return
 		}
-		defer temporary.Close(context.Background())
+		defer s.closeSession(context.Background(), temporary)
 	}
 
 	responseID := newID("resp")
 	if persistent && store {
-		s.registerResponseSession(responseID, record.id)
+		s.registerResponseSession(responseID, record)
 	}
 
 	incremental := req.PreviousResponseID != "" || sessionID != ""
@@ -660,7 +731,11 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		completion, err = temporary.Run(ctx, buildResponsePrompt(req, false))
 	}
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "acp_turn_error", err.Error(), "")
+		s.writeTurnError(w, err)
+		return
+	}
+	if err := s.checkOutput(completion.OutputText); err != nil {
+		s.writeTurnError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, responseFromCompletion(responseID, firstNonEmpty(req.Model, rc.responseModel()), completion, req.Metadata))
@@ -941,102 +1016,124 @@ func (s *Server) startSession(ctx context.Context, rc requestContext) (*acp.Sess
 	if rc.effort != "" {
 		options.InitialConfig.Effort = rc.effort
 	}
-	return s.runtime.StartSession(ctx, options)
+	return s.startTrackedSession(ctx, s.runtime, options)
 }
 
 func (s *Server) createPersistentSession(ctx context.Context, rc requestContext) (*sessionRecord, error) {
 	s.mu.Lock()
-	if s.maxSessions > 0 && len(s.sessions) >= s.maxSessions {
+	if s.closed {
 		s.mu.Unlock()
-		return nil, sessionHTTPError{
-			status:  http.StatusTooManyRequests,
-			code:    "session_limit",
-			message: fmt.Sprintf("maximum concurrent sessions reached (%d)", s.maxSessions),
-		}
+		return nil, serverClosedError()
 	}
+	if s.maxSessions > 0 && len(s.sessions)+s.pendingPersistent >= s.maxSessions {
+		s.mu.Unlock()
+		return nil, sessionHTTPError{status: http.StatusTooManyRequests, code: "session_limit", message: "maximum persistent sessions reached"}
+	}
+	s.pendingPersistent++
 	s.mu.Unlock()
-
+	defer func() { s.mu.Lock(); s.pendingPersistent--; s.mu.Unlock() }()
 	session, err := s.startSession(ctx, rc)
 	if err != nil {
 		return nil, err
 	}
 	now := time.Now()
-	id := newID("acpsess")
 	record := &sessionRecord{
-		id:          id,
-		acpID:       session.Snapshot().Session.ID,
-		session:     session,
-		managed:     true,
-		agentID:     rc.agentID,
-		modelID:     rc.modelID,
-		cwd:         rc.cwd,
-		ownerHash:   rc.ownerHash,
-		fingerprint: rc.fingerprint,
-		systemHash:  rc.systemHash,
-		createdAt:   now,
-		lastSeenAt:  now,
-		expiresAt:   now.Add(s.sessionTTL),
+		id: newID("acpsess"), acpID: session.Snapshot().Session.ID,
+		session: session, managed: true, agentID: rc.agentID, modelID: rc.modelID,
+		cwd: rc.cwd, ownerHash: rc.ownerHash, fingerprint: rc.fingerprint,
+		systemHash: rc.systemHash, createdAt: now, lastSeenAt: now, expiresAt: now.Add(s.sessionTTL),
 	}
 	s.mu.Lock()
-	if s.maxSessions > 0 && len(s.sessions) >= s.maxSessions {
+	if s.closed {
 		s.mu.Unlock()
-		_ = session.Close(context.Background())
-		return nil, sessionHTTPError{
-			status:  http.StatusTooManyRequests,
-			code:    "session_limit",
-			message: fmt.Sprintf("maximum concurrent sessions reached (%d)", s.maxSessions),
-		}
+		_ = s.closeSession(context.Background(), session)
+		return nil, serverClosedError()
 	}
-	s.sessions[id] = record
+	s.sessions[record.id] = record
 	s.mu.Unlock()
 	return record, nil
 }
 
 func (s *Server) validatePersistentSession(id string, rc requestContext) (*sessionRecord, error) {
-	record, ok := s.getSession(id)
-	if !ok {
+	s.mu.Lock()
+	record, ok := s.sessions[id]
+	if !ok || record.ownerHash != rc.ownerHash {
+		s.mu.Unlock()
 		return nil, sessionHTTPError{status: http.StatusNotFound, code: "session_not_found", message: "ACP session not found"}
-	}
-	if record.ownerHash != rc.ownerHash {
-		return nil, sessionHTTPError{status: http.StatusNotFound, code: "session_not_found", message: "ACP session not found"}
-	}
-	if time.Now().After(record.expiresAt) {
-		s.removeSession(id)
-		_ = s.closeManagedSession(context.Background(), record)
-		return nil, sessionHTTPError{status: http.StatusGone, code: "session_expired", message: "ACP session expired"}
-	}
-	if record.fingerprint != rc.fingerprint {
-		return nil, sessionHTTPError{status: http.StatusConflict, code: "session_conflict", message: "ACP session fingerprint does not match request"}
-	}
-	if rc.systemHash != "" && record.systemHash != "" && rc.systemHash != record.systemHash {
-		return nil, sessionHTTPError{status: http.StatusConflict, code: "session_conflict", message: "ACP session system prompt does not match"}
 	}
 	record.mu.Lock()
-	tainted := record.tainted
+	var err error
+	switch {
+	case record.fingerprint != rc.fingerprint:
+		err = sessionHTTPError{status: http.StatusConflict, code: "session_conflict", message: "ACP session fingerprint does not match request"}
+	case rc.systemHash != "" && record.systemHash != "" && rc.systemHash != record.systemHash:
+		err = sessionHTTPError{status: http.StatusConflict, code: "session_conflict", message: "ACP session system prompt does not match"}
+	default:
+		err = record.availabilityLocked(time.Now())
+	}
+	expired := isSessionError(err, "session_expired")
+	if expired {
+		s.removeSessionLocked(record)
+	}
 	record.mu.Unlock()
-	if tainted {
-		return nil, sessionHTTPError{status: http.StatusConflict, code: "session_tainted", message: "ACP session is tainted; create a new session"}
+	s.mu.Unlock()
+	if expired {
+		_ = s.closeManagedSession(context.Background(), record)
+	}
+	if err != nil {
+		return nil, err
 	}
 	return record, nil
 }
 
-func (s *Server) runPersistent(ctx context.Context, record *sessionRecord, req chatCompletionRequest, incremental bool) (acp.TurnCompletion, error) {
-	if !record.tryBegin(s.sessionTTL) {
-		return acp.TurnCompletion{}, sessionHTTPError{status: http.StatusConflict, code: "session_busy", message: "ACP session is busy"}
+// beginSession repeats identity and idle-expiry checks while acquiring the lease.
+// No stale pointer may start after cleanup/delete/replacement removed its record.
+func (s *Server) beginSession(record *sessionRecord) error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return serverClosedError()
 	}
-	defer record.end(false, s.sessionTTL)
+	if s.sessions[record.id] != record {
+		s.mu.Unlock()
+		return sessionHTTPError{status: http.StatusGone, code: "session_expired", message: "ACP session is no longer available"}
+	}
+	record.mu.Lock()
+	err := record.availabilityLocked(time.Now())
+	expired := isSessionError(err, "session_expired")
+	if expired {
+		s.removeSessionLocked(record)
+	}
+	if err == nil {
+		record.beginLocked(s.sessionTTL)
+	}
+	record.mu.Unlock()
+	s.mu.Unlock()
+	if expired {
+		_ = s.closeManagedSession(context.Background(), record)
+	}
+	return err
+}
+
+func (s *Server) runPersistent(ctx context.Context, record *sessionRecord, req chatCompletionRequest, incremental bool) (acp.TurnCompletion, error) {
+	if err := s.beginSession(record); err != nil {
+		return acp.TurnCompletion{}, err
+	}
+	defer s.endSession(record, ctx)
 	prompt := buildPrompt(req, incremental)
 	return record.session.Run(ctx, prompt)
 }
 
 func (s *Server) streamPersistent(ctx context.Context, w http.ResponseWriter, record *sessionRecord, req chatCompletionRequest, incremental bool) {
-	if !record.tryBegin(s.sessionTTL) {
-		writeError(w, http.StatusConflict, "session_busy", "ACP session is busy", "")
+	if err := s.beginSession(record); err != nil {
+		s.writeSessionError(w, err)
 		return
 	}
-	defer record.end(false, s.sessionTTL)
+	defer s.endSession(record, ctx)
 	prompt := buildPrompt(req, incremental)
-	s.streamTurn(ctx, w, record.session, prompt, req, req.Model)
+	if err := s.streamTurn(ctx, w, record.session, prompt, req, firstNonEmpty(req.Model, record.responseModel())); err != nil {
+		record.end(true, s.sessionTTL)
+	}
 }
 
 func (s *Server) streamTemporary(ctx context.Context, w http.ResponseWriter, session *acp.Session, req chatCompletionRequest, model string) {
@@ -1045,193 +1142,81 @@ func (s *Server) streamTemporary(ctx context.Context, w http.ResponseWriter, ses
 }
 
 func (s *Server) runResponsePersistent(ctx context.Context, record *sessionRecord, req responseRequest, incremental bool) (acp.TurnCompletion, error) {
-	if !record.tryBegin(s.sessionTTL) {
-		return acp.TurnCompletion{}, sessionHTTPError{status: http.StatusConflict, code: "session_busy", message: "ACP session is busy"}
+	if err := s.beginSession(record); err != nil {
+		return acp.TurnCompletion{}, err
 	}
-	defer record.end(false, s.sessionTTL)
+	defer s.endSession(record, ctx)
 	return record.session.Run(ctx, buildResponsePrompt(req, incremental))
 }
 
 func (s *Server) streamResponsePersistent(ctx context.Context, w http.ResponseWriter, record *sessionRecord, req responseRequest, responseID string, incremental bool) {
-	if !record.tryBegin(s.sessionTTL) {
-		writeError(w, http.StatusConflict, "session_busy", "ACP session is busy", "")
+	if err := s.beginSession(record); err != nil {
+		s.writeSessionError(w, err)
 		return
 	}
-	defer record.end(false, s.sessionTTL)
-	s.streamResponseTurn(ctx, w, record.session, buildResponsePrompt(req, incremental), req, responseID, firstNonEmpty(req.Model, record.responseModel()))
+	defer s.endSession(record, ctx)
+	if err := s.streamResponseTurn(ctx, w, record.session, buildResponsePrompt(req, incremental), req, responseID, firstNonEmpty(req.Model, record.responseModel())); err != nil {
+		record.end(true, s.sessionTTL)
+	}
 }
 
 func (s *Server) streamResponseTemporary(ctx context.Context, w http.ResponseWriter, session *acp.Session, req responseRequest, responseID string, model string) {
 	s.streamResponseTurn(ctx, w, session, buildResponsePrompt(req, false), req, responseID, model)
 }
 
-func (s *Server) streamTurn(ctx context.Context, w http.ResponseWriter, session *acp.Session, prompt string, req chatCompletionRequest, model string) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeError(w, http.StatusInternalServerError, "streaming_not_supported", "response writer does not support streaming", "")
-		return
+// availabilityLocked checks idle TTL only after busy. TTL is not a run deadline.
+func (r *sessionRecord) availabilityLocked(now time.Time) error {
+	switch {
+	case r.closed:
+		return sessionHTTPError{status: http.StatusGone, code: "session_expired", message: "ACP session is closed"}
+	case r.tainted:
+		return sessionHTTPError{status: http.StatusConflict, code: "session_tainted", message: "ACP session is tainted; create a new session"}
+	case r.busy:
+		return sessionHTTPError{status: http.StatusConflict, code: "session_busy", message: "ACP session is busy"}
+	case !r.expiresAt.IsZero() && !now.Before(r.expiresAt):
+		return sessionHTTPError{status: http.StatusGone, code: "session_expired", message: "ACP session expired"}
+	default:
+		return nil
 	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	streamID := newID("chatcmpl")
-	turn := session.StartTurn(ctx, acp.RuntimePrompt{Text: prompt})
-	writeSSE(w, flusher, streamChunk(streamID, model, choiceDelta{Role: "assistant"}, nil, nil))
-	for event := range turn.Events {
-		switch event.Type {
-		case "text":
-			if event.Text != "" {
-				writeSSE(w, flusher, streamChunk(streamID, model, choiceDelta{Content: event.Text}, nil, nil))
-			}
-		case "operation_updated":
-			if event.Operation != nil {
-				text := formatOperation(event.Operation)
-				if text != "" {
-					writeSSE(w, flusher, streamChunk(streamID, model, choiceDelta{Content: text}, nil, nil))
-				}
-			}
-		case "plan_updated":
-			text := formatPlan(event.Plan)
-			if text != "" {
-				writeSSE(w, flusher, streamChunk(streamID, model, choiceDelta{Content: text}, nil, nil))
-			}
-		case "failed":
-			writeSSE(w, flusher, map[string]any{"error": event.Error.Error()})
-		}
-	}
-	result := <-turn.Completion
-	if result.Err != nil {
-		writeSSE(w, flusher, map[string]any{"error": result.Err.Error()})
-		return
-	}
-	finish := finishReason(result.Completion.StopReason)
-	usage := usageFromACP(result.Completion.Usage)
-	writeSSE(w, flusher, streamChunk(streamID, model, choiceDelta{}, &finish, usage))
-	if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
-		writeSSE(w, flusher, chatCompletionResponse{
-			ID:      streamID,
-			Object:  "chat.completion.chunk",
-			Created: time.Now().Unix(),
-			Model:   model,
-			Choices: []chatCompletionChoice{},
-			Usage:   usage,
-		})
-	}
-	fmt.Fprint(w, "data: [DONE]\n\n")
-	flusher.Flush()
 }
 
-func (s *Server) streamResponseTurn(ctx context.Context, w http.ResponseWriter, session *acp.Session, prompt string, req responseRequest, responseID string, model string) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeError(w, http.StatusInternalServerError, "streaming_not_supported", "response writer does not support streaming", "")
-		return
+func (r *sessionRecord) beginLocked(ttl time.Duration) {
+	r.busy = true
+	r.lastSeenAt = time.Now()
+	if ttl > 0 {
+		r.expiresAt = r.lastSeenAt.Add(ttl)
 	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	itemID := newID("msg")
-	created := time.Now().Unix()
-	writeResponseSSE(w, flusher, "response.created", map[string]any{
-		"type":     "response.created",
-		"response": responseSkeleton(responseID, model, created, "in_progress", req.Metadata),
-	})
-	turn := session.StartTurn(ctx, acp.RuntimePrompt{Text: prompt})
-	var output strings.Builder
-	sequence := 0
-	writeResponseSSE(w, flusher, "response.output_item.added", map[string]any{
-		"type":            "response.output_item.added",
-		"sequence_number": sequence,
-		"output_index":    0,
-		"item": map[string]any{
-			"id":      itemID,
-			"type":    "message",
-			"status":  "in_progress",
-			"role":    "assistant",
-			"content": []any{},
-		},
-	})
-	sequence++
-	for event := range turn.Events {
-		var text string
-		switch event.Type {
-		case "text":
-			text = event.Text
-		case "operation_updated":
-			if event.Operation != nil {
-				text = formatOperation(event.Operation)
-			}
-		case "plan_updated":
-			text = formatPlan(event.Plan)
-		case "failed":
-			writeResponseSSE(w, flusher, "response.failed", map[string]any{"type": "response.failed", "error": event.Error.Error()})
-		}
-		if text == "" {
-			continue
-		}
-		output.WriteString(text)
-		writeResponseSSE(w, flusher, "response.output_text.delta", map[string]any{
-			"type":            "response.output_text.delta",
-			"sequence_number": sequence,
-			"item_id":         itemID,
-			"output_index":    0,
-			"content_index":   0,
-			"delta":           text,
-		})
-		sequence++
-	}
-	result := <-turn.Completion
-	if result.Err != nil {
-		writeResponseSSE(w, flusher, "response.failed", map[string]any{"type": "response.failed", "error": result.Err.Error()})
-		return
-	}
-	text := firstNonEmpty(result.Completion.OutputText, output.String())
-	response := responseFromCompletion(responseID, model, result.Completion, req.Metadata)
-	response.CreatedAt = created
-	response.OutputText = text
-	if len(response.Output) > 0 && len(response.Output[0].Content) > 0 {
-		response.Output[0].ID = itemID
-		response.Output[0].Content[0].Text = text
-	}
-	writeResponseSSE(w, flusher, "response.completed", map[string]any{
-		"type":     "response.completed",
-		"response": response,
-	})
-	fmt.Fprint(w, "data: [DONE]\n\n")
-	flusher.Flush()
 }
 
 func (r *sessionRecord) tryBegin(ttl time.Duration) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.busy || r.tainted {
+	if r.availabilityLocked(time.Now()) != nil {
 		return false
 	}
-	r.busy = true
-	// Refresh TTL when a turn starts so long-running turns are not cleaned up
-	// mid-flight by the expiry loop.
-	now := time.Now()
-	r.lastSeenAt = now
-	if ttl > 0 {
-		r.expiresAt = now.Add(ttl)
-	}
+	r.beginLocked(ttl)
 	return true
+}
+
+func (s *Server) endSession(record *sessionRecord, ctx context.Context) {
+	status := ""
+	if record.session != nil {
+		status = record.session.Status()
+	}
+	record.end(ctx.Err() != nil || status == "tainted" || status == "closed", s.sessionTTL)
 }
 
 func (r *sessionRecord) end(tainted bool, ttl time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.busy = false
-	if tainted {
-		r.tainted = true
+	r.tainted = r.tainted || tainted
+	if !r.closed {
+		r.lastSeenAt = time.Now()
+		r.expiresAt = r.lastSeenAt.Add(ttl)
 	}
-	now := time.Now()
-	r.lastSeenAt = now
-	r.expiresAt = now.Add(ttl)
 }
 
-// isBusy reports whether a turn is in flight. Used by cleanup to skip sessions
-// that must not be closed under the host's feet.
 func (r *sessionRecord) isBusy() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1245,11 +1230,24 @@ func (s *Server) getSession(id string) (*sessionRecord, bool) {
 	return record, ok
 }
 
-func (s *Server) removeSession(id string) {
+// All operations involving both locks take s.mu before record.mu. Closing a
+// transport is always outside these locks, and deletion checks pointer identity.
+func (s *Server) removeSession(record *sessionRecord) bool {
 	s.mu.Lock()
-	delete(s.sessions, id)
-	s.removeResponseAliasesLocked(id)
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	record.mu.Lock()
+	defer record.mu.Unlock()
+	return s.removeSessionLocked(record)
+}
+
+func (s *Server) removeSessionLocked(record *sessionRecord) bool {
+	if s.sessions[record.id] != record {
+		return false
+	}
+	record.closed = true
+	delete(s.sessions, record.id)
+	s.removeResponseAliasesLocked(record.id)
+	return true
 }
 
 func (s *Server) cleanupLoop() {
@@ -1269,18 +1267,14 @@ func (s *Server) cleanupExpired() {
 	now := time.Now()
 	var expired []*sessionRecord
 	s.mu.Lock()
-	for id, record := range s.sessions {
-		if !now.After(record.expiresAt) {
-			continue
+	for _, record := range s.sessions {
+		record.mu.Lock()
+		if !record.busy && !record.expiresAt.IsZero() && !now.Before(record.expiresAt) {
+			if s.removeSessionLocked(record) {
+				expired = append(expired, record)
+			}
 		}
-		// Never tear down a session mid-turn. tryBegin refreshes expiresAt, so a
-		// busy session should rarely appear here; skip defensively if it does.
-		if record.isBusy() {
-			continue
-		}
-		delete(s.sessions, id)
-		s.removeResponseAliasesLocked(id)
-		expired = append(expired, record)
+		record.mu.Unlock()
 	}
 	s.mu.Unlock()
 	for _, record := range expired {
@@ -1292,18 +1286,34 @@ func (s *Server) drainSessions() []*sessionRecord {
 	s.mu.Lock()
 	records := make([]*sessionRecord, 0, len(s.sessions))
 	for _, record := range s.sessions {
+		record.mu.Lock()
+		record.closed = true
+		record.mu.Unlock()
 		records = append(records, record)
 	}
 	s.sessions = map[string]*sessionRecord{}
 	s.responses = map[string]string{}
+	s.responseOrder = nil
 	s.mu.Unlock()
 	return records
 }
 
-func (s *Server) registerResponseSession(responseID string, sessionID string) {
+func (s *Server) registerResponseSession(responseID string, record *sessionRecord) {
 	s.mu.Lock()
-	s.responses[responseID] = sessionID
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	if s.sessions[record.id] != record {
+		return
+	}
+	limit := s.maxResponseAliases
+	if limit <= 0 {
+		limit = 4096
+	}
+	for len(s.responseOrder) >= limit {
+		delete(s.responses, s.responseOrder[0])
+		s.responseOrder = s.responseOrder[1:]
+	}
+	s.responses[responseID] = record.id
+	s.responseOrder = append(s.responseOrder, responseID)
 }
 
 func (s *Server) sessionIDForResponse(responseID string) (string, bool) {
@@ -1319,13 +1329,20 @@ func (s *Server) removeResponseAliasesLocked(sessionID string) {
 			delete(s.responses, responseID)
 		}
 	}
+	order := s.responseOrder[:0]
+	for _, id := range s.responseOrder {
+		if _, ok := s.responses[id]; ok {
+			order = append(order, id)
+		}
+	}
+	s.responseOrder = order
 }
 
 func (s *Server) closeManagedSession(ctx context.Context, record *sessionRecord) error {
 	if record == nil || !record.managed || record.session == nil {
 		return nil
 	}
-	return record.session.Close(ctx)
+	return s.closeSession(ctx, record.session)
 }
 
 func buildPrompt(req chatCompletionRequest, incremental bool) string {
@@ -1457,6 +1474,25 @@ func streamChunk(id string, model string, delta choiceDelta, finish *string, usa
 }
 
 func validateChatCompletionRequest(req chatCompletionRequest) *requestValidationError {
+	if req.MaxTokens != nil {
+		return unsupportedParameter("max_tokens")
+	}
+	if req.MaxCompletionTokens != nil {
+		return unsupportedParameter("max_completion_tokens")
+	}
+	if err := validateSampling(req.Temperature, req.TopP); err != nil {
+		return err
+	}
+	if !emptyStop(req.Stop) {
+		return unsupportedParameter("stop")
+	}
+	for i, message := range req.Messages {
+		for j, part := range message.Content.Parts {
+			if part.Type != "text" && part.Type != "input_text" {
+				return unsupportedParameter(fmt.Sprintf("messages[%d].content[%d].type", i, j))
+			}
+		}
+	}
 	if req.N != nil && *req.N != 1 {
 		return &requestValidationError{param: "n", message: "only n=1 is supported"}
 	}
@@ -1472,13 +1508,35 @@ func validateChatCompletionRequest(req chatCompletionRequest) *requestValidation
 			return &requestValidationError{param: "response_format", message: "only response_format.type=text is supported"}
 		}
 	}
-	if len(req.Tools) > 0 && !toolChoiceIsNone(req.ToolChoice) {
+	if (len(req.Tools) > 0 || req.ToolChoice != nil) && !toolChoiceIsNone(req.ToolChoice) {
 		return &requestValidationError{param: "tools", message: "OpenAI tool calling is not supported by this gateway yet"}
 	}
 	return nil
 }
 
 func validateResponseRequest(req responseRequest) *requestValidationError {
+	if req.MaxOutputTokens != nil {
+		return unsupportedParameter("max_output_tokens")
+	}
+	if err := validateSampling(req.Temperature, req.TopP); err != nil {
+		return err
+	}
+	if !emptyStop(req.Stop) {
+		return unsupportedParameter("stop")
+	}
+	for i, item := range req.Input.Items {
+		if item.Type != "" && item.Type != "message" {
+			return unsupportedParameter(fmt.Sprintf("input[%d].type", i))
+		}
+		for j, part := range item.Content.Parts {
+			if part.Type != "text" && part.Type != "input_text" && part.Type != "output_text" {
+				return unsupportedParameter(fmt.Sprintf("input[%d].content[%d].type", i, j))
+			}
+		}
+	}
+	if req.Reasoning != nil && req.Reasoning.Summary != "" {
+		return unsupportedParameter("reasoning.summary")
+	}
 	if req.Text != nil && req.Text.Format != nil {
 		switch req.Text.Format.Type {
 		case "", "text":
@@ -1486,7 +1544,7 @@ func validateResponseRequest(req responseRequest) *requestValidationError {
 			return &requestValidationError{param: "text.format", message: "only text.format.type=text is supported"}
 		}
 	}
-	if len(req.Tools) > 0 && !toolChoiceIsNone(req.ToolChoice) {
+	if (len(req.Tools) > 0 || req.ToolChoice != nil) && !toolChoiceIsNone(req.ToolChoice) {
 		return &requestValidationError{param: "tools", message: "OpenAI tool calling is not supported by this gateway yet"}
 	}
 	if req.Store != nil && !*req.Store && strings.TrimSpace(req.PreviousResponseID) != "" {
@@ -1553,44 +1611,6 @@ func finishReason(stopReason string) string {
 	}
 }
 
-func formatOperation(op *acp.Operation) string {
-	if op == nil || op.Title == "" {
-		return ""
-	}
-	return "\n\n[" + op.Phase + "] " + op.Title + "\n"
-}
-
-func formatPlan(entries []acp.PlanEntry) string {
-	if len(entries) == 0 {
-		return ""
-	}
-	var b strings.Builder
-	b.WriteString("\n\nPlan:\n")
-	for _, entry := range entries {
-		b.WriteString("- ")
-		if entry.Status != "" {
-			b.WriteString(entry.Status)
-			b.WriteString(": ")
-		}
-		b.WriteString(entry.Content)
-		b.WriteString("\n")
-	}
-	return b.String()
-}
-
-func writeSSE(w http.ResponseWriter, flusher http.Flusher, value any) {
-	data, _ := json.Marshal(value)
-	fmt.Fprintf(w, "data: %s\n\n", data)
-	flusher.Flush()
-}
-
-func writeResponseSSE(w http.ResponseWriter, flusher http.Flusher, event string, value any) {
-	data, _ := json.Marshal(value)
-	fmt.Fprintf(w, "event: %s\n", event)
-	fmt.Fprintf(w, "data: %s\n\n", data)
-	flusher.Flush()
-}
-
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -1613,12 +1633,13 @@ type sessionHTTPError struct {
 func (e sessionHTTPError) Error() string { return e.message }
 
 func (s *Server) writeSessionError(w http.ResponseWriter, err error) {
-	var sessionErr sessionHTTPError
-	if errors.As(err, &sessionErr) {
-		writeError(w, sessionErr.status, sessionErr.code, sessionErr.message, "")
-		return
-	}
-	writeError(w, http.StatusBadGateway, "acp_session_error", err.Error(), "")
+	e := classifyError(err, "acp_session_error")
+	writeError(w, e.status, e.code, e.message, "")
+}
+
+func (s *Server) writeTurnError(w http.ResponseWriter, err error) {
+	e := classifyError(err, "acp_turn_error")
+	writeError(w, e.status, e.code, e.message, "")
 }
 
 func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {

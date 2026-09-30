@@ -60,6 +60,7 @@ type responseRequest struct {
 	PreviousResponseID string                     `json:"previous_response_id,omitempty"`
 	Store              *bool                      `json:"store,omitempty"`
 	Metadata           map[string]any             `json:"metadata,omitempty"`
+	Stop               any                        `json:"stop,omitempty"`
 	MaxOutputTokens    *int                       `json:"max_output_tokens,omitempty"`
 	Temperature        *float64                   `json:"temperature,omitempty"`
 	TopP               *float64                   `json:"top_p,omitempty"`
@@ -134,8 +135,6 @@ func (c messageContent) text() string {
 			if part.Text != "" {
 				parts = append(parts, part.Text)
 			}
-		case "image_url", "input_image":
-			parts = append(parts, "[image]")
 		}
 	}
 	return strings.Join(parts, "\n")
@@ -217,8 +216,6 @@ func (c responseInputContent) text() string {
 			if part.Text != "" {
 				parts = append(parts, part.Text)
 			}
-		case "image_url", "input_image":
-			parts = append(parts, "[image]")
 		}
 	}
 	return strings.Join(parts, "\n")

@@ -26,6 +26,10 @@ func main() {
 	var apiKey string
 	var ttl time.Duration
 	var maxSessions int
+	var maxConcurrentSessions int
+	var maxOutputBytes int
+	var maxResponseAliases int
+	var streamWriteTimeout time.Duration
 	var allowHeaderCWD bool
 	var models string
 	var agents string
@@ -37,7 +41,11 @@ func main() {
 	flag.StringVar(&cwd, "cwd", "", "session working directory; defaults to the user home directory")
 	flag.StringVar(&apiKey, "api-key", "", "optional API key required as Bearer token or X-API-Key")
 	flag.DurationVar(&ttl, "session-ttl", 30*time.Minute, "persistent ACP session TTL")
-	flag.IntVar(&maxSessions, "max-sessions", 256, "maximum concurrent managed sessions; 0 uses default, negative disables")
+	flag.IntVar(&maxSessions, "max-sessions", 256, "maximum managed persistent sessions, including in-flight starts; 0 uses default, negative disables this cap")
+	flag.IntVar(&maxConcurrentSessions, "max-concurrent-sessions", 256, "maximum total live sessions and in-flight starts, including temporary requests and discovery; 0 uses default, negative disables")
+	flag.IntVar(&maxOutputBytes, "max-output-bytes", 8*1024*1024, "maximum assistant text bytes delivered per HTTP turn; not a provider token or billing limit")
+	flag.IntVar(&maxResponseAliases, "max-response-aliases", 4096, "maximum process-local previous_response_id aliases; oldest aliases are evicted")
+	flag.DurationVar(&streamWriteTimeout, "stream-write-timeout", 30*time.Second, "deadline for each SSE write; 0 uses default, negative disables")
 	flag.BoolVar(&allowHeaderCWD, "allow-header-cwd", false, "allow X-ACP-CWD to override working directory")
 	flag.StringVar(&models, "models", "", "comma-separated OpenAI model ids returned by /v1/models, e.g. claude/sonnet,codex/gpt-5.5")
 	flag.StringVar(&agents, "agents", "claude,codex", "comma-separated ACP agent ids or aliases; first entry is the default agent")
@@ -76,6 +84,10 @@ func main() {
 		CWD:                        cwd,
 		SessionTTL:                 ttl,
 		MaxSessions:                maxSessions,
+		MaxConcurrentSessions:      maxConcurrentSessions,
+		MaxOutputBytes:             maxOutputBytes,
+		MaxResponseAliases:         maxResponseAliases,
+		StreamWriteTimeout:         streamWriteTimeout,
 		APIKey:                     apiKey,
 		AllowHeaderCWD:             allowHeaderCWD,
 		Models:                     splitCSV(models),
@@ -88,7 +100,15 @@ func main() {
 		},
 	})
 
-	httpServer := &http.Server{Addr: listen, Handler: server.Handler()}
+	// Per-frame SSE deadlines are applied by the gateway. A whole-response
+	// WriteTimeout would incorrectly terminate legitimate long-running turns.
+	httpServer := &http.Server{
+		Addr: listen, Handler: server.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    1 << 20,
+	}
 	defer server.Close(context.Background())
 	go func() {
 		<-ctx.Done()
