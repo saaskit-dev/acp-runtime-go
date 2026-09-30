@@ -1,0 +1,1 @@
+{"id":"interactive-login","name":"Log in","type":"terminal","args":["--login"],"env":{"ACP_INTERACTIVE_LOGIN":"1"}}

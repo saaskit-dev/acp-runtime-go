@@ -1,0 +1,1 @@
+{"requestId":12,"mode":"form","message":"Choose a color","requestedSchema":{"type":"object","properties":{"color":{"type":"string","enum":["blue","green"]},"enabled":{"type":"boolean","default":false}},"required":["color","enabled"]}}

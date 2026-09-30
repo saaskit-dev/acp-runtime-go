@@ -1,0 +1,11 @@
+{
+  "repository": "https://github.com/agentclientprotocol/agent-client-protocol",
+  "protocolVersion": 1,
+  "target": "schema-v1.23.0",
+  "stableOnly": true,
+  "verifiedAt": "2026-09-30",
+  "releases": [
+    {"tag":"schema-v1.17.0","path":"schema-v1.17.0/schema.json","source":"https://github.com/agentclientprotocol/agent-client-protocol/blob/schema-v1.17.0/schema/v1/schema.json","sha256":"3fe84267dcf4851723829e1a9f36e1d24faa23fd065bdd8cd8791a3d203db56c"},
+    {"tag":"schema-v1.23.0","commit":"6d08f412a7a1370d3cc9a124e3be3d6acf92641e","path":"schema-v1.23.0/schema.json","source":"https://github.com/agentclientprotocol/agent-client-protocol/blob/schema-v1.23.0/schema/v1/schema.json","sha256":"3c17bd6385d90cf672d8a661fddc359d73422cf8b8ce6865213d25cfd4c0eca7"}
+  ]
+}
