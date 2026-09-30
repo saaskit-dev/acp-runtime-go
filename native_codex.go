@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -13,8 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
-	"time"
 )
 
 // codexNativeEngine drives codex app-server DAEMONS, pooled by config
@@ -32,6 +31,7 @@ type codexNativeEngine struct {
 	mu       sync.Mutex
 	daemons  map[string]*codexDaemon  // config key -> shared daemon
 	sessions map[string]*codexSession // ACP session id (= thread id) -> ref
+	closed   bool
 }
 
 func (e *codexNativeEngine) Name() string { return "codex" }
@@ -44,6 +44,7 @@ func (e *codexNativeEngine) Start(ctx context.Context, opts nativeEngineOptions)
 	e.mu.Lock()
 	e.daemons = map[string]*codexDaemon{}
 	e.sessions = map[string]*codexSession{}
+	e.closed = false
 	e.mu.Unlock()
 	return nil
 }
@@ -59,12 +60,14 @@ type codexDaemon struct {
 	peer   *Peer
 	loopOn context.CancelFunc
 	turns  map[string]*codexTurn // threadID -> in-flight turn
+	wait   nativeProcessWait
 }
 
 // codexSession ties an ACP session id to its daemon + thread.
 type codexSession struct {
 	daemon   *codexDaemon
 	threadID string
+	model    string
 }
 
 // daemonKey fingerprints everything that is process-scoped for codex: the
@@ -96,14 +99,16 @@ func (e *codexNativeEngine) NewSession(ctx context.Context, opts nativeEngineOpt
 	if err != nil {
 		return "", err
 	}
+	model := nativeCodexModel(opts.Agent, req.Meta)
 	var res struct {
 		Thread struct {
 			ID string `json:"id"`
 		} `json:"thread"`
+		Model string `json:"model"`
 	}
 	if err := daemon.peer.Call(ctx, "thread/start", map[string]any{
-		"cwd":                  opts.CWD,
-		"model":                metaString(req.Meta, "model"),
+		"cwd":                   opts.CWD,
+		"model":                 model,
 		"experimentalRawEvents": true,
 	}, &res); err != nil {
 		return "", wrapError(ErrorProcess, "native.codex.thread", "thread/start failed", err)
@@ -111,8 +116,11 @@ func (e *codexNativeEngine) NewSession(ctx context.Context, opts nativeEngineOpt
 	if res.Thread.ID == "" {
 		return "", &RuntimeError{Kind: ErrorProcess, Op: "native.codex.thread", Msg: "thread/start returned no thread id"}
 	}
+	if model != "" && res.Model == "" {
+		return "", wrapError(ErrorProtocol, "native.codex.thread", "thread/start did not report the selected model", nil)
+	}
 	e.mu.Lock()
-	e.sessions[res.Thread.ID] = &codexSession{daemon: daemon, threadID: res.Thread.ID}
+	e.sessions[res.Thread.ID] = &codexSession{daemon: daemon, threadID: res.Thread.ID, model: res.Model}
 	e.mu.Unlock()
 	return res.Thread.ID, nil
 }
@@ -133,16 +141,18 @@ func (e *codexNativeEngine) LoadSession(ctx context.Context, opts nativeEngineOp
 		Thread struct {
 			ID string `json:"id"`
 		} `json:"thread"`
+		Model string `json:"model"`
 	}
 	if err := daemon.peer.Call(ctx, "thread/resume", map[string]any{
 		"threadId":              req.SessionID,
 		"cwd":                   opts.CWD,
+		"model":                 nativeCodexModel(opts.Agent, req.Meta),
 		"experimentalRawEvents": true,
 	}, &res); err != nil {
 		return "", wrapError(ErrorProcess, "native.codex.resume", "thread/resume failed", err)
 	}
 	e.mu.Lock()
-	e.sessions[req.SessionID] = &codexSession{daemon: daemon, threadID: req.SessionID}
+	e.sessions[req.SessionID] = &codexSession{daemon: daemon, threadID: req.SessionID, model: res.Model}
 	e.mu.Unlock()
 	return req.SessionID, nil
 }
@@ -151,22 +161,24 @@ func (e *codexNativeEngine) LoadSession(ctx context.Context, opts nativeEngineOp
 // first use.
 func (e *codexNativeEngine) ensureDaemon(ctx context.Context, key string, servers []MCPServer) (*codexDaemon, error) {
 	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return nil, wrapError(ErrorSessionClosed, "native.codex.spawn", "native connection is closed", nil)
+	}
 	if e.daemons == nil {
 		e.daemons = map[string]*codexDaemon{}
 	}
 	if d, ok := e.daemons[key]; ok {
-		e.mu.Unlock()
 		return d, nil
 	}
+	// ponytail: serialize cold daemon admission per engine; narrow only if
+	// concurrent cold starts on one connection become a measured bottleneck.
 	d := &codexDaemon{key: key, eng: e, turns: map[string]*codexTurn{}}
-	e.daemons[key] = d
-	e.mu.Unlock()
 	if err := d.spawn(ctx, codexSpawnExtras(e.opts, servers)); err != nil {
-		e.mu.Lock()
-		delete(e.daemons, key)
-		e.mu.Unlock()
+		_ = d.kill(context.Background())
 		return nil, err
 	}
+	e.daemons[key] = d
 	return d, nil
 }
 
@@ -192,14 +204,28 @@ func (e *codexNativeEngine) Cancel(ctx context.Context, opts nativeEngineOptions
 
 func (e *codexNativeEngine) Close(ctx context.Context) error {
 	e.mu.Lock()
-	daemons := e.daemons
-	e.daemons = map[string]*codexDaemon{}
-	e.sessions = map[string]*codexSession{}
-	e.mu.Unlock()
-	for _, d := range daemons {
-		_ = d.kill()
+	e.closed = true
+	daemons := make(map[string]*codexDaemon, len(e.daemons))
+	for key, daemon := range e.daemons {
+		daemons[key] = daemon
 	}
-	return nil
+	e.mu.Unlock()
+	var cleanupErrors []error
+	for key, daemon := range daemons {
+		if err := daemon.kill(ctx); err != nil {
+			cleanupErrors = append(cleanupErrors, err)
+			continue
+		}
+		e.mu.Lock()
+		delete(e.daemons, key)
+		for id, session := range e.sessions {
+			if session.daemon == daemon {
+				delete(e.sessions, id)
+			}
+		}
+		e.mu.Unlock()
+	}
+	return errors.Join(cleanupErrors...)
 }
 
 // codexProc (kept name for tests) is the per-daemon process state.
@@ -472,6 +498,12 @@ func (d *codexDaemon) prompt(ctx context.Context, threadID string, blocks []Cont
 
 	select {
 	case <-turnDone(d, threadID):
+	case <-d.peer.Done():
+		select {
+		case <-turn.done:
+		default:
+			return nativeTurnResult{}, wrapError(ErrorProcess, "native.codex.turn", "Codex app-server closed before a terminal result", io.ErrClosedPipe)
+		}
 	case <-ctx.Done():
 		return nativeTurnResult{}, ctx.Err()
 	}
@@ -559,7 +591,7 @@ func (d *codexDaemon) handleApproval(ctx context.Context, raw json.RawMessage) (
 }
 
 // kill terminates the daemon process tree.
-func (d *codexDaemon) kill() error {
+func (d *codexDaemon) kill(ctx context.Context) error {
 	d.mu.Lock()
 	cmd, stdin, loopOn := d.cmd, d.stdin, d.loopOn
 	d.mu.Unlock()
@@ -569,32 +601,7 @@ func (d *codexDaemon) kill() error {
 	if d.peer != nil {
 		d.peer.Close()
 	}
-	if cmd == nil || cmd.Process == nil {
-		return nil
-	}
-	if stdin != nil {
-		_ = stdin.Close()
-	}
-	pgid := processGroupIDAfterStart(cmd)
-	waitCh := make(chan error, 1)
-	go func() { waitCh <- cmd.Wait() }()
-	select {
-	case <-waitCh:
-		return nil
-	case <-time.After(1500 * time.Millisecond):
-		_ = signalProcessTree(pgid, cmd.Process, syscall.SIGTERM)
-		select {
-		case <-waitCh:
-			return nil
-		case <-time.After(time.Second):
-			_ = signalProcessTree(pgid, cmd.Process, syscall.SIGKILL)
-			select {
-			case <-waitCh:
-			case <-time.After(3 * time.Second):
-			}
-			return nil
-		}
-	}
+	return stopNativeProcess(ctx, cmd, stdin, &d.wait)
 }
 
 func strPtr(s string) *string { return &s }
@@ -782,4 +789,3 @@ func codexInputFromBlocks(blocks []ContentBlock) []any {
 	}
 	return items
 }
-

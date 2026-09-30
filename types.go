@@ -237,10 +237,11 @@ type NewSessionResponse struct {
 }
 
 type LoadSessionRequest struct {
-	SessionID             string      `json:"sessionId"`
-	CWD                   string      `json:"cwd"`
-	MCPServers            []MCPServer `json:"mcpServers"`
-	AdditionalDirectories []string    `json:"additionalDirectories,omitempty"`
+	SessionID             string         `json:"sessionId"`
+	CWD                   string         `json:"cwd"`
+	MCPServers            []MCPServer    `json:"mcpServers"`
+	AdditionalDirectories []string       `json:"additionalDirectories,omitempty"`
+	Meta                  map[string]any `json:"_meta,omitempty"`
 }
 
 type LoadSessionResponse = NewSessionResponse

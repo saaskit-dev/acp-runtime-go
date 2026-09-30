@@ -3,7 +3,9 @@ package acpruntime
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,7 +13,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -25,9 +26,10 @@ import (
 // claude emits system/init lazily (after the first user message), so the ACP
 // session id is synthetic; the real uuid is recorded on the process.
 type claudeNativeEngine struct {
-	opts  nativeEngineOptions
-	mu    sync.Mutex
-	procs map[string]*claudeProc // ACP session id -> its own CLI process
+	opts   nativeEngineOptions
+	mu     sync.Mutex
+	procs  map[string]*claudeProc // ACP session id -> its owned CLI process
+	closed bool
 }
 
 func (e *claudeNativeEngine) Name() string { return "claude" }
@@ -60,6 +62,7 @@ func (e *claudeNativeEngine) Start(ctx context.Context, opts nativeEngineOptions
 	}
 	e.mu.Lock()
 	e.procs = map[string]*claudeProc{}
+	e.closed = false
 	e.mu.Unlock()
 	return nil
 }
@@ -74,11 +77,25 @@ func (e *claudeNativeEngine) proc(sessionID string) (*claudeProc, error) {
 	return p, nil
 }
 
+func newClaudeNativeSessionID() (string, error) {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return "", err
+	}
+	id[6] = (id[6] & 0x0f) | 0x40
+	id[8] = (id[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", id[:4], id[4:6], id[6:8], id[8:10], id[10:]), nil
+}
+
 func (e *claudeNativeEngine) NewSession(ctx context.Context, opts nativeEngineOptions, req NewSessionRequest) (string, error) {
+	id, err := newClaudeNativeSessionID()
+	if err != nil {
+		return "", wrapError(ErrorCreate, "native.claude.session_id", "create session identity", err)
+	}
 	proc := &claudeProc{
-		eng:        e,
-		acpSessionID: fmt.Sprintf("claude-%d", time.Now().UnixNano()),
-		pendingReq: &req,
+		eng:          e,
+		acpSessionID: id,
+		pendingReq:   &req,
 	}
 	e.mu.Lock()
 	e.procs[proc.acpSessionID] = proc
@@ -94,7 +111,7 @@ func (e *claudeNativeEngine) LoadSession(ctx context.Context, opts nativeEngineO
 		eng:          e,
 		acpSessionID: req.SessionID,
 		resumeFrom:   req.SessionID,
-		pendingReq:   &NewSessionRequest{MCPServers: req.MCPServers},
+		pendingReq:   &NewSessionRequest{Meta: req.Meta, MCPServers: req.MCPServers, AdditionalDirectories: req.AdditionalDirectories},
 	}
 	e.mu.Lock()
 	e.procs[req.SessionID] = proc
@@ -112,9 +129,13 @@ func (e *claudeNativeEngine) LoadSession(ctx context.Context, opts nativeEngineO
 // spawn carries --resume <id> --fork-session, so the original stays intact.
 // claude mints the derived uuid lazily, so the ACP id here is synthetic.
 func (e *claudeNativeEngine) ForkSession(ctx context.Context, opts nativeEngineOptions, req ForkSessionRequest) (string, error) {
+	id, err := newClaudeNativeSessionID()
+	if err != nil {
+		return "", wrapError(ErrorFork, "native.claude.session_id", "create fork identity", err)
+	}
 	proc := &claudeProc{
 		eng:          e,
-		acpSessionID: fmt.Sprintf("claude-%d", time.Now().UnixNano()),
+		acpSessionID: id,
 		resumeFrom:   req.SessionID,
 		forkSession:  true,
 		pendingReq:   &NewSessionRequest{MCPServers: req.MCPServers},
@@ -143,16 +164,23 @@ func (e *claudeNativeEngine) Cancel(ctx context.Context, opts nativeEngineOption
 
 func (e *claudeNativeEngine) Close(ctx context.Context) error {
 	e.mu.Lock()
-	procs := make([]*claudeProc, 0, len(e.procs))
-	for _, p := range e.procs {
-		procs = append(procs, p)
+	e.closed = true
+	procs := make(map[string]*claudeProc, len(e.procs))
+	for id, proc := range e.procs {
+		procs[id] = proc
 	}
-	e.procs = map[string]*claudeProc{}
 	e.mu.Unlock()
-	for _, p := range procs {
-		_ = p.kill()
+	var cleanupErrors []error
+	for id, proc := range procs {
+		if err := proc.kill(ctx); err != nil {
+			cleanupErrors = append(cleanupErrors, err)
+			continue
+		}
+		e.mu.Lock()
+		delete(e.procs, id)
+		e.mu.Unlock()
 	}
-	return nil
+	return errors.Join(cleanupErrors...)
 }
 
 // claudeProc is one dedicated headless claude process for one session.
@@ -163,6 +191,7 @@ type claudeProc struct {
 	cmd            *exec.Cmd
 	stdin          io.WriteCloser
 	loopOn         context.CancelFunc
+	exitDone       <-chan struct{}
 	realSessionID  string // claude's own session uuid (init event)
 	acpSessionID   string // synthetic ACP session id
 	model          string // spawn-time --model
@@ -176,6 +205,7 @@ type claudeProc struct {
 	planTools      map[string]bool // tool ids that carried TodoWrite plans
 	mcpFile        string
 	settingsFile   string
+	wait           nativeProcessWait
 }
 
 type claudeTurn struct {
@@ -222,6 +252,9 @@ func (p *claudeProc) buildArgs() ([]string, error) {
 	if p.pendingReq != nil {
 		meta = p.pendingReq.Meta
 		servers = p.pendingReq.MCPServers
+		for _, directory := range p.pendingReq.AdditionalDirectories {
+			args = append(args, "--add-dir", directory)
+		}
 	}
 	model := p.model
 	if model == "" {
@@ -240,6 +273,12 @@ func (p *claudeProc) buildArgs() ([]string, error) {
 	}
 	if permissionMode != "" {
 		args = append(args, "--permission-mode", permissionMode)
+		if permissionMode == "bypassPermissions" {
+			args = append(args, "--allow-dangerously-skip-permissions")
+		}
+	}
+	if p.resumeFrom == "" || p.forkSession {
+		args = append(args, "--session-id", p.acpSessionID)
 	}
 	if p.resumeFrom != "" {
 		args = append(args, "--resume", p.resumeFrom)
@@ -255,6 +294,22 @@ func (p *claudeProc) buildArgs() ([]string, error) {
 	}
 	if cc, ok := meta["claudeCode"].(map[string]any); ok {
 		if options, ok := cc["options"].(map[string]any); ok {
+			if tools, present := options["tools"]; present && tools != nil {
+				args = append(args, "--tools", strings.Join(stringSliceFromAny(tools), ","))
+			}
+			if sources, present := options["settingSources"]; present && sources != nil {
+				args = append(args, "--setting-sources", strings.Join(stringSliceFromAny(sources), ","))
+			}
+			if plugins, ok := options["plugins"].([]any); ok {
+				for _, entry := range plugins {
+					plugin, _ := entry.(map[string]any)
+					if plugin["type"] == "local" {
+						if directory, ok := plugin["path"].(string); ok && directory != "" {
+							args = append(args, "--plugin-dir", directory)
+						}
+					}
+				}
+			}
 			if v := stringSliceFromAny(options["allowedTools"]); len(v) > 0 {
 				args = append(args, "--allowedTools", strings.Join(v, ","))
 			}
@@ -344,6 +399,11 @@ func (p *claudeProc) writeMCPConfig(servers []MCPServer) (string, error) {
 
 // ensureSpawned launches the CLI exactly once, with all spawn-time options.
 func (p *claudeProc) ensureSpawned(ctx context.Context) error {
+	p.eng.mu.Lock()
+	defer p.eng.mu.Unlock()
+	if p.eng.closed {
+		return wrapError(ErrorSessionClosed, "native.claude.spawn", "native connection is closed", nil)
+	}
 	p.mu.Lock()
 	if p.spawned {
 		p.mu.Unlock()
@@ -390,6 +450,7 @@ func (p *claudeProc) spawn(ctx context.Context, opts nativeEngineOptions, args [
 	var closeLoopOnce sync.Once
 	cancelLoop := func() { closeLoopOnce.Do(func() { close(loopDone) }) }
 	p.loopOn = cancelLoop
+	p.exitDone = loopDone
 	go func() {
 		defer cancelLoop()
 		scanner := bufio.NewScanner(stdout)
@@ -423,6 +484,12 @@ func (p *claudeProc) prompt(ctx context.Context, blocks []ContentBlock) (nativeT
 
 	select {
 	case <-turn.done:
+	case <-p.exitDone:
+		select {
+		case <-turn.done:
+		default:
+			return nativeTurnResult{}, wrapError(ErrorProcess, "native.claude.turn", "Claude process stream closed before a terminal result", io.EOF)
+		}
 	case <-ctx.Done():
 		return nativeTurnResult{}, ctx.Err()
 	}
@@ -452,16 +519,16 @@ func (p *claudeProc) cancel() {
 // handleLine processes one claude stream-json event.
 func (p *claudeProc) handleLine(line []byte) {
 	var ev struct {
-		Type       string          `json:"type"`
-		Subtype    string          `json:"subtype"`
-		SessionID  string          `json:"session_id"`
-		IsError    bool            `json:"is_error"`
-		Result     string          `json:"result"`
-		StopReason string          `json:"stop_reason"`
-		Usage      json.RawMessage `json:"usage"`
+		Type           string          `json:"type"`
+		Subtype        string          `json:"subtype"`
+		SessionID      string          `json:"session_id"`
+		IsError        bool            `json:"is_error"`
+		Result         string          `json:"result"`
+		StopReason     string          `json:"stop_reason"`
+		Usage          json.RawMessage `json:"usage"`
 		SlashCommands  []string        `json:"slash_commands"`
 		PermissionMode string          `json:"permissionMode"`
-		Message    *struct {
+		Message        *struct {
 			ID      string          `json:"id"`
 			Content json.RawMessage `json:"content"`
 		} `json:"message"`
@@ -692,7 +759,7 @@ func (p *claudeProc) acpSessionIDLocked() string {
 }
 
 // kill terminates this session's process tree and temp files.
-func (p *claudeProc) kill() error {
+func (p *claudeProc) kill(ctx context.Context) error {
 	p.mu.Lock()
 	cmd, stdin, loopOn := p.cmd, p.stdin, p.loopOn
 	mcpFile, settingsFile := p.mcpFile, p.settingsFile
@@ -700,8 +767,8 @@ func (p *claudeProc) kill() error {
 	if loopOn != nil {
 		defer loopOn()
 	}
-	if stdin != nil {
-		_ = stdin.Close()
+	if err := stopNativeProcess(ctx, cmd, stdin, &p.wait); err != nil {
+		return err
 	}
 	if mcpFile != "" {
 		_ = os.Remove(mcpFile)
@@ -709,29 +776,7 @@ func (p *claudeProc) kill() error {
 	if settingsFile != "" {
 		_ = os.Remove(settingsFile)
 	}
-	if cmd == nil || cmd.Process == nil {
-		return nil
-	}
-	pgid := processGroupIDAfterStart(cmd)
-	waitCh := make(chan error, 1)
-	go func() { waitCh <- cmd.Wait() }()
-	select {
-	case <-waitCh:
-		return nil
-	case <-time.After(1500 * time.Millisecond):
-		_ = signalProcessTree(pgid, cmd.Process, syscall.SIGTERM)
-		select {
-		case <-waitCh:
-			return nil
-		case <-time.After(time.Second):
-			_ = signalProcessTree(pgid, cmd.Process, syscall.SIGKILL)
-			select {
-			case <-waitCh:
-			case <-time.After(3 * time.Second):
-			}
-			return nil
-		}
-	}
+	return nil
 }
 
 // claudeContentFromBlocks maps ACP prompt blocks onto anthropic message

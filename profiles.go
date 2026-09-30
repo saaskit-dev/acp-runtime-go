@@ -28,7 +28,7 @@ type InitialConfigOptionSelector struct {
 func ResolveAgentProfile(agent Agent) AgentProfile {
 	profile := defaultAgentProfile()
 	switch agent.Type {
-	case CodexACPRegistryID:
+	case CodexACPRegistryID, CodexNativeRegistryID:
 		profile.NormalizeRuntimeAuthMethods = func(agent Agent, methods []RuntimeAuthenticationMethod) []RuntimeAuthenticationMethod {
 			return methods
 		}
@@ -69,7 +69,18 @@ func ResolveAgentProfile(agent Agent) AgentProfile {
 		// _meta.claudeCode.options, which the native adapter translates into
 		// spawn flags (allowedTools/disallowedTools/settings). The yolo mode
 		// alias matches the ACP behavior.
-		profile.ApplyAgentConfig = applyClaudeAgentConfig
+		basePromptProjection := profile.ProjectSystemPrompt
+		profile.ProjectSystemPrompt = func(agent Agent, prompt SystemPromptProjection) (Agent, map[string]any) {
+			agent.Args = removeClaudeSystemPromptArgs(agent.Args)
+			return basePromptProjection(agent, prompt)
+		}
+		profile.ApplyAgentConfig = func(agent Agent, cfg AgentConfig) (Agent, map[string]any) {
+			agent, meta := applyClaudeAgentConfig(agent, cfg)
+			if cfg.Model != "" {
+				meta = mergeSessionMeta(meta, map[string]any{"model": cfg.Model})
+			}
+			return agent, meta
+		}
 		profile.CreateInitialConfigAliases = func(key string, value any) []any {
 			if key == "mode" && value == "yolo" {
 				return []any{"bypassPermissions", value}
@@ -261,6 +272,8 @@ func applyCodexAgentConfig(agent Agent, cfg AgentConfig) (Agent, map[string]any)
 	}
 	if cfg.Sandbox == "read-only" {
 		codexOpts.ApprovalPolicy = "on-request"
+	} else if cfg.Sandbox == "full-access" {
+		codexOpts.ApprovalPolicy = "never"
 	}
 	if len(cfg.Permissions.Deny) > 0 {
 		codexOpts.WritableRoots = filterWritableRoots(cfg.Permissions.Deny)

@@ -20,6 +20,14 @@ type Connection struct {
 // a session/request_permission request. The host's decision is passed through
 // unchanged so the runtime can record the request in its read model without
 // affecting the outcome returned to the agent.
+// SetRawMessageObserver replaces the protocol observer for this connection.
+// Message buffers are copied, and registration is safe against peer IO.
+func (c *Connection) SetRawMessageObserver(observer func(string, json.RawMessage)) {
+	c.peer.rawMu.Lock()
+	defer c.peer.rawMu.Unlock()
+	c.peer.opts.OnRawMessage = observer
+}
+
 func (c *Connection) SetPermissionObserver(handler func(PermissionRequest, PermissionDecision)) {
 	c.permissionObserverMu.Lock()
 	defer c.permissionObserverMu.Unlock()

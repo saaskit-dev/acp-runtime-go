@@ -160,18 +160,25 @@ func newNativeBridgeConnection(ctx context.Context, input ConnectionFactoryInput
 	go func() { _ = hostPeer.Start(bridgeCtx) }()
 	go func() { _ = bridge.peer.Start(bridgeCtx) }()
 
-	var closeOnce sync.Once
+	var disposeMu sync.Mutex
+	disposed := false
 	dispose := func(ctx context.Context) error {
-		closeOnce.Do(func() {
-			cancelBridge()
-			_ = engine.Close(ctx)
-			_ = hostRead.Close()
-			_ = hostWrite.Close()
-			_ = bridgeRead.Close()
-			_ = bridgeWrite.Close()
-			hostPeer.Close()
-			bridge.peer.Close()
-		})
+		disposeMu.Lock()
+		defer disposeMu.Unlock()
+		if disposed {
+			return nil
+		}
+		cancelBridge()
+		_ = hostRead.Close()
+		_ = hostWrite.Close()
+		_ = bridgeRead.Close()
+		_ = bridgeWrite.Close()
+		hostPeer.Close()
+		bridge.peer.Close()
+		if err := engine.Close(ctx); err != nil {
+			return err
+		}
+		disposed = true
 		return nil
 	}
 	return ConnectionHandle{Connection: conn, Dispose: dispose}, nil
@@ -216,7 +223,7 @@ func registerNativeBridgeHandlers(b *nativeBridge) {
 		if err != nil {
 			return nil, err
 		}
-		return NewSessionResponse{SessionID: id, ConfigOptions: b.engine.SessionConfigOptions()}, nil
+		return nativeSessionResponse(b.engine, id), nil
 	})
 
 	// set_config_option / set_mode: engines with spawn-time knobs (claude:
@@ -303,7 +310,7 @@ func registerNativeBridgeHandlers(b *nativeBridge) {
 		if err != nil {
 			return nil, err
 		}
-		return NewSessionResponse{SessionID: id}, nil
+		return nativeSessionResponse(b.engine, id), nil
 	})
 
 	// session/load and session/resume share one translation: re-attach the
@@ -312,10 +319,10 @@ func registerNativeBridgeHandlers(b *nativeBridge) {
 	// preserved.
 	loadResume := func(ctx context.Context, raw json.RawMessage) (any, error) {
 		var req struct {
-			SessionID             string    `json:"sessionId"`
-			CWD                   string    `json:"cwd"`
-			MCPServers            []MCPServer `json:"mcpServers"`
-			AdditionalDirectories []string  `json:"additionalDirectories"`
+			SessionID             string         `json:"sessionId"`
+			CWD                   string         `json:"cwd"`
+			MCPServers            []MCPServer    `json:"mcpServers"`
+			AdditionalDirectories []string       `json:"additionalDirectories"`
 			Meta                  map[string]any `json:"_meta"`
 		}
 		if err := json.Unmarshal(raw, &req); err != nil {
@@ -329,11 +336,12 @@ func registerNativeBridgeHandlers(b *nativeBridge) {
 			CWD:                   b.opts.CWD,
 			MCPServers:            req.MCPServers,
 			AdditionalDirectories: req.AdditionalDirectories,
+			Meta:                  req.Meta,
 		})
 		if err != nil {
 			return nil, err
 		}
-		return NewSessionResponse{SessionID: id}, nil
+		return nativeSessionResponse(b.engine, id), nil
 	}
 	p.RegisterRequest("session/load", loadResume)
 	p.RegisterRequest("session/resume", loadResume)
@@ -346,6 +354,15 @@ func registerNativeBridgeHandlers(b *nativeBridge) {
 			return nil, errNativeUnsupported(method)
 		})
 	}
+}
+
+func nativeSessionResponse(engine nativeEngine, sessionID string) NewSessionResponse {
+	if source, ok := engine.(interface {
+		SessionState(string) NewSessionResponse
+	}); ok {
+		return source.SessionState(sessionID)
+	}
+	return NewSessionResponse{SessionID: sessionID, ConfigOptions: engine.SessionConfigOptions()}
 }
 
 // promptBlocksText flattens ACP content blocks to plain text for engines that

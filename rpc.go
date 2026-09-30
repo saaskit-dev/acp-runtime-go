@@ -78,6 +78,7 @@ type Peer struct {
 	reader *bufio.Reader
 	writer io.Writer
 	opts   PeerOptions
+	rawMu  sync.RWMutex
 
 	nextID  atomic.Int64
 	writeMu sync.Mutex
@@ -125,6 +126,15 @@ var (
 		return &buffer
 	}}
 )
+
+func (p *Peer) observeRawMessage(direction string, message []byte) {
+	p.rawMu.RLock()
+	observer := p.opts.OnRawMessage
+	p.rawMu.RUnlock()
+	if observer != nil {
+		observer(direction, append(json.RawMessage(nil), message...))
+	}
+}
 
 func NewPeer(r io.Reader, w io.Writer, opts PeerOptions) *Peer {
 	p := &Peer{
@@ -179,9 +189,7 @@ func (p *Peer) Start(ctx context.Context) error {
 		line, err := p.readMessageLine()
 		p.markReadIdle(false)
 		if len(line) > 0 {
-			if p.opts.OnRawMessage != nil {
-				p.opts.OnRawMessage("inbound", append(json.RawMessage(nil), line...))
-			}
+			p.observeRawMessage("inbound", line)
 			if msg, ok := parseRPCMessage(line); ok {
 				if len(msg.ID) > 0 && msg.Method == "" {
 					p.resolvePending(msg)
@@ -469,9 +477,7 @@ func (p *Peer) writeMessage(msg rpcMessage) error {
 	buffer := appendRPCMessage((*bufferPtr)[:0], msg)
 
 	p.writeMu.Lock()
-	if p.opts.OnRawMessage != nil {
-		p.opts.OnRawMessage("outbound", append(json.RawMessage(nil), buffer...))
-	}
+	p.observeRawMessage("outbound", buffer)
 	buffer = append(buffer, '\n')
 	_, err := p.writer.Write(buffer)
 	p.writeMu.Unlock()

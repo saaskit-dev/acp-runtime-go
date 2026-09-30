@@ -2,11 +2,11 @@ package acpruntime
 
 import (
 	"bufio"
-	"regexp"
-	"fmt"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -55,13 +55,19 @@ func TestFakeCodexAppServer(t *testing.T) {
 		case "initialize":
 			write(map[string]any{"jsonrpc": "2.0", "id": *msg.ID, "result": map[string]any{"userAgent": "fake-codex/0.153.4"}})
 		case "thread/start":
+			var req struct {
+				Model string `json:"model"`
+			}
+			_ = json.Unmarshal(msg.Params, &req)
+			model := firstNonEmpty(req.Model, "fake-model")
 			threadCounter++
 			threadIDs[threadCounter] = fmt.Sprintf("fake-thread-%d", threadCounter)
 			write(map[string]any{"jsonrpc": "2.0", "id": *msg.ID, "result": map[string]any{
-				"thread": map[string]any{"id": threadIDs[threadCounter]}}})
+				"model": model, "thread": map[string]any{"id": threadIDs[threadCounter]}}})
 		case "thread/resume":
 			var req struct {
 				ThreadID string `json:"threadId"`
+				Model    string `json:"model"`
 			}
 			_ = json.Unmarshal(msg.Params, &req)
 			if req.ThreadID == "gone-thread" {
@@ -70,7 +76,7 @@ func TestFakeCodexAppServer(t *testing.T) {
 				return
 			}
 			write(map[string]any{"jsonrpc": "2.0", "id": *msg.ID, "result": map[string]any{
-				"thread": map[string]any{"id": req.ThreadID}}})
+				"model": firstNonEmpty(req.Model, "fake-model"), "thread": map[string]any{"id": req.ThreadID}}})
 		case "turn/start":
 			var tr struct {
 				ThreadID string `json:"threadId"`
@@ -197,7 +203,6 @@ func TestCodexNativeTransportEndToEnd(t *testing.T) {
 		t.Fatalf("tool call = %+v, want title=echo hi kind=execute_command status=completed", found)
 	}
 }
-
 
 var pidRe = regexp.MustCompile(`PID=(\d+)`)
 

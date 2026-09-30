@@ -34,6 +34,22 @@ func NewRuntime(factory ConnectionFactory, options RuntimeOptions) *Runtime {
 	}
 }
 
+// SetConnectionObserver installs a host decorator around every connection,
+// including native loopback transports. Call before starting any sessions.
+func (r *Runtime) SetConnectionObserver(observer func(context.Context, ConnectionFactoryInput, *ConnectionHandle)) {
+	if observer == nil {
+		return
+	}
+	base := r.service.factory
+	r.service.factory = func(ctx context.Context, input ConnectionFactoryInput) (ConnectionHandle, error) {
+		handle, err := base(ctx, input)
+		if err == nil {
+			observer(ctx, input, &handle)
+		}
+		return handle, err
+	}
+}
+
 func (r *Runtime) StartSession(ctx context.Context, options StartSessionOptions) (*Session, error) {
 	resolved, err := r.resolveStartOptions(ctx, options)
 	if err != nil {

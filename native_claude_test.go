@@ -2,9 +2,9 @@ package acpruntime
 
 import (
 	"bufio"
-	"fmt"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -136,10 +136,10 @@ func TestClaudeNativeTransportEndToEnd(t *testing.T) {
 	}
 	defer func() { _ = session.Close(context.Background()) }()
 
-	// claude emits system/init lazily, so session/new returns a synthetic ACP
-	// id; the real uuid stays internal to the engine.
-	if sid := session.Snapshot().Session.ID; !strings.HasPrefix(sid, "claude-") {
-		t.Fatalf("session id = %q, want synthetic claude- prefixed id", sid)
+	// The host-chosen UUID is passed to Claude --session-id and remains valid
+	// for --resume after this process is gone.
+	if sid := session.Snapshot().Session.ID; !nativePlatformSessionIDPattern.MatchString(sid) {
+		t.Fatalf("session id = %q, want resumable UUID", sid)
 	}
 
 	completion, err := session.Run(ctx, "say FAKE_CLAUDE_HELLO")
@@ -271,8 +271,6 @@ func TestClaudeNativeTransportLive(t *testing.T) {
 		t.Fatalf("Usage missing: %+v", completion.Usage)
 	}
 }
-
-
 
 // TestClaudeNativeSessionIsolation: two sessions on the SAME connection get
 // TWO separate claude processes (independent MCP/config), while turns within

@@ -104,7 +104,7 @@ func TestCodexApprovalDeniedAndApproved(t *testing.T) {
 }
 
 // TestClaudeNativeFork: session/fork spawns with --resume <id> --fork-session
-// and returns a fresh synthetic ACP id.
+// and returns a fresh resumable UUID.
 func TestClaudeNativeFork(t *testing.T) {
 	if os.Getenv("GO_WANT_HELPER_PROCESS") == "1" {
 		return
@@ -127,8 +127,8 @@ func TestClaudeNativeFork(t *testing.T) {
 	defer func() { _ = session.Close(context.Background()) }()
 
 	sid := session.Snapshot().Session.ID
-	if !strings.HasPrefix(sid, "claude-") {
-		t.Fatalf("session id = %q, want synthetic claude- id for the forked lineage", sid)
+	if !nativePlatformSessionIDPattern.MatchString(sid) {
+		t.Fatalf("session id = %q, want resumable UUID for the forked lineage", sid)
 	}
 	completion, err := session.Run(ctx, "hi")
 	if err != nil {
