@@ -38,7 +38,7 @@
     },
     {
       "type": "session-prompt",
-      "prompt": "/bash git status",
+      "prompt": "/bash pwd",
       "turnRef": "turn-fault-run"
     },
     {

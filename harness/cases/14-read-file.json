@@ -5,16 +5,16 @@
   "scenarioCategory": "main-flow",
   "probes": {
     "simulator-agent-acp-local": {
-      "prompt": "/read $cwd/README.md"
+      "prompt": "/read $fixture/README.md"
     },
     "opencode": {
-      "prompt": "Use the read tool to inspect ./README.md. Do not rely on prior context. After you have read the file, answer with only its first markdown heading."
+      "prompt": "Use the read tool to inspect $fixture/README.md. Do not rely on prior context. After you have read the file, answer with only its first markdown heading."
     },
     "cursor": {
-      "prompt": "Use your file reading tool to inspect ./README.md. Do not rely on prior context. After the tool call completes, answer with only the first markdown heading."
+      "prompt": "Use your file reading tool to inspect $fixture/README.md. Do not rely on prior context. After the tool call completes, answer with only the first markdown heading."
     },
     "pi-acp": {
-      "prompt": "Use your file reading tool to inspect ./README.md. Do not rely on prior context. After the tool call completes, answer with only the first markdown heading."
+      "prompt": "Use your file reading tool to inspect $fixture/README.md. Do not rely on prior context. After the tool call completes, answer with only the first markdown heading."
     }
   },
   "title": "Read File",
@@ -38,7 +38,7 @@
     {
       "type": "session-prompt",
       "prompt": "$probe-prompt",
-      "defaultPrompt": "Read ./README.md and tell me the first heading.",
+      "defaultPrompt": "Read $fixture/README.md and tell me the first heading.",
       "turnRef": "turn-1"
     },
     {
@@ -75,5 +75,8 @@
       "type": "transcript-has-event",
       "eventType": "tool_call_update"
     }
-  ]
+  ],
+  "fixtures": {
+    "README.md": "# Harness fixture\nThis file is created by the test.\n"
+  }
 }

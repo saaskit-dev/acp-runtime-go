@@ -5,7 +5,9 @@
   "scenarioCategory": "host-authority",
   "title": "Host Run Command",
   "agents": {
-    "include": ["simulator-agent-acp-local"]
+    "include": [
+      "simulator-agent-acp-local"
+    ]
   },
   "level": "P1",
   "protocolDependencies": [

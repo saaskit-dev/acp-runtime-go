@@ -56,9 +56,8 @@ harness-admission: build
 	$(BIN_DIR)/acp-harness --case harness/cases/05-session-prompt.json --simulator-bin $(BIN_DIR)/acp-simulator-agent
 
 harness-full: build
-	@for case_file in harness/cases/*.json; do \
-		$(BIN_DIR)/acp-harness --case "$$case_file" --simulator-bin $(BIN_DIR)/acp-simulator-agent || exit $$?; \
-	done
+	mkdir -p harness-outputs
+	$(BIN_DIR)/acp-harness --all --json harness-outputs/full.json --simulator-bin $(BIN_DIR)/acp-simulator-agent
 
 install: build
 	install -m 0755 $(BIN_DIR)/acp-runtime /usr/local/bin/acp-runtime

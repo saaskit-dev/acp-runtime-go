@@ -31,7 +31,7 @@
     },
     {
       "type": "session-prompt",
-      "prompt": "/scenario full-cycle /tmp/acp-harness-scenario.txt git diff --stat",
+      "prompt": "/scenario full-cycle $fixture/scenario.txt pwd",
       "turnRef": "turn-scenario"
     },
     {

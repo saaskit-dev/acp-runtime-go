@@ -36,5 +36,6 @@
       "type": "transcript-has-method",
       "method": "session/fork"
     }
-  ]
+  ],
+  "experimental": true
 }

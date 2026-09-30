@@ -5,7 +5,9 @@
   "scenarioCategory": "host-authority",
   "title": "Host Read File",
   "agents": {
-    "include": ["simulator-agent-acp-local"]
+    "include": [
+      "simulator-agent-acp-local"
+    ]
   },
   "level": "P1",
   "protocolDependencies": [
@@ -27,9 +29,9 @@
     },
     {
       "type": "session-prompt",
-      "defaultPrompt": "Read ./README.md and tell me the first heading.",
+      "defaultPrompt": "Read $fixture/README.md and tell me the first heading.",
       "turnRef": "turn-1",
-      "prompt": "Read ./README.md and tell me the first heading."
+      "prompt": "Read $fixture/README.md and tell me the first heading."
     },
     {
       "type": "wait-for-event",
@@ -50,5 +52,8 @@
       "type": "transcript-has-event",
       "eventType": "tool_call_update"
     }
-  ]
+  ],
+  "fixtures": {
+    "README.md": "# Harness fixture\nThis file is created by the test.\n"
+  }
 }

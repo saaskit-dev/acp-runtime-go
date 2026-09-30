@@ -28,9 +28,14 @@
       "type": "session-new"
     },
     {
+      "type": "permission-decision",
+      "decision": "allow"
+    },
+    {
       "type": "session-prompt",
-      "prompt": "Run `sleep 30` in a terminal and wait for it to finish.",
-      "turnRef": "turn-1"
+      "prompt": "$probe-prompt",
+      "turnRef": "turn-1",
+      "defaultPrompt": "Run `sleep 30` in a terminal and wait for it to finish."
     },
     {
       "type": "wait-for-event",
@@ -43,7 +48,7 @@
     },
     {
       "type": "wait-for-event",
-      "eventType": "available_commands_update",
+      "eventType": "completed",
       "timeoutMs": 15000
     }
   ],
@@ -60,6 +65,17 @@
       "type": "transcript-order",
       "first": "session/prompt",
       "then": "session/cancel"
+    },
+    {
+      "type": "transcript-method-response-has",
+      "method": "session/prompt",
+      "path": "stopReason",
+      "equals": "cancelled"
     }
-  ]
+  ],
+  "probes": {
+    "simulator-agent-acp-local": {
+      "prompt": "/bash sleep 30"
+    }
+  }
 }

@@ -14,7 +14,7 @@
   },
   "probes": {
     "simulator-agent-acp-local": {
-      "prompt": "/write /tmp/acp-harness-test.txt hello world"
+      "prompt": "/write $fixture/output.txt hello world"
     },
     "codex-acp": {
       "modeId": "read-only",

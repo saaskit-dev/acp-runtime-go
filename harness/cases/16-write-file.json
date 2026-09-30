@@ -5,16 +5,16 @@
   "scenarioCategory": "main-flow",
   "probes": {
     "simulator-agent-acp-local": {
-      "prompt": "/write /tmp/acp-harness-test.txt READY"
+      "prompt": "/write $fixture/output.txt READY"
     },
     "opencode": {
-      "prompt": "Use your file editing or command execution tool to create ./.tmp/tmp-output.txt containing exactly READY. Wait for the tool call to complete, then answer done."
+      "prompt": "Use your file editing or command execution tool to create $fixture/output.txt containing exactly READY. Wait for the tool call to complete, then answer done."
     },
     "cursor": {
-      "prompt": "Use your file editing or command execution tool to create ./.tmp/tmp-output.txt containing exactly READY. Wait for the tool call to complete, then answer done."
+      "prompt": "Use your file editing or command execution tool to create $fixture/output.txt containing exactly READY. Wait for the tool call to complete, then answer done."
     },
     "pi-acp": {
-      "prompt": "Use your file editing or command execution tool to create ./.tmp/tmp-output.txt containing exactly READY. Wait for the tool call to complete, then answer done."
+      "prompt": "Use your file editing or command execution tool to create $fixture/output.txt containing exactly READY. Wait for the tool call to complete, then answer done."
     }
   },
   "title": "Write File",
@@ -40,7 +40,7 @@
     {
       "type": "session-prompt",
       "prompt": "$probe-prompt",
-      "defaultPrompt": "Create ./.tmp/tmp-output.txt containing the word READY.",
+      "defaultPrompt": "Create $fixture/output.txt containing the word READY.",
       "turnRef": "turn-1"
     },
     {

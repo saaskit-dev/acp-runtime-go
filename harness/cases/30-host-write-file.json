@@ -5,7 +5,9 @@
   "scenarioCategory": "host-authority",
   "title": "Host Write File",
   "agents": {
-    "include": ["simulator-agent-acp-local"]
+    "include": [
+      "simulator-agent-acp-local"
+    ]
   },
   "level": "P1",
   "protocolDependencies": [
@@ -28,9 +30,9 @@
     },
     {
       "type": "session-prompt",
-      "defaultPrompt": "Create ./.tmp/tmp-output.txt containing the word READY.",
+      "defaultPrompt": "/write $fixture/output.txt READY",
       "turnRef": "turn-1",
-      "prompt": "Create ./.tmp/tmp-output.txt containing the word READY."
+      "prompt": "/write $fixture/output.txt READY"
     },
     {
       "type": "wait-for-event",
